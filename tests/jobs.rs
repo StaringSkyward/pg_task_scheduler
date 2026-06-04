@@ -14,7 +14,7 @@ fn spec(name: &str, cron: &str) -> CreateJob {
         name: JobName::new(name),
         cron: CronExpression::parse(cron).unwrap(),
         job_args: serde_json::json!({"k": "v"}),
-        lease_duration: LeaseDuration(Duration::from_secs(300)),
+        lease_duration: LeaseDuration::try_from(Duration::from_secs(300)).unwrap(),
         max_attempts: MaxAttempts(NonZeroU32::new(3).unwrap()),
         is_paused: false,
     }

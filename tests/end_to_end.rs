@@ -25,7 +25,7 @@ async fn runs_due_job_end_to_end() {
             name: JobName::new("counter"),
             cron: CronExpression::parse("*/1 * * * *").unwrap(),
             job_args: serde_json::json!({"n": 1}),
-            lease_duration: LeaseDuration(Duration::from_secs(60)),
+            lease_duration: LeaseDuration::try_from(Duration::from_secs(60)).unwrap(),
             max_attempts: MaxAttempts(NonZeroU32::new(3).unwrap()),
             is_paused: false,
         },

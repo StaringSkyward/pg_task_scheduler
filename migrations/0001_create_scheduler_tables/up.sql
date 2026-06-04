@@ -6,7 +6,8 @@ CREATE TABLE scheduler_jobs (
     cron_expression TEXT NOT NULL,
     job_args        JSONB NOT NULL DEFAULT '{}'::jsonb,
     next_run_at     TIMESTAMPTZ NOT NULL,
-    lease_duration  INTERVAL NOT NULL DEFAULT INTERVAL '5 minutes',
+    lease_duration  INTERVAL NOT NULL DEFAULT INTERVAL '5 minutes'
+                    CHECK (lease_duration > INTERVAL '0 seconds'),
     max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
     is_paused       BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

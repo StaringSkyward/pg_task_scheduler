@@ -61,7 +61,7 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
         cron_expression: spec.cron.as_str().to_owned(),
         job_args: spec.job_args.clone(),
         next_run_at: spec.cron.next_after(db_now)?,
-        lease_duration: spec.lease_duration.to_pg_interval()?,
+        lease_duration: spec.lease_duration.to_pg_interval(),
         max_attempts: spec.max_attempts.to_i32()?,
         is_paused: spec.is_paused,
     })

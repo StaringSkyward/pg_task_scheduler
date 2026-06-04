@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroI64, NonZeroU32};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -27,9 +27,39 @@ pub enum RunOutcome {
 #[derive(Debug, Clone, Copy)]
 pub struct MaxAttempts(pub NonZeroU32);
 
-/// Max single-attempt runtime / lease length.
-#[derive(Debug, Clone, Copy)]
-pub struct LeaseDuration(pub Duration);
+/// Max single-attempt runtime / lease length. A positive, microsecond-exact
+/// duration: the persisted PG interval always equals what the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseDuration {
+    micros: NonZeroI64, // invariant: always in 1..=i64::MAX, enforced by TryFrom
+}
+
+/// Why a `Duration` was rejected as a `LeaseDuration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LeaseDurationError {
+    #[error("lease duration must be greater than zero")]
+    Zero,
+    #[error("lease duration must be a whole number of microseconds")]
+    PrecisionLoss,
+    #[error("lease duration exceeds the maximum of i64::MAX microseconds")]
+    TooLarge,
+}
+
+impl TryFrom<Duration> for LeaseDuration {
+    type Error = LeaseDurationError;
+
+    fn try_from(d: Duration) -> Result<Self, LeaseDurationError> {
+        // Reject any sub-microsecond remainder first (no silent floor). Whole
+        // seconds are always whole microseconds, so only the subsec component
+        // can carry a fractional-microsecond part.
+        if !d.subsec_nanos().is_multiple_of(1000) {
+            return Err(LeaseDurationError::PrecisionLoss);
+        }
+        let micros = i64::try_from(d.as_micros()).map_err(|_| LeaseDurationError::TooLarge)?;
+        let micros = NonZeroI64::new(micros).ok_or(LeaseDurationError::Zero)?;
+        Ok(LeaseDuration { micros })
+    }
+}
 
 impl MaxAttempts {
     /// Convert to the `i32` the column stores; errors if it exceeds `i32::MAX`.
@@ -41,15 +71,9 @@ impl MaxAttempts {
 }
 
 impl LeaseDuration {
-    /// Checked conversion to a Postgres interval (microsecond precision).
-    pub fn to_pg_interval(
-        self,
-    ) -> Result<diesel::pg::data_types::PgInterval, crate::error::SchedulerError> {
-        let micros = i64::try_from(self.0.as_micros())
-            .map_err(|_| crate::error::SchedulerError::Config("lease_duration too large".into()))?;
-        Ok(diesel::pg::data_types::PgInterval::from_microseconds(
-            micros,
-        ))
+    /// Total, infallible: `micros` is already a validated positive i64.
+    pub fn to_pg_interval(self) -> diesel::pg::data_types::PgInterval {
+        diesel::pg::data_types::PgInterval::from_microseconds(self.micros.get())
     }
 }
 
@@ -170,4 +194,66 @@ pub struct StatusRow {
     pub finished_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod lease_duration_tests {
+    use super::{LeaseDuration, LeaseDurationError};
+    use std::time::Duration;
+
+    #[test]
+    fn zero_is_rejected() {
+        assert_eq!(
+            LeaseDuration::try_from(Duration::ZERO),
+            Err(LeaseDurationError::Zero)
+        );
+    }
+
+    #[test]
+    fn sub_microsecond_is_precision_loss() {
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_nanos(500)),
+            Err(LeaseDurationError::PrecisionLoss)
+        );
+    }
+
+    #[test]
+    fn fractional_microsecond_is_precision_loss() {
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_nanos(1500)),
+            Err(LeaseDurationError::PrecisionLoss)
+        );
+    }
+
+    #[test]
+    fn one_microsecond_is_accepted() {
+        let ld = LeaseDuration::try_from(Duration::from_micros(1)).expect("1us is valid");
+        let iv = ld.to_pg_interval();
+        assert_eq!(iv.microseconds, 1);
+        assert_eq!(iv.days, 0);
+        assert_eq!(iv.months, 0);
+    }
+
+    #[test]
+    fn whole_seconds_convert_to_microseconds() {
+        let ld = LeaseDuration::try_from(Duration::from_secs(60)).expect("60s is valid");
+        assert_eq!(ld.to_pg_interval().microseconds, 60_000_000);
+    }
+
+    #[test]
+    fn max_i64_microseconds_is_accepted() {
+        let micros = u64::try_from(i64::MAX).unwrap();
+        let ld =
+            LeaseDuration::try_from(Duration::from_micros(micros)).expect("i64::MAX us is valid");
+        assert_eq!(ld.to_pg_interval().microseconds, i64::MAX);
+    }
+
+    #[test]
+    fn one_past_max_i64_microseconds_is_too_large() {
+        let micros = u64::try_from(i64::MAX).unwrap() + 1;
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_micros(micros)),
+            Err(LeaseDurationError::TooLarge)
+        );
+    }
 }
