@@ -23,8 +23,16 @@ use uuid::Uuid;
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn database_url() -> String {
+    // Load `.env` exactly once. `std::sync::Once` gives a happens-before edge so
+    // concurrent tests don't race on env mutation (relevant under edition 2024),
+    // and `dotenvy` never overrides a var already set in the real environment, so
+    // CI that exports DATABASE_URL still wins.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = dotenvy::dotenv();
+    });
     std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set to run integration tests (PostgreSQL 13+)")
+        .expect("DATABASE_URL must be set (via the environment or a .env file) to run integration tests (PostgreSQL 13+)")
 }
 
 fn unique_schema() -> String {

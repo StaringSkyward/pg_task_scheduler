@@ -53,7 +53,7 @@ impl<P: SchedulerPool> Scheduler<P> {
                     claim_and_dispatch(&pool, &registry, &names, &config.worker_id,
                                        &semaphore, &mut in_flight, &cancel).await;
                     while let Some(res) = in_flight.try_join_next() {
-                        if let Err(e) = res { tracing::error!(error = %e, "handler join error"); }
+                        log_handler_join(res);
                     }
                 }
             }
@@ -61,10 +61,18 @@ impl<P: SchedulerPool> Scheduler<P> {
 
         tracing::info!("draining in-flight handlers");
         let _ = tokio::time::timeout(config.shutdown_timeout, async {
-            while in_flight.join_next().await.is_some() {}
+            while let Some(res) = in_flight.join_next().await {
+                log_handler_join(res);
+            }
         })
         .await;
-        in_flight.shutdown().await;
+        // Deadline passed (or all drained): abort whatever remains. Because each
+        // task now owns its handler future directly, abort cancels the handler
+        // rather than detaching it. Still drain so a panic is logged, not swallowed.
+        in_flight.abort_all();
+        while let Some(res) = in_flight.join_next().await {
+            log_handler_join(res);
+        }
         reaper.abort();
         Ok(())
     }
@@ -110,6 +118,17 @@ async fn claim_and_dispatch<P: SchedulerPool>(
     }
 }
 
+/// Log a handler task's join result. A cancellation is expected during shutdown
+/// (we `abort_all` past the deadline), so only non-cancellation errors — i.e.
+/// handler panics — are surfaced.
+fn log_handler_join(res: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = res
+        && !e.is_cancelled()
+    {
+        tracing::error!(error = %e, "handler task error");
+    }
+}
+
 async fn dispatch<P: SchedulerPool>(
     pool: P,
     registry: Arc<Registry>,
@@ -129,10 +148,15 @@ async fn dispatch<P: SchedulerPool>(
                 lease_expires_at: claimed.lease_expires_at,
             };
             let args = claimed.job_args.clone();
-            match tokio::spawn(async move { handler(ctx, args).await }).await {
-                Ok(Ok(())) => Outcome::Completed,
-                Ok(Err(e)) => Outcome::Failed(e.to_string()),
-                Err(join) => Outcome::Failed(format!("handler panicked: {join}")),
+            // Run the handler directly in this JoinSet task so the scheduler owns
+            // its future. On shutdown, aborting this task drops the handler future
+            // at its current await point (cooperative cancellation) instead of
+            // detaching a nested task. A panic unwinds this task and surfaces as a
+            // JoinError on the JoinSet (logged at the join sites); the run is left
+            // un-finalized and recovered via lease expiry.
+            match handler(ctx, args).await {
+                Ok(()) => Outcome::Completed,
+                Err(e) => Outcome::Failed(e.to_string()),
             }
         }
         // We only claim jobs whose names we registered, so this is unreachable;
