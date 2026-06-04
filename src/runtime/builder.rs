@@ -1,0 +1,171 @@
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
+use crate::error::{JobError, SchedulerError};
+use crate::ids::{JobName, WorkerId};
+use crate::pool::SchedulerPool;
+use crate::runtime::context::JobContext;
+use crate::runtime::registry::Registry;
+
+/// Compile-time constant so there is no runtime partiality (no `unwrap`/`expect`
+/// in production paths). `const Option::unwrap` is stable since Rust 1.64.
+const DEFAULT_MAX_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
+#[derive(Debug, Clone)]
+pub(crate) struct Config {
+    pub worker_id: WorkerId,
+    pub poll_interval: Duration,
+    pub reaper_interval: Duration,
+    pub shutdown_timeout: Duration,
+    pub max_concurrency: NonZeroUsize,
+}
+
+pub struct SchedulerBuilder<P: SchedulerPool> {
+    pool: P,
+    registry: Registry,
+    worker_id: WorkerId,
+    poll_interval: Duration,
+    reaper_interval: Duration,
+    shutdown_timeout: Duration,
+    max_concurrency: NonZeroUsize,
+}
+
+impl<P: SchedulerPool> SchedulerBuilder<P> {
+    pub(crate) fn new(pool: P, worker_id: WorkerId) -> Self {
+        Self {
+            pool,
+            registry: Registry::new(),
+            worker_id,
+            poll_interval: Duration::from_secs(1),
+            reaper_interval: Duration::from_secs(20),
+            shutdown_timeout: Duration::from_secs(25),
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+        }
+    }
+
+    pub fn poll_interval(mut self, d: Duration) -> Self {
+        self.poll_interval = d;
+        self
+    }
+
+    pub fn reaper_interval(mut self, d: Duration) -> Self {
+        self.reaper_interval = d;
+        self
+    }
+
+    pub fn shutdown_timeout(mut self, d: Duration) -> Self {
+        self.shutdown_timeout = d;
+        self
+    }
+
+    pub fn max_concurrency(mut self, n: NonZeroUsize) -> Self {
+        self.max_concurrency = n;
+        self
+    }
+
+    pub fn register<A, F, Fut>(mut self, name: impl Into<JobName>, handler: F) -> Self
+    where
+        A: serde::de::DeserializeOwned + Send + 'static,
+        F: Fn(JobContext, A) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
+    {
+        self.registry.register(name.into(), handler);
+        self
+    }
+
+    pub fn build(self) -> Result<Scheduler<P>, SchedulerError> {
+        if self.registry.is_empty() {
+            return Err(SchedulerError::Config(
+                "at least one handler must be registered".into(),
+            ));
+        }
+        Ok(Scheduler {
+            pool: self.pool,
+            registry: self.registry,
+            config: Config {
+                worker_id: self.worker_id,
+                poll_interval: self.poll_interval,
+                reaper_interval: self.reaper_interval,
+                shutdown_timeout: self.shutdown_timeout,
+                max_concurrency: self.max_concurrency,
+            },
+        })
+    }
+}
+
+pub struct Scheduler<P: SchedulerPool> {
+    pub(crate) pool: P,
+    pub(crate) registry: Registry,
+    pub(crate) config: Config,
+}
+
+impl<P: SchedulerPool> Scheduler<P> {
+    /// `worker_id` is a required constructor argument — a `Scheduler` cannot
+    /// exist without one (no `Option`, no runtime "missing worker_id" error).
+    pub fn builder(pool: P, worker_id: WorkerId) -> SchedulerBuilder<P> {
+        SchedulerBuilder::new(pool, worker_id)
+    }
+}
+
+impl From<&str> for JobName {
+    fn from(s: &str) -> Self {
+        JobName::new(s)
+    }
+}
+
+impl From<String> for JobName {
+    fn from(s: String) -> Self {
+        JobName::new(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that `build()` returns `SchedulerError::Config` when no handler
+    /// has been registered. Uses a no-pool sentinel type so we can test the
+    /// builder without a live database.
+    #[test]
+    fn build_errors_on_empty_registry() {
+        /// Minimal fake pool that satisfies the `SchedulerPool` bound but
+        /// cannot actually acquire a connection (used only at the type level).
+        #[derive(Clone)]
+        struct FakePool;
+
+        impl crate::pool::SchedulerPool for FakePool {
+            // Box<AsyncPgConnection> satisfies DerefMut<Target = AsyncPgConnection>.
+            type Conn = Box<diesel_async::AsyncPgConnection>;
+
+            async fn acquire(&self) -> Result<Self::Conn, crate::pool::PoolError> {
+                panic!("FakePool::acquire must never be called in this test")
+            }
+        }
+
+        let worker_id = WorkerId::new("test-worker");
+        let result = Scheduler::<FakePool>::builder(FakePool, worker_id).build();
+
+        match result {
+            Err(SchedulerError::Config(_)) => {} // expected
+            Err(other) => panic!("expected SchedulerError::Config, got {other:?}"),
+            Ok(_) => panic!("build() must fail when no handlers are registered"),
+        }
+    }
+
+    /// Verify that `From<&str>` and `From<String>` conversions for `JobName`
+    /// produce the expected value (compile-time check + equality).
+    #[test]
+    fn job_name_from_impls() {
+        let from_ref: JobName = "my-job".into();
+        let from_owned: JobName = "my-job".to_string().into();
+        assert_eq!(from_ref, from_owned);
+    }
+
+    /// Verify `DEFAULT_MAX_CONCURRENCY` is what we expect (paranoia check that
+    /// the const evaluated correctly — evaluated at compile time, zero runtime
+    /// cost when the assertion passes).
+    #[test]
+    fn default_concurrency_is_16() {
+        assert_eq!(DEFAULT_MAX_CONCURRENCY.get(), 16);
+    }
+}
