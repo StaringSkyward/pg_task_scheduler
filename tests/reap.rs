@@ -19,7 +19,7 @@ async fn dead_letters_exhausted_runs() {
         .await;
     let mut conn = db.pool.get().await.unwrap();
     store::materialize_due_jobs(&mut conn).await.unwrap();
-    let c = store::claim_one(&mut conn, &WorkerId::new("w"), &["j".into()])
+    let c = store::claim_one(&mut conn, &WorkerId::try_from("w").unwrap(), &["j".into()])
         .await
         .unwrap()
         .unwrap();
@@ -48,7 +48,7 @@ async fn leaves_reclaimable_runs() {
         .await;
     let mut conn = db.pool.get().await.unwrap();
     store::materialize_due_jobs(&mut conn).await.unwrap();
-    let c = store::claim_one(&mut conn, &WorkerId::new("w"), &["j".into()])
+    let c = store::claim_one(&mut conn, &WorkerId::try_from("w").unwrap(), &["j".into()])
         .await
         .unwrap()
         .unwrap();

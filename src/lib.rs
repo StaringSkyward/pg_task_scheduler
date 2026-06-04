@@ -30,9 +30,9 @@
 //!     Ok(())
 //! }
 //!
-//! let scheduler = Scheduler::builder(pool, WorkerId::new("api-1"))
+//! let scheduler = Scheduler::builder(pool, WorkerId::try_from("api-1")?)
 //!     .poll_interval(Duration::from_secs(1))
-//!     .register::<DigestArgs, _, _>("send_digest_email", send_digest)
+//!     .register::<DigestArgs, _, _>("send_digest_email", send_digest)?
 //!     .build()?;
 //! scheduler.run_until_shutdown(CancellationToken::new()).await?;
 //! # Ok(()) }
@@ -55,7 +55,7 @@ pub mod admin;
 
 pub use crate::cron::CronExpression;
 pub use crate::error::{JobError, SchedulerError};
-pub use crate::ids::{JobId, JobName, LeaseToken, RunId, WorkerId};
+pub use crate::ids::{IdentifierError, JobId, JobName, LeaseToken, RunId, WorkerId};
 pub use crate::jobs::{CreateJob, ScheduleUpdate};
 pub use crate::models::RunOutcome;
 pub use crate::models::{

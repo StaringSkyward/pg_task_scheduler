@@ -96,7 +96,7 @@ async fn run_with_lease_is_running() {
     let state = store::run_state(&mut conn, run_id).await.unwrap();
     match state {
         Some(RunState::Running(lease)) => {
-            assert_eq!(lease.worker_id, WorkerId::new(worker_id));
+            assert_eq!(lease.worker_id, WorkerId::try_from(worker_id).unwrap());
             // Verify the token round-trips: LeaseToken's inner is private, so we check
             // via Debug that it contains the same UUID string.
             assert!(format!("{lease:?}").contains(&token.to_string()));

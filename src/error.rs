@@ -10,6 +10,8 @@ pub enum SchedulerError {
     Cron(String),
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("invalid identifier: {0}")]
+    Identifier(#[from] crate::ids::IdentifierError),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     /// A structural guarantee was violated (should be impossible); surfaced loudly.

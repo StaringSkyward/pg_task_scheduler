@@ -22,7 +22,7 @@ async fn runs_due_job_end_to_end() {
     let job = jobs::create(
         &mut conn,
         CreateJob {
-            name: JobName::new("counter"),
+            name: JobName::try_from("counter").unwrap(),
             cron: CronExpression::parse("*/1 * * * *").unwrap(),
             job_args: serde_json::json!({"n": 1}),
             lease_duration: LeaseDuration::try_from(Duration::from_secs(60)).unwrap(),
@@ -46,7 +46,7 @@ async fn runs_due_job_end_to_end() {
     drop(conn);
 
     static COUNT: AtomicU32 = AtomicU32::new(0);
-    let scheduler = Scheduler::builder(db.pool.clone(), WorkerId::new("test"))
+    let scheduler = Scheduler::builder(db.pool.clone(), WorkerId::try_from("test").unwrap())
         .poll_interval(Duration::from_millis(100))
         .reaper_interval(Duration::from_secs(5))
         .shutdown_timeout(Duration::from_secs(5))
@@ -55,6 +55,7 @@ async fn runs_due_job_end_to_end() {
             COUNT.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
+        .unwrap()
         .build()
         .unwrap();
 

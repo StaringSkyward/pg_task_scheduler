@@ -40,25 +40,29 @@ async fn shutdown_cancels_in_flight_handler_no_detach() {
     let started_h = started.clone();
     let after_h = after.clone();
 
-    let scheduler = Scheduler::builder(db.pool.clone(), WorkerId::new("shutdown-test"))
-        .poll_interval(Duration::from_millis(50))
-        .reaper_interval(Duration::from_secs(60))
-        .shutdown_timeout(Duration::from_millis(200))
-        .register::<serde_json::Value, _, _>("blocker", move |_ctx, _a| {
-            let started = started_h.clone();
-            let after = after_h.clone();
-            async move {
-                started.notify_one();
-                // Outlasts shutdown_timeout (200ms) so the deadline forces an
-                // abort while the handler is still here; the 3s post-shutdown wait
-                // then leaves a wide margin for a detached orphan to set AFTER.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                after.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        })
-        .build()
-        .unwrap();
+    let scheduler = Scheduler::builder(
+        db.pool.clone(),
+        WorkerId::try_from("shutdown-test").unwrap(),
+    )
+    .poll_interval(Duration::from_millis(50))
+    .reaper_interval(Duration::from_secs(60))
+    .shutdown_timeout(Duration::from_millis(200))
+    .register::<serde_json::Value, _, _>("blocker", move |_ctx, _a| {
+        let started = started_h.clone();
+        let after = after_h.clone();
+        async move {
+            started.notify_one();
+            // Outlasts shutdown_timeout (200ms) so the deadline forces an
+            // abort while the handler is still here; the 3s post-shutdown wait
+            // then leaves a wide margin for a detached orphan to set AFTER.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            after.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .unwrap()
+    .build()
+    .unwrap();
 
     let cancel = CancellationToken::new();
     let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
@@ -104,7 +108,7 @@ async fn panicking_handler_is_not_finalized_and_is_recoverable() {
     let started = Arc::new(Notify::new());
     let started_h = started.clone();
 
-    let scheduler = Scheduler::builder(db.pool.clone(), WorkerId::new("panic-test"))
+    let scheduler = Scheduler::builder(db.pool.clone(), WorkerId::try_from("panic-test").unwrap())
         .poll_interval(Duration::from_millis(50))
         .reaper_interval(Duration::from_secs(60))
         .shutdown_timeout(Duration::from_millis(200))
@@ -115,6 +119,7 @@ async fn panicking_handler_is_not_finalized_and_is_recoverable() {
                 panic!("handler boom");
             }
         })
+        .unwrap()
         .build()
         .unwrap();
 

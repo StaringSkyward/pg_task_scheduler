@@ -17,7 +17,7 @@ async fn claims_pending_and_marks_running() {
     let mut conn = db.pool.get().await.unwrap();
     store::materialize_due_jobs(&mut conn).await.unwrap();
 
-    let w = WorkerId::new("w1");
+    let w = WorkerId::try_from("w1").unwrap();
     let claimed = store::claim_one(&mut conn, &w, &names(&["j"]))
         .await
         .unwrap()
@@ -42,7 +42,7 @@ async fn does_not_claim_unregistered_job() {
         .await;
     let mut conn = db.pool.get().await.unwrap();
     store::materialize_due_jobs(&mut conn).await.unwrap();
-    let w = WorkerId::new("w1");
+    let w = WorkerId::try_from("w1").unwrap();
     assert!(
         store::claim_one(&mut conn, &w, &names(&["other"]))
             .await
@@ -61,7 +61,10 @@ async fn concurrent_workers_claim_disjoint() {
         let mut c = db.pool.get().await.unwrap();
         store::materialize_due_jobs(&mut c).await.unwrap();
     }
-    let (w1, w2) = (WorkerId::new("w1"), WorkerId::new("w2"));
+    let (w1, w2) = (
+        WorkerId::try_from("w1").unwrap(),
+        WorkerId::try_from("w2").unwrap(),
+    );
     let names = names(&["j"]);
     let mut c1 = db.pool.get().await.unwrap();
     let mut c2 = db.pool.get().await.unwrap();
@@ -92,7 +95,7 @@ async fn reclaims_expired_until_max_attempts() {
         .await;
     let mut conn = db.pool.get().await.unwrap();
     store::materialize_due_jobs(&mut conn).await.unwrap();
-    let w = WorkerId::new("w");
+    let w = WorkerId::try_from("w").unwrap();
 
     let a = store::claim_one(&mut conn, &w, &names(&["j"]))
         .await

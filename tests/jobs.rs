@@ -11,7 +11,7 @@ use pg_task_scheduler::{
 
 fn spec(name: &str, cron: &str) -> CreateJob {
     CreateJob {
-        name: JobName::new(name),
+        name: JobName::try_from(name).unwrap(),
         cron: CronExpression::parse(cron).unwrap(),
         job_args: serde_json::json!({"k": "v"}),
         lease_duration: LeaseDuration::try_from(Duration::from_secs(300)).unwrap(),

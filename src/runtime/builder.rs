@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::error::{JobError, SchedulerError};
-use crate::ids::{JobName, WorkerId};
+use crate::ids::{IdentifierError, JobName, WorkerId};
 use crate::pool::SchedulerPool;
 use crate::runtime::context::JobContext;
 use crate::runtime::registry::Registry;
@@ -63,14 +63,19 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         self
     }
 
-    pub fn register<A, F, Fut>(mut self, name: impl Into<JobName>, handler: F) -> Self
+    pub fn register<A, F, Fut>(
+        mut self,
+        name: impl TryInto<JobName, Error: Into<IdentifierError>>,
+        handler: F,
+    ) -> Result<Self, IdentifierError>
     where
         A: serde::de::DeserializeOwned + Send + 'static,
         F: Fn(JobContext, A) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
     {
-        self.registry.register(name.into(), handler);
-        self
+        let name = name.try_into().map_err(Into::into)?;
+        self.registry.register(name, handler);
+        Ok(self)
     }
 
     pub fn build(self) -> Result<Scheduler<P>, SchedulerError> {
@@ -107,18 +112,6 @@ impl<P: SchedulerPool> Scheduler<P> {
     }
 }
 
-impl From<&str> for JobName {
-    fn from(s: &str) -> Self {
-        JobName::new(s)
-    }
-}
-
-impl From<String> for JobName {
-    fn from(s: String) -> Self {
-        JobName::new(s)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +135,7 @@ mod tests {
             }
         }
 
-        let worker_id = WorkerId::new("test-worker");
+        let worker_id = WorkerId::try_from("test-worker").unwrap();
         let result = Scheduler::<FakePool>::builder(FakePool, worker_id).build();
 
         match result {
@@ -150,15 +143,6 @@ mod tests {
             Err(other) => panic!("expected SchedulerError::Config, got {other:?}"),
             Ok(_) => panic!("build() must fail when no handlers are registered"),
         }
-    }
-
-    /// Verify that `From<&str>` and `From<String>` conversions for `JobName`
-    /// produce the expected value (compile-time check + equality).
-    #[test]
-    fn job_name_from_impls() {
-        let from_ref: JobName = "my-job".into();
-        let from_owned: JobName = "my-job".to_string().into();
-        assert_eq!(from_ref, from_owned);
     }
 
     /// Verify `DEFAULT_MAX_CONCURRENCY` is what we expect (paranoia check that

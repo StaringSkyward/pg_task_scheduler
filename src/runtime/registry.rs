@@ -71,7 +71,7 @@ mod tests {
         JobContext {
             run_id: RunId(uuid::Uuid::new_v4()),
             job_id: JobId(uuid::Uuid::new_v4()),
-            job_name: JobName::new("t"),
+            job_name: JobName::try_from("t").unwrap(),
             scheduled_for: Utc::now(),
             attempt: NonZeroU32::new(1).unwrap(),
             lease_token: LeaseToken::generate(),
@@ -87,11 +87,11 @@ mod tests {
         }
         static SUM: AtomicI64 = AtomicI64::new(0);
         let mut reg = Registry::new();
-        reg.register::<Args, _, _>(JobName::new("t"), |_ctx, a| async move {
+        reg.register::<Args, _, _>(JobName::try_from("t").unwrap(), |_ctx, a| async move {
             SUM.fetch_add(a.n, Ordering::SeqCst);
             Ok(())
         });
-        reg.get(&JobName::new("t")).unwrap()(ctx(), serde_json::json!({"n": 5}))
+        reg.get(&JobName::try_from("t").unwrap()).unwrap()(ctx(), serde_json::json!({"n": 5}))
             .await
             .unwrap();
         assert_eq!(SUM.load(Ordering::SeqCst), 5);
@@ -104,9 +104,14 @@ mod tests {
             _n: i64,
         }
         let mut reg = Registry::new();
-        reg.register::<Args, _, _>(JobName::new("t"), |_c, _a: Args| async { Ok(()) });
-        let r =
-            reg.get(&JobName::new("t")).unwrap()(ctx(), serde_json::json!({"wrong": true})).await;
+        reg.register::<Args, _, _>(JobName::try_from("t").unwrap(), |_c, _a: Args| async {
+            Ok(())
+        });
+        let r = reg.get(&JobName::try_from("t").unwrap()).unwrap()(
+            ctx(),
+            serde_json::json!({"wrong": true}),
+        )
+        .await;
         assert!(r.is_err());
     }
 }
