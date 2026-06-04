@@ -178,8 +178,9 @@ lease and an outcome — is enforced by two triggers, keeping it in the schema:
 ### Type model
 
 Identity, units, and security-sensitive values are newtypes, not raw primitives: `JobId`, `RunId`,
-`JobName`, `LeaseToken`, `WorkerId`, `MaxAttempts(NonZeroU32)`, `LeaseDuration(Duration)` (checked
-conversion to `INTERVAL`, never `as`), and `CronExpression` (parse-don't-validate at the
+`JobName`, `LeaseToken`, `WorkerId`, `MaxAttempts(NonZeroU32)`, `LeaseDuration` (checked
+`TryFrom<Duration>`, microsecond-exact, converted to `INTERVAL` without `as`), and `CronExpression`
+(parse-don't-validate at the
 job-creation boundary). The `run_outcome` enum maps to a Rust enum via `diesel-derive-enum` whose
 `FromSql` rejects unknown labels — no stringly status, no partial `Option` decode.
 
@@ -398,12 +399,12 @@ Example shape:
 
 ```rust
 // worker_id is a constructor argument, so a scheduler cannot be built without one.
-let scheduler = Scheduler::builder(pool, WorkerId::new("api-1"))
+let scheduler = Scheduler::builder(pool, WorkerId::try_from("api-1")?)
     .poll_interval(Duration::from_secs(1))
     .reaper_interval(Duration::from_secs(20))
     .shutdown_timeout(Duration::from_secs(25))
-    .register::<DigestArgs, _>("send_digest_email", send_digest_email)
-    .register::<SyncArgs, _>("sync_accounts", sync_accounts)
+    .register::<DigestArgs, _, _>("send_digest_email", send_digest_email)?
+    .register::<SyncArgs, _, _>("sync_accounts", sync_accounts)?
     .build()?; // errors only if no handler was registered
 
 scheduler.run_until_shutdown(cancel_token).await?; // tokio_util::sync::CancellationToken

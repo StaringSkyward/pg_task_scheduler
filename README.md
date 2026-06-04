@@ -34,9 +34,9 @@ async fn send_digest(ctx: JobContext, _args: DigestArgs) -> Result<(), JobError>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `pool` is a diesel_async deadpool (or bb8/mobc) Pool<AsyncPgConnection>.
-    let scheduler = Scheduler::builder(pool, WorkerId::new("api-1"))
+    let scheduler = Scheduler::builder(pool, WorkerId::try_from("api-1")?)
         .poll_interval(Duration::from_secs(1))
-        .register::<DigestArgs, _, _>("send_digest_email", send_digest)
+        .register::<DigestArgs, _, _>("send_digest_email", send_digest)?
         .build()?;
     scheduler.run_until_shutdown(CancellationToken::new()).await?;
     Ok(())
