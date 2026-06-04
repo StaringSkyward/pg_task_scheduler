@@ -1,5 +1,7 @@
 //! Crate error types.
 
+use crate::ids::{IdentifierError, JobName};
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error("database error: {0}")]
@@ -11,12 +13,28 @@ pub enum SchedulerError {
     #[error("configuration error: {0}")]
     Config(String),
     #[error("invalid identifier: {0}")]
-    Identifier(#[from] crate::ids::IdentifierError),
+    Identifier(#[from] IdentifierError),
+    #[error(transparent)]
+    Register(#[from] RegisterError),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+}
+
+/// A handler was already registered for this job name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a handler is already registered for job name {}", .0.as_str())]
+pub struct DuplicateJobName(pub JobName);
+
+/// Why `SchedulerBuilder::register` rejected a registration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RegisterError {
+    #[error(transparent)]
+    Name(#[from] IdentifierError),
+    #[error(transparent)]
+    Duplicate(#[from] DuplicateJobName),
 }
 
 /// Opaque handler error. Deliberately does NOT implement `std::error::Error`

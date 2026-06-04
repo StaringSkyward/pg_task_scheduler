@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use crate::error::{JobError, SchedulerError};
+use crate::error::{JobError, RegisterError, SchedulerError};
 use crate::ids::{IdentifierError, JobName, WorkerId};
 use crate::pool::SchedulerPool;
 use crate::runtime::context::JobContext;
@@ -28,6 +28,19 @@ pub struct SchedulerBuilder<P: SchedulerPool> {
     reaper_interval: Duration,
     shutdown_timeout: Duration,
     max_concurrency: NonZeroUsize,
+}
+
+impl<P: SchedulerPool + std::fmt::Debug> std::fmt::Debug for SchedulerBuilder<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulerBuilder")
+            .field("registry", &self.registry)
+            .field("worker_id", &self.worker_id)
+            .field("poll_interval", &self.poll_interval)
+            .field("reaper_interval", &self.reaper_interval)
+            .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("max_concurrency", &self.max_concurrency)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<P: SchedulerPool> SchedulerBuilder<P> {
@@ -67,14 +80,14 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         mut self,
         name: impl TryInto<JobName, Error: Into<IdentifierError>>,
         handler: F,
-    ) -> Result<Self, IdentifierError>
+    ) -> Result<Self, RegisterError>
     where
         A: serde::de::DeserializeOwned + Send + 'static,
         F: Fn(JobContext, A) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
     {
-        let name = name.try_into().map_err(Into::into)?;
-        self.registry.register(name, handler);
+        let name = name.try_into().map_err(Into::into)?; // E -> IdentifierError -> RegisterError::Name
+        self.registry.register(name, handler)?; // DuplicateJobName -> RegisterError::Duplicate
         Ok(self)
     }
 
@@ -116,25 +129,23 @@ impl<P: SchedulerPool> Scheduler<P> {
 mod tests {
     use super::*;
 
-    /// Verify that `build()` returns `SchedulerError::Config` when no handler
-    /// has been registered. Uses a no-pool sentinel type so we can test the
-    /// builder without a live database.
+    /// Minimal fake pool satisfying `SchedulerPool` at the type level; it never
+    /// acquires a connection (used only so the builder can be constructed in tests).
+    #[derive(Clone, Debug)]
+    struct FakePool;
+
+    impl crate::pool::SchedulerPool for FakePool {
+        // Box<AsyncPgConnection> satisfies DerefMut<Target = AsyncPgConnection>.
+        type Conn = Box<diesel_async::AsyncPgConnection>;
+
+        async fn acquire(&self) -> Result<Self::Conn, crate::pool::PoolError> {
+            panic!("FakePool::acquire must never be called in this test")
+        }
+    }
+
+    /// `build()` returns `SchedulerError::Config` when no handler is registered.
     #[test]
     fn build_errors_on_empty_registry() {
-        /// Minimal fake pool that satisfies the `SchedulerPool` bound but
-        /// cannot actually acquire a connection (used only at the type level).
-        #[derive(Clone)]
-        struct FakePool;
-
-        impl crate::pool::SchedulerPool for FakePool {
-            // Box<AsyncPgConnection> satisfies DerefMut<Target = AsyncPgConnection>.
-            type Conn = Box<diesel_async::AsyncPgConnection>;
-
-            async fn acquire(&self) -> Result<Self::Conn, crate::pool::PoolError> {
-                panic!("FakePool::acquire must never be called in this test")
-            }
-        }
-
         let worker_id = WorkerId::try_from("test-worker").unwrap();
         let result = Scheduler::<FakePool>::builder(FakePool, worker_id).build();
 
@@ -145,9 +156,41 @@ mod tests {
         }
     }
 
-    /// Verify `DEFAULT_MAX_CONCURRENCY` is what we expect (paranoia check that
-    /// the const evaluated correctly — evaluated at compile time, zero runtime
-    /// cost when the assertion passes).
+    /// Registering the same name twice is rejected at the second `register`.
+    #[test]
+    fn builder_rejects_duplicate_registration() {
+        let builder = Scheduler::<FakePool>::builder(FakePool, WorkerId::try_from("w").unwrap())
+            .register::<serde_json::Value, _, _>("dup", |_c, _a| async { Ok(()) })
+            .unwrap();
+        let err = builder
+            .register::<serde_json::Value, _, _>("dup", |_c, _a| async { Ok(()) })
+            .unwrap_err();
+        assert!(matches!(err, RegisterError::Duplicate(_)), "got {err:?}");
+    }
+
+    /// An invalid job name still surfaces, now through `RegisterError::Name`.
+    #[test]
+    fn builder_rejects_invalid_name() {
+        let err = Scheduler::<FakePool>::builder(FakePool, WorkerId::try_from("w").unwrap())
+            .register::<serde_json::Value, _, _>("", |_c, _a| async { Ok(()) })
+            .unwrap_err();
+        assert!(
+            matches!(err, RegisterError::Name(IdentifierError::Empty)),
+            "got {err:?}"
+        );
+    }
+
+    /// Guards the `impl TryInto<JobName, Error: Into<IdentifierError>>` signature:
+    /// an already-constructed `JobName` is still accepted by `register`.
+    #[test]
+    fn builder_accepts_prebuilt_job_name() {
+        let name = JobName::try_from("built").unwrap();
+        let result = Scheduler::<FakePool>::builder(FakePool, WorkerId::try_from("w").unwrap())
+            .register::<serde_json::Value, _, _>(name, |_c, _a| async { Ok(()) });
+        assert!(result.is_ok());
+    }
+
+    /// `DEFAULT_MAX_CONCURRENCY` evaluates to 16 (compile-time const sanity check).
     #[test]
     fn default_concurrency_is_16() {
         assert_eq!(DEFAULT_MAX_CONCURRENCY.get(), 16);

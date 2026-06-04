@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 
-use crate::error::JobError;
+use crate::error::{DuplicateJobName, JobError};
 use crate::ids::JobName;
 use crate::runtime::context::JobContext;
 
@@ -15,6 +15,14 @@ pub type Handler = Arc<
 #[derive(Clone, Default)]
 pub struct Registry {
     handlers: HashMap<JobName, Handler>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("handler_count", &self.handlers.len())
+            .finish()
+    }
 }
 
 impl Registry {
@@ -40,13 +48,17 @@ impl Registry {
 
     /// Register a typed handler. `job_args` (a `serde_json::Value`) is deserialized
     /// into `A` at this boundary. A deserialize failure becomes `Err(JobError::from(e))`,
-    /// never a panic.
-    pub fn register<A, F, Fut>(&mut self, name: JobName, handler: F)
+    /// never a panic. Returns `Err(DuplicateJobName)` if a handler is already registered
+    /// for `name`; the first handler wins and is never replaced.
+    pub fn register<A, F, Fut>(&mut self, name: JobName, handler: F) -> Result<(), DuplicateJobName>
     where
         A: DeserializeOwned + Send + 'static,
         F: Fn(JobContext, A) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
     {
+        if self.handlers.contains_key(&name) {
+            return Err(DuplicateJobName(name)); // first handler wins; do not insert
+        }
         let handler = Arc::new(handler);
         let boxed: Handler = Arc::new(move |ctx, value| {
             let handler = handler.clone();
@@ -56,6 +68,7 @@ impl Registry {
             }
         });
         self.handlers.insert(name, boxed);
+        Ok(())
     }
 }
 
@@ -90,7 +103,8 @@ mod tests {
         reg.register::<Args, _, _>(JobName::try_from("t").unwrap(), |_ctx, a| async move {
             SUM.fetch_add(a.n, Ordering::SeqCst);
             Ok(())
-        });
+        })
+        .unwrap();
         reg.get(&JobName::try_from("t").unwrap()).unwrap()(ctx(), serde_json::json!({"n": 5}))
             .await
             .unwrap();
@@ -106,12 +120,53 @@ mod tests {
         let mut reg = Registry::new();
         reg.register::<Args, _, _>(JobName::try_from("t").unwrap(), |_c, _a: Args| async {
             Ok(())
-        });
+        })
+        .unwrap();
         let r = reg.get(&JobName::try_from("t").unwrap()).unwrap()(
             ctx(),
             serde_json::json!({"wrong": true}),
         )
         .await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_is_rejected_first_wins() {
+        static RAN: AtomicI64 = AtomicI64::new(0);
+        let mut reg = Registry::new();
+        // First handler for "x" increments by 1.
+        reg.register::<serde_json::Value, _, _>(JobName::try_from("x").unwrap(), |_c, _a| async {
+            RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        // A second handler for "x" (would increment by 100) must be rejected.
+        let err = reg
+            .register::<serde_json::Value, _, _>(JobName::try_from("x").unwrap(), |_c, _a| async {
+                RAN.fetch_add(100, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(err, DuplicateJobName(JobName::try_from("x").unwrap()));
+        // First-wins: the retained handler is the FIRST one.
+        reg.get(&JobName::try_from("x").unwrap()).unwrap()(ctx(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn distinct_names_both_register() {
+        let mut reg = Registry::new();
+        reg.register::<serde_json::Value, _, _>(JobName::try_from("a").unwrap(), |_c, _a| async {
+            Ok(())
+        })
+        .unwrap();
+        reg.register::<serde_json::Value, _, _>(JobName::try_from("b").unwrap(), |_c, _a| async {
+            Ok(())
+        })
+        .unwrap();
+        assert!(reg.get(&JobName::try_from("a").unwrap()).is_some());
+        assert!(reg.get(&JobName::try_from("b").unwrap()).is_some());
     }
 }

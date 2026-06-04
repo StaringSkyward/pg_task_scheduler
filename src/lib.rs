@@ -54,7 +54,7 @@ pub mod runtime;
 pub mod admin;
 
 pub use crate::cron::CronExpression;
-pub use crate::error::{JobError, SchedulerError};
+pub use crate::error::{DuplicateJobName, JobError, RegisterError, SchedulerError};
 pub use crate::ids::{IdentifierError, JobId, JobName, LeaseToken, RunId, WorkerId};
 pub use crate::jobs::{CreateJob, ScheduleUpdate};
 pub use crate::models::RunOutcome;
