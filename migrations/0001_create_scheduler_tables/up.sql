@@ -2,7 +2,9 @@ CREATE TYPE run_outcome AS ENUM ('completed', 'failed');
 
 CREATE TABLE scheduler_jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name            TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL UNIQUE
+                    CHECK (char_length(name) BETWEEN 1 AND 255
+                           AND name !~ '^[[:space:]]|[[:space:]]$'),
     cron_expression TEXT NOT NULL,
     job_args        JSONB NOT NULL DEFAULT '{}'::jsonb,
     next_run_at     TIMESTAMPTZ NOT NULL,
@@ -28,7 +30,9 @@ CREATE UNIQUE INDEX scheduler_runs_job_id_scheduled_for_idx
 
 CREATE TABLE scheduler_run_leases (
     run_id           UUID PRIMARY KEY REFERENCES scheduler_runs (id) ON DELETE CASCADE,
-    worker_id        TEXT NOT NULL,
+    worker_id        TEXT NOT NULL
+                     CHECK (char_length(worker_id) BETWEEN 1 AND 255
+                            AND worker_id !~ '^[[:space:]]|[[:space:]]$'),
     lease_token      UUID NOT NULL,
     lease_expires_at TIMESTAMPTZ NOT NULL,
     started_at       TIMESTAMPTZ NOT NULL DEFAULT now()
