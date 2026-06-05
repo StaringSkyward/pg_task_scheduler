@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
-use crate::error::SchedulerError;
+use crate::error::{CorruptJobRow, SchedulerError};
+use crate::ids::JobId;
 
 /// A five-field cron expression validated at construction (parse, don't validate).
 #[derive(Debug, Clone)]
@@ -11,15 +12,32 @@ pub struct CronExpression {
 
 impl CronExpression {
     pub fn parse(source: impl Into<String>) -> Result<Self, SchedulerError> {
-        let source = source.into();
-        let schedule = croner::Cron::new(&source)
-            .parse()
-            .map_err(|e| SchedulerError::Cron(format!("{source:?}: {e}")))?;
-        Ok(Self { source, schedule })
+        Self::parse_inner(source.into()).map_err(SchedulerError::Cron)
     }
 
     pub fn as_str(&self) -> &str {
         &self.source
+    }
+
+    /// Parse a cron string read back from storage, attributing a parse failure to
+    /// the owning job as [`SchedulerError::CorruptJob`] rather than a bare
+    /// [`SchedulerError::Cron`]. Used by the `Job` projection and `jobs::reschedule`.
+    pub(crate) fn parse_stored(job_id: JobId, source: &str) -> Result<Self, SchedulerError> {
+        Self::parse_inner(source.to_owned()).map_err(|detail| SchedulerError::CorruptJob {
+            job_id,
+            source: CorruptJobRow::Cron(detail),
+        })
+    }
+
+    /// Shared parse core. On failure returns the formatted detail
+    /// (`"<source>": <croner error>`), which each public constructor wraps in its
+    /// own error variant — so the detail is never double-prefixed by passing through
+    /// another error type's `Display`.
+    fn parse_inner(source: String) -> Result<Self, String> {
+        let schedule = croner::Cron::new(&source)
+            .parse()
+            .map_err(|e| format!("{source:?}: {e}"))?;
+        Ok(Self { source, schedule })
     }
 
     /// Next occurrence strictly after `after` (run_once misfire semantics).
@@ -80,5 +98,21 @@ mod tests {
             CronExpression::parse("17 * * * *").unwrap().as_str(),
             "17 * * * *"
         );
+    }
+
+    #[test]
+    fn parse_stored_maps_garbage_to_corrupt_job() {
+        let id = JobId(uuid::Uuid::nil());
+        let err = CronExpression::parse_stored(id, "not a cron").unwrap_err();
+        assert!(matches!(
+            err,
+            SchedulerError::CorruptJob { source: CorruptJobRow::Cron(_), .. }
+        ));
+    }
+
+    #[test]
+    fn parse_stored_accepts_valid() {
+        let id = JobId(uuid::Uuid::nil());
+        assert!(CronExpression::parse_stored(id, "17 * * * *").is_ok());
     }
 }
