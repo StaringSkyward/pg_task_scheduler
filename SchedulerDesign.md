@@ -178,7 +178,7 @@ lease and an outcome — is enforced by two triggers, keeping it in the schema:
 ### Type model
 
 Identity, units, and security-sensitive values are newtypes, not raw primitives: `JobId`, `RunId`,
-`JobName`, `LeaseToken`, `WorkerId`, `MaxAttempts(NonZeroU32)`, `LeaseDuration` (checked
+`JobName`, `LeaseToken`, `WorkerId`, `MaxAttempts` (opaque, `NonZeroI32`-backed, validated via `TryFrom<u32>`), `LeaseDuration` (checked
 `TryFrom<Duration>`, microsecond-exact, converted to `INTERVAL` without `as`), and `CronExpression`
 (parse-don't-validate at the
 job-creation boundary). The `run_outcome` enum maps to a Rust enum via `diesel-derive-enum` whose
