@@ -106,7 +106,10 @@ mod tests {
         let err = CronExpression::parse_stored(id, "not a cron").unwrap_err();
         assert!(matches!(
             err,
-            SchedulerError::CorruptJob { source: CorruptJobRow::Cron(_), .. }
+            SchedulerError::CorruptJob {
+                source: CorruptJobRow::Cron(_),
+                ..
+            }
         ));
     }
 

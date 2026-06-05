@@ -92,7 +92,9 @@ pub enum LeaseDurationError {
     PrecisionLoss,
     #[error("lease duration exceeds the maximum of i64::MAX microseconds")]
     TooLarge,
-    #[error("lease interval has calendar components (months={months}, days={days}); only microseconds are valid")]
+    #[error(
+        "lease interval has calendar components (months={months}, days={days}); only microseconds are valid"
+    )]
     CalendarComponent { months: i32, days: i32 },
     #[error("lease interval is negative: {microseconds} microseconds")]
     Negative { microseconds: i64 },
@@ -161,7 +163,9 @@ impl LeaseDuration {
             });
         }
         if iv.microseconds < 0 {
-            return Err(LeaseDurationError::Negative { microseconds: iv.microseconds });
+            return Err(LeaseDurationError::Negative {
+                microseconds: iv.microseconds,
+            });
         }
         let micros = NonZeroI64::new(iv.microseconds).ok_or(LeaseDurationError::Zero)?;
         Ok(LeaseDuration { micros })
@@ -236,10 +240,17 @@ impl TryFrom<SchedulerJob> for Job {
     fn try_from(row: SchedulerJob) -> Result<Self, SchedulerError> {
         let job_id = row.id;
         let cron = CronExpression::parse_stored(job_id, &row.cron_expression)?;
-        let lease_duration = LeaseDuration::from_pg_interval(row.lease_duration)
-            .map_err(|e| SchedulerError::CorruptJob { job_id, source: e.into() })?;
-        let max_attempts = MaxAttempts::from_db_i32(row.max_attempts)
-            .map_err(|e| SchedulerError::CorruptJob { job_id, source: e.into() })?;
+        let lease_duration = LeaseDuration::from_pg_interval(row.lease_duration).map_err(|e| {
+            SchedulerError::CorruptJob {
+                job_id,
+                source: e.into(),
+            }
+        })?;
+        let max_attempts =
+            MaxAttempts::from_db_i32(row.max_attempts).map_err(|e| SchedulerError::CorruptJob {
+                job_id,
+                source: e.into(),
+            })?;
         Ok(Job {
             id: job_id,
             name: row.name,
@@ -337,7 +348,10 @@ mod max_attempts_tests {
 
     #[test]
     fn try_from_zero_is_non_positive() {
-        assert_eq!(MaxAttempts::try_from(0u32), Err(MaxAttemptsError::NonPositive));
+        assert_eq!(
+            MaxAttempts::try_from(0u32),
+            Err(MaxAttemptsError::NonPositive)
+        );
     }
 
     #[test]
@@ -359,8 +373,14 @@ mod max_attempts_tests {
 
     #[test]
     fn from_db_rejects_non_positive() {
-        assert_eq!(MaxAttempts::from_db_i32(0), Err(MaxAttemptsError::NonPositive));
-        assert_eq!(MaxAttempts::from_db_i32(-1), Err(MaxAttemptsError::NonPositive));
+        assert_eq!(
+            MaxAttempts::from_db_i32(0),
+            Err(MaxAttemptsError::NonPositive)
+        );
+        assert_eq!(
+            MaxAttempts::from_db_i32(-1),
+            Err(MaxAttemptsError::NonPositive)
+        );
     }
 
     #[test]
@@ -418,31 +438,50 @@ mod job_projection_tests {
 
     #[test]
     fn non_positive_max_attempts_is_corrupt() {
-        let row = SchedulerJob { max_attempts: 0, ..good_row() };
+        let row = SchedulerJob {
+            max_attempts: 0,
+            ..good_row()
+        };
         assert!(matches!(
             Job::try_from(row),
-            Err(SchedulerError::CorruptJob { source: CorruptJobRow::MaxAttempts(_), .. })
+            Err(SchedulerError::CorruptJob {
+                source: CorruptJobRow::MaxAttempts(_),
+                ..
+            })
         ));
     }
 
     #[test]
     fn unparseable_cron_is_corrupt() {
-        let row = SchedulerJob { cron_expression: "garbage".to_owned(), ..good_row() };
+        let row = SchedulerJob {
+            cron_expression: "garbage".to_owned(),
+            ..good_row()
+        };
         assert!(matches!(
             Job::try_from(row),
-            Err(SchedulerError::CorruptJob { source: CorruptJobRow::Cron(_), .. })
+            Err(SchedulerError::CorruptJob {
+                source: CorruptJobRow::Cron(_),
+                ..
+            })
         ));
     }
 
     #[test]
     fn calendar_lease_is_corrupt() {
         let row = SchedulerJob {
-            lease_duration: diesel::pg::data_types::PgInterval { microseconds: 0, days: 1, months: 0 },
+            lease_duration: diesel::pg::data_types::PgInterval {
+                microseconds: 0,
+                days: 1,
+                months: 0,
+            },
             ..good_row()
         };
         assert!(matches!(
             Job::try_from(row),
-            Err(SchedulerError::CorruptJob { source: CorruptJobRow::LeaseDuration(_), .. })
+            Err(SchedulerError::CorruptJob {
+                source: CorruptJobRow::LeaseDuration(_),
+                ..
+            })
         ));
     }
 }
@@ -517,7 +556,11 @@ mod lease_duration_tests {
 
     #[test]
     fn from_pg_interval_rejects_days() {
-        let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 1, months: 0 };
+        let iv = diesel::pg::data_types::PgInterval {
+            microseconds: 0,
+            days: 1,
+            months: 0,
+        };
         assert_eq!(
             LeaseDuration::from_pg_interval(iv),
             Err(LeaseDurationError::CalendarComponent { months: 0, days: 1 })
@@ -526,7 +569,11 @@ mod lease_duration_tests {
 
     #[test]
     fn from_pg_interval_rejects_months() {
-        let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 0, months: 1 };
+        let iv = diesel::pg::data_types::PgInterval {
+            microseconds: 0,
+            days: 0,
+            months: 1,
+        };
         assert_eq!(
             LeaseDuration::from_pg_interval(iv),
             Err(LeaseDurationError::CalendarComponent { months: 1, days: 0 })
@@ -535,13 +582,24 @@ mod lease_duration_tests {
 
     #[test]
     fn from_pg_interval_rejects_zero_micros() {
-        let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 0, months: 0 };
-        assert_eq!(LeaseDuration::from_pg_interval(iv), Err(LeaseDurationError::Zero));
+        let iv = diesel::pg::data_types::PgInterval {
+            microseconds: 0,
+            days: 0,
+            months: 0,
+        };
+        assert_eq!(
+            LeaseDuration::from_pg_interval(iv),
+            Err(LeaseDurationError::Zero)
+        );
     }
 
     #[test]
     fn from_pg_interval_rejects_negative_micros() {
-        let iv = diesel::pg::data_types::PgInterval { microseconds: -1, days: 0, months: 0 };
+        let iv = diesel::pg::data_types::PgInterval {
+            microseconds: -1,
+            days: 0,
+            months: 0,
+        };
         assert_eq!(
             LeaseDuration::from_pg_interval(iv),
             Err(LeaseDurationError::Negative { microseconds: -1 })

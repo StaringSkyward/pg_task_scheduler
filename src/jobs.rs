@@ -94,10 +94,7 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
 
 /// Strict insert: errors if a job with this name already exists. The initial
 /// cursor is computed from the DB clock.
-pub async fn create(
-    conn: &mut AsyncPgConnection,
-    spec: CreateJob,
-) -> Result<Job, SchedulerError> {
+pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job, SchedulerError> {
     let row = conn
         .transaction::<SchedulerJob, SchedulerError, _>(|c| {
             async move {
@@ -201,10 +198,7 @@ pub async fn reschedule(
     row.map(Job::try_from).transpose()
 }
 
-pub async fn get(
-    conn: &mut AsyncPgConnection,
-    id: JobId,
-) -> Result<Option<Job>, SchedulerError> {
+pub async fn get(conn: &mut AsyncPgConnection, id: JobId) -> Result<Option<Job>, SchedulerError> {
     let row: Option<SchedulerJob> = j::scheduler_jobs
         .find(id)
         .select(SchedulerJob::as_returning())

@@ -113,12 +113,20 @@ async fn pause_resume_list_get_delete() {
         .unwrap();
     jobs::pause(&mut conn, job.id).await.unwrap();
     assert_eq!(
-        jobs::get(&mut conn, job.id).await.unwrap().unwrap().lifecycle,
+        jobs::get(&mut conn, job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle,
         JobLifecycle::Paused
     );
     jobs::resume(&mut conn, job.id).await.unwrap();
     assert_eq!(
-        jobs::get(&mut conn, job.id).await.unwrap().unwrap().lifecycle,
+        jobs::get(&mut conn, job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle,
         JobLifecycle::Active
     );
     assert_eq!(jobs::list(&mut conn).await.unwrap().len(), 1);
@@ -225,7 +233,10 @@ async fn get_unparseable_cron_is_corrupt_job() {
     let res = jobs::get(&mut conn, JobId(id)).await;
     assert!(matches!(
         res,
-        Err(SchedulerError::CorruptJob { source: CorruptJobRow::Cron(_), .. })
+        Err(SchedulerError::CorruptJob {
+            source: CorruptJobRow::Cron(_),
+            ..
+        })
     ));
     db.cleanup().await;
 }
@@ -249,7 +260,10 @@ async fn get_calendar_lease_interval_is_corrupt_job() {
     let res = jobs::get(&mut conn, JobId(id)).await;
     assert!(matches!(
         res,
-        Err(SchedulerError::CorruptJob { source: CorruptJobRow::LeaseDuration(_), .. })
+        Err(SchedulerError::CorruptJob {
+            source: CorruptJobRow::LeaseDuration(_),
+            ..
+        })
     ));
     db.cleanup().await;
 }
