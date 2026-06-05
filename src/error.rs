@@ -1,6 +1,7 @@
 //! Crate error types.
 
-use crate::ids::{IdentifierError, JobName};
+use crate::ids::{IdentifierError, JobId, JobName};
+use crate::models::{LeaseDurationError, MaxAttemptsError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -21,6 +22,29 @@ pub enum SchedulerError {
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+    /// A persisted `scheduler_jobs` row failed to project into a domain `Job`
+    /// because a stored value violates an invariant the scheduler guarantees on
+    /// write (e.g. the row was edited directly in SQL).
+    #[error("corrupt job row {job_id:?}: {source}")]
+    CorruptJob {
+        job_id: JobId,
+        #[source]
+        source: CorruptJobRow,
+    },
+}
+
+/// Why a stored `scheduler_jobs` row failed to project into a domain `Job`. Each
+/// arm is a value the scheduler guarantees on write, so reaching one means the row
+/// was corrupted. The cron arm is a `String` because cron errors are stringly
+/// crate-wide (`src/cron.rs`); tightening that is a separate finding.
+#[derive(Debug, thiserror::Error)]
+pub enum CorruptJobRow {
+    #[error("unparseable cron: {0}")]
+    Cron(String),
+    #[error(transparent)]
+    LeaseDuration(#[from] LeaseDurationError),
+    #[error(transparent)]
+    MaxAttempts(#[from] MaxAttemptsError),
 }
 
 /// A handler was already registered for this job name.
@@ -84,5 +108,11 @@ mod tests {
     fn job_error_msg_display() {
         let job_err = JobError::msg("e");
         assert_eq!(job_err.to_string(), "e");
+    }
+
+    #[test]
+    fn corrupt_job_row_from_max_attempts() {
+        let e: CorruptJobRow = MaxAttemptsError::NonPositive.into();
+        assert!(e.to_string().contains("max_attempts"));
     }
 }
