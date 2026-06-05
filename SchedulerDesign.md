@@ -285,8 +285,12 @@ ON CONFLICT (run_id) DO UPDATE
 RETURNING lease_token, lease_expires_at;
 ```
 
-Filtering by registered job names means a worker never claims work it cannot run, so there is no
-"unknown handler" runtime branch. `claim_one` returns a value that always carries a complete lease.
+Filtering by registered job names means a worker never claims work it cannot run, so `dispatch` is
+handed a resolved `Handler` and has no unknown-handler branch. The only remaining miss path is a
+defensive resolution guard *before* `dispatch`: on the structurally-unreachable case where the registry
+and the claim filter disagree, it logs a scheduler-invariant violation and leaves the lease for
+expiry-based recovery rather than finalizing an application failure. `claim_one` returns a value that
+always carries a complete lease.
 
 ### Finalizing Runs
 
