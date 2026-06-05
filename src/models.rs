@@ -94,6 +94,8 @@ pub enum LeaseDurationError {
     TooLarge,
     #[error("lease interval has calendar components (months={months}, days={days}); only microseconds are valid")]
     CalendarComponent { months: i32, days: i32 },
+    #[error("lease interval is negative: {microseconds} microseconds")]
+    Negative { microseconds: i64 },
 }
 
 impl TryFrom<Duration> for LeaseDuration {
@@ -125,12 +127,25 @@ impl MaxAttempts {
     pub(crate) fn to_i32(self) -> i32 {
         self.0.get()
     }
+
+    /// The configured attempt count. Total: the inner is a validated `1..=i32::MAX`,
+    /// so `i32::unsigned_abs` is an exact i32->u32 — no `as` cast, no `unwrap`.
+    pub fn get(self) -> u32 {
+        self.0.get().unsigned_abs()
+    }
 }
 
 impl LeaseDuration {
     /// Total, infallible: `micros` is already a validated positive i64.
     pub(crate) fn to_pg_interval(self) -> diesel::pg::data_types::PgInterval {
         diesel::pg::data_types::PgInterval::from_microseconds(self.micros.get())
+    }
+
+    /// The lease length as a [`std::time::Duration`]. Total: `micros` is a validated
+    /// positive `i64` (1..=i64::MAX), so `i64::unsigned_abs` is an exact i64->u64 —
+    /// no `as` cast, no `unwrap`, no precision loss.
+    pub fn as_duration(self) -> Duration {
+        Duration::from_micros(self.micros.get().unsigned_abs())
     }
 
     /// Read boundary: parse a stored interval back into the domain value. Rejects
@@ -145,10 +160,10 @@ impl LeaseDuration {
                 days: iv.days,
             });
         }
-        let micros = NonZeroI64::new(iv.microseconds).ok_or(LeaseDurationError::Zero)?;
-        if micros.get() < 0 {
-            return Err(LeaseDurationError::Zero);
+        if iv.microseconds < 0 {
+            return Err(LeaseDurationError::Negative { microseconds: iv.microseconds });
         }
+        let micros = NonZeroI64::new(iv.microseconds).ok_or(LeaseDurationError::Zero)?;
         Ok(LeaseDuration { micros })
     }
 }
@@ -352,6 +367,11 @@ mod max_attempts_tests {
     fn from_db_accepts_positive() {
         assert_eq!(MaxAttempts::from_db_i32(3).unwrap().to_i32(), 3);
     }
+
+    #[test]
+    fn get_returns_u32() {
+        assert_eq!(MaxAttempts::try_from(3u32).unwrap().get(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -517,5 +537,20 @@ mod lease_duration_tests {
     fn from_pg_interval_rejects_zero_micros() {
         let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 0, months: 0 };
         assert_eq!(LeaseDuration::from_pg_interval(iv), Err(LeaseDurationError::Zero));
+    }
+
+    #[test]
+    fn from_pg_interval_rejects_negative_micros() {
+        let iv = diesel::pg::data_types::PgInterval { microseconds: -1, days: 0, months: 0 };
+        assert_eq!(
+            LeaseDuration::from_pg_interval(iv),
+            Err(LeaseDurationError::Negative { microseconds: -1 })
+        );
+    }
+
+    #[test]
+    fn as_duration_round_trips() {
+        let d = Duration::from_secs(300);
+        assert_eq!(LeaseDuration::try_from(d).unwrap().as_duration(), d);
     }
 }
