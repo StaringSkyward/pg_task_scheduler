@@ -6,6 +6,7 @@ use axum::{Json, Router};
 
 use crate::ids::JobId;
 use crate::jobs;
+use crate::jobs::Applied;
 use crate::pool::SchedulerPool;
 
 #[derive(serde::Serialize)]
@@ -56,10 +57,13 @@ async fn pause_job<P: SchedulerPool>(
     Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut c = acquire(&pool).await?;
-    jobs::pause(&mut c, JobId(id))
+    match jobs::pause(&mut c, JobId(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Applied::Changed => Ok(StatusCode::NO_CONTENT),
+        Applied::NotFound => Err((StatusCode::NOT_FOUND, format!("no job with id {id}"))),
+    }
 }
 
 async fn resume_job<P: SchedulerPool>(
@@ -67,8 +71,11 @@ async fn resume_job<P: SchedulerPool>(
     Path(id): Path<uuid::Uuid>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut c = acquire(&pool).await?;
-    jobs::resume(&mut c, JobId(id))
+    match jobs::resume(&mut c, JobId(id))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Applied::Changed => Ok(StatusCode::NO_CONTENT),
+        Applied::NotFound => Err((StatusCode::NOT_FOUND, format!("no job with id {id}"))),
+    }
 }
