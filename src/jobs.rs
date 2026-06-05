@@ -68,6 +68,7 @@ pub enum ScheduleUpdate {
 /// Whether a job mutation addressed an existing row. The `Err` channel is reserved
 /// for genuine failures; a missing job is a normal, expected outcome the caller
 /// must handle.
+#[must_use = "a NotFound outcome means the job did not exist; handle it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
     /// The addressed job existed and the transition was applied.
