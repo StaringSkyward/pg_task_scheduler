@@ -90,6 +90,8 @@ pub enum LeaseDurationError {
     PrecisionLoss,
     #[error("lease duration exceeds the maximum of i64::MAX microseconds")]
     TooLarge,
+    #[error("lease interval has calendar components (months={months}, days={days}); only microseconds are valid")]
+    CalendarComponent { months: i32, days: i32 },
 }
 
 impl TryFrom<Duration> for LeaseDuration {
@@ -125,8 +127,27 @@ impl MaxAttempts {
 
 impl LeaseDuration {
     /// Total, infallible: `micros` is already a validated positive i64.
-    pub fn to_pg_interval(self) -> diesel::pg::data_types::PgInterval {
+    pub(crate) fn to_pg_interval(self) -> diesel::pg::data_types::PgInterval {
         diesel::pg::data_types::PgInterval::from_microseconds(self.micros.get())
+    }
+
+    /// Read boundary: parse a stored interval back into the domain value. Rejects
+    /// any month/day component (the scheduler only ever writes pure microseconds via
+    /// `from_microseconds`) and non-positive microseconds.
+    pub(crate) fn from_pg_interval(
+        iv: diesel::pg::data_types::PgInterval,
+    ) -> Result<Self, LeaseDurationError> {
+        if iv.months != 0 || iv.days != 0 {
+            return Err(LeaseDurationError::CalendarComponent {
+                months: iv.months,
+                days: iv.days,
+            });
+        }
+        let micros = NonZeroI64::new(iv.microseconds).ok_or(LeaseDurationError::Zero)?;
+        if micros.get() < 0 {
+            return Err(LeaseDurationError::Zero);
+        }
+        Ok(LeaseDuration { micros })
     }
 }
 
@@ -359,5 +380,36 @@ mod lease_duration_tests {
             LeaseDuration::try_from(Duration::from_micros(micros)),
             Err(LeaseDurationError::TooLarge)
         );
+    }
+
+    #[test]
+    fn from_pg_interval_round_trips() {
+        let ld = LeaseDuration::try_from(Duration::from_secs(300)).unwrap();
+        let back = LeaseDuration::from_pg_interval(ld.to_pg_interval()).unwrap();
+        assert_eq!(back, ld);
+    }
+
+    #[test]
+    fn from_pg_interval_rejects_days() {
+        let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 1, months: 0 };
+        assert_eq!(
+            LeaseDuration::from_pg_interval(iv),
+            Err(LeaseDurationError::CalendarComponent { months: 0, days: 1 })
+        );
+    }
+
+    #[test]
+    fn from_pg_interval_rejects_months() {
+        let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 0, months: 1 };
+        assert_eq!(
+            LeaseDuration::from_pg_interval(iv),
+            Err(LeaseDurationError::CalendarComponent { months: 1, days: 0 })
+        );
+    }
+
+    #[test]
+    fn from_pg_interval_rejects_zero_micros() {
+        let iv = diesel::pg::data_types::PgInterval { microseconds: 0, days: 0, months: 0 };
+        assert_eq!(LeaseDuration::from_pg_interval(iv), Err(LeaseDurationError::Zero));
     }
 }
