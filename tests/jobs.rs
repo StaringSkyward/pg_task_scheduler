@@ -10,14 +10,15 @@ use pg_task_scheduler::{
 };
 
 fn spec(name: &str, cron: &str) -> CreateJob {
-    CreateJob {
-        name: JobName::try_from(name).unwrap(),
-        cron: CronExpression::parse(cron).unwrap(),
-        job_args: serde_json::json!({"k": "v"}),
-        lease_duration: LeaseDuration::try_from(Duration::from_secs(300)).unwrap(),
-        max_attempts: MaxAttempts::try_from(3u32).unwrap(),
-        is_paused: false,
-    }
+    CreateJob::new(
+        JobName::try_from(name).unwrap(),
+        CronExpression::parse(cron).unwrap(),
+        LeaseDuration::try_from(Duration::from_secs(300)).unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        serde_json::json!({"k": "v"}),
+    )
+    .unwrap()
 }
 
 #[tokio::test]

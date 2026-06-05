@@ -16,17 +16,42 @@ use scoped_futures::ScopedFutureExt;
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
 use crate::ids::{JobId, JobName};
-use crate::models::{Job, LeaseDuration, MaxAttempts, NewJob, SchedulerJob};
+use crate::models::{Job, JobLifecycle, LeaseDuration, MaxAttempts, NewJob, SchedulerJob};
 use crate::schema::scheduler_jobs::dsl as j;
 
 #[derive(Debug, Clone)]
 pub struct CreateJob {
-    pub name: JobName,
-    pub cron: CronExpression,
-    pub job_args: serde_json::Value,
-    pub lease_duration: LeaseDuration,
-    pub max_attempts: MaxAttempts,
-    pub is_paused: bool,
+    name: JobName,
+    cron: CronExpression,
+    args: serde_json::Value,
+    lease_duration: LeaseDuration,
+    max_attempts: MaxAttempts,
+    lifecycle: JobLifecycle,
+}
+
+impl CreateJob {
+    /// The five leading parameters are distinct, non-`Serialize` types, so their
+    /// positional order is type-checked. `args` accepts any `Serialize` and is
+    /// intentionally last (the one slot a transposition could reach). It is
+    /// serialized here, so a raw `serde_json::Value` only crosses the boundary if
+    /// the caller deliberately passes one.
+    pub fn new(
+        name: JobName,
+        cron: CronExpression,
+        lease_duration: LeaseDuration,
+        max_attempts: MaxAttempts,
+        lifecycle: JobLifecycle,
+        args: impl serde::Serialize,
+    ) -> Result<Self, SchedulerError> {
+        Ok(CreateJob {
+            name,
+            cron,
+            lease_duration,
+            max_attempts,
+            lifecycle,
+            args: serde_json::to_value(args)?, // SchedulerError::Serde on failure
+        })
+    }
 }
 
 /// How [`reschedule`] should move a job's `next_run_at`. This is the only
@@ -59,11 +84,11 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
     Ok(NewJob {
         name: spec.name.clone(),
         cron_expression: spec.cron.as_str().to_owned(),
-        job_args: spec.job_args.clone(),
+        job_args: spec.args.clone(),
         next_run_at: spec.cron.next_after(db_now)?,
         lease_duration: spec.lease_duration.to_pg_interval(),
         max_attempts: spec.max_attempts.to_i32(),
-        is_paused: spec.is_paused,
+        is_paused: spec.lifecycle.is_paused(),
     })
 }
 

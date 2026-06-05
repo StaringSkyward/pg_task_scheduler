@@ -5,7 +5,8 @@ use std::time::Duration;
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob};
 use pg_task_scheduler::{
-    CronExpression, JobName, LeaseDuration, MaxAttempts, RunId, RunState, Scheduler, WorkerId,
+    CronExpression, JobLifecycle, JobName, LeaseDuration, MaxAttempts, RunId, RunState, Scheduler,
+    WorkerId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -20,14 +21,15 @@ async fn runs_due_job_end_to_end() {
     let mut conn = db.pool.get().await.unwrap();
     let job = jobs::create(
         &mut conn,
-        CreateJob {
-            name: JobName::try_from("counter").unwrap(),
-            cron: CronExpression::parse("*/1 * * * *").unwrap(),
-            job_args: serde_json::json!({"n": 1}),
-            lease_duration: LeaseDuration::try_from(Duration::from_secs(60)).unwrap(),
-            max_attempts: MaxAttempts::try_from(3u32).unwrap(),
-            is_paused: false,
-        },
+        CreateJob::new(
+            JobName::try_from("counter").unwrap(),
+            CronExpression::parse("*/1 * * * *").unwrap(),
+            LeaseDuration::try_from(Duration::from_secs(60)).unwrap(),
+            MaxAttempts::try_from(3u32).unwrap(),
+            JobLifecycle::Active,
+            serde_json::json!({"n": 1}),
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
