@@ -11,7 +11,7 @@ use crate::models::{ClaimedRun, FinalizeOutcome, Outcome};
 use crate::pool::SchedulerPool;
 use crate::runtime::builder::Scheduler;
 use crate::runtime::context::JobContext;
-use crate::runtime::registry::Registry;
+use crate::runtime::registry::{Handler, Registry};
 use crate::store;
 
 async fn conn<P: SchedulerPool>(pool: &P) -> Result<P::Conn, SchedulerError> {
@@ -106,8 +106,16 @@ async fn claim_and_dispatch<P: SchedulerPool>(
             Ok(Some(claimed)) => {
                 metrics::incr(metrics::RUNS_CLAIMED);
                 drop(c);
-                let fut = dispatch(pool.clone(), registry.clone(), claimed, permit);
-                in_flight.spawn(fut);
+                // On a handler miss, `handler_for` has already logged the scheduler-
+                // invariant error; deliberately take NO further action. No finalize
+                // (that would write a bogus `Failed` outcome) and no release (a broken
+                // names/registry invariant would then tight-loop reclaiming). The permit
+                // and `claimed` drop here; the lease expires and the run is recovered by
+                // the reaper / a later claim. The loop continues to claim other work.
+                if let Some(handler) = handler_for(registry, &claimed) {
+                    let fut = dispatch(pool.clone(), handler, claimed, permit);
+                    in_flight.spawn(fut);
+                }
             }
             Ok(None) => break,
             Err(e) => {
@@ -129,45 +137,50 @@ fn log_handler_join(res: Result<(), tokio::task::JoinError>) {
     }
 }
 
+/// Resolve the handler for a freshly-claimed run. `claim_one` filters by registered
+/// names (`ANY($names)`, `names` derived from this same registry), so a miss is a
+/// scheduler-invariant violation — the registry and the claim filter cannot diverge
+/// by construction. Surface it loudly and return `None`; the caller then skips
+/// dispatch, leaving the lease for expiry-based recovery, and never finalizes a
+/// bogus application `Failed` outcome.
+fn handler_for(registry: &Registry, claimed: &ClaimedRun) -> Option<Handler> {
+    let handler = registry.get(&claimed.job_name);
+    if handler.is_none() {
+        tracing::error!(
+            run = %claimed.run_id.0,
+            job = claimed.job_name.as_str(),
+            "claimed run has no registered handler (scheduler invariant); \
+             leaving lease for expiry-based recovery"
+        );
+    }
+    handler
+}
+
 async fn dispatch<P: SchedulerPool>(
     pool: P,
-    registry: Arc<Registry>,
+    handler: Handler,
     claimed: ClaimedRun,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
-    let outcome = match registry.get(&claimed.job_name) {
-        Some(handler) => {
-            let ctx = JobContext {
-                run_id: claimed.run_id,
-                job_id: claimed.job_id,
-                job_name: claimed.job_name.clone(),
-                scheduled_for: claimed.scheduled_for,
-                attempt: claimed.attempt,
-                lease_token: claimed.lease_token,
-                lease_expires_at: claimed.lease_expires_at,
-            };
-            let args = claimed.job_args.clone();
-            // Run the handler directly in this JoinSet task so the scheduler owns
-            // its future. On shutdown, aborting this task drops the handler future
-            // at its current await point (cooperative cancellation) instead of
-            // detaching a nested task. A panic unwinds this task and surfaces as a
-            // JoinError on the JoinSet (logged at the join sites); the run is left
-            // un-finalized and recovered via lease expiry.
-            match handler(ctx, args).await {
-                Ok(()) => Outcome::Completed,
-                Err(e) => Outcome::Failed(e.to_string()),
-            }
-        }
-        // We only claim jobs whose names we registered, so this is unreachable;
-        // surface loudly rather than silently and fail the run so it doesn't loop.
-        None => {
-            tracing::error!(
-                job = claimed.job_name.as_str(),
-                "claimed run with no handler (invariant)"
-            );
-            Outcome::Failed("internal: no handler for claimed job".into())
-        }
+    let ctx = JobContext {
+        run_id: claimed.run_id,
+        job_id: claimed.job_id,
+        job_name: claimed.job_name.clone(),
+        scheduled_for: claimed.scheduled_for,
+        attempt: claimed.attempt,
+        lease_token: claimed.lease_token,
+        lease_expires_at: claimed.lease_expires_at,
+    };
+    let args = claimed.job_args.clone();
+    // Run the handler directly in this JoinSet task so the scheduler owns its
+    // future: on shutdown, aborting this task drops the handler at its current
+    // await point (cooperative cancellation). A panic unwinds this task and
+    // surfaces as a JoinError on the JoinSet; the run is left un-finalized and
+    // recovered via lease expiry.
+    let outcome = match handler(ctx, args).await {
+        Ok(()) => Outcome::Completed,
+        Err(e) => Outcome::Failed(e.to_string()),
     };
 
     match &outcome {
@@ -219,4 +232,47 @@ fn spawn_reaper<P: SchedulerPool>(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod handler_for_tests {
+    use super::*;
+    use crate::ids::{JobId, JobName, LeaseToken, RunId};
+    use chrono::Utc;
+    use std::num::NonZeroU32;
+
+    fn claimed(name: &str) -> ClaimedRun {
+        ClaimedRun {
+            run_id: RunId(uuid::Uuid::new_v4()),
+            job_id: JobId(uuid::Uuid::new_v4()),
+            job_name: JobName::try_from(name).unwrap(),
+            job_args: serde_json::json!({}),
+            scheduled_for: Utc::now(),
+            attempt: NonZeroU32::new(1).unwrap(),
+            lease_token: LeaseToken::generate(),
+            lease_expires_at: Utc::now(),
+        }
+    }
+
+    fn registry_with(name: &str) -> Registry {
+        let mut reg = Registry::new();
+        reg.register::<serde_json::Value, _, _>(
+            JobName::try_from(name).unwrap(),
+            |_ctx, _args| async { Ok(()) },
+        )
+        .unwrap();
+        reg
+    }
+
+    #[test]
+    fn resolves_registered_handler() {
+        let reg = registry_with("known");
+        assert!(handler_for(&reg, &claimed("known")).is_some());
+    }
+
+    #[test]
+    fn missing_handler_is_none() {
+        let reg = registry_with("known");
+        assert!(handler_for(&reg, &claimed("unknown")).is_none());
+    }
 }
