@@ -11,7 +11,8 @@ const REAP: &str = "\
     LEFT JOIN scheduler_run_outcomes o ON o.run_id = r.id \
     WHERE o.run_id IS NULL \
       AND l.lease_expires_at <= now() \
-      AND r.attempt_count >= j.max_attempts";
+      AND r.attempt_count >= j.max_attempts \
+    ON CONFLICT (run_id) DO NOTHING";
 
 /// Dead-letter every run whose lease expired and whose attempts are exhausted.
 /// The AFTER INSERT trigger clears each lease. Returns the count failed.

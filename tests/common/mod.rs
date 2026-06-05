@@ -195,6 +195,33 @@ impl TestDb {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
+
+    /// Poll until backend `pid` is blocked waiting on a lock, so a concurrency test
+    /// deterministically exercises the contended insert before the holder commits.
+    /// Panics on timeout (the backend never blocked).
+    pub async fn wait_until_lock_blocked(&self, pid: i32) {
+        let step = std::time::Duration::from_millis(20);
+        let timeout = std::time::Duration::from_secs(5);
+        let mut waited = std::time::Duration::ZERO;
+        let mut conn = self.pool.get().await.expect("poll conn");
+        loop {
+            let n = diesel::sql_query(
+                "SELECT count(*) AS n FROM pg_stat_activity \
+                 WHERE pid = $1 AND wait_event_type = 'Lock'",
+            )
+            .bind::<diesel::sql_types::Integer, _>(pid)
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .expect("pg_stat_activity")
+            .n;
+            if n >= 1 {
+                return;
+            }
+            assert!(waited < timeout, "backend {pid} never blocked on a lock");
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+    }
 }
 
 #[derive(diesel::QueryableByName)]
@@ -211,4 +238,25 @@ struct TsRow {
 struct BoolRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     flag: bool,
+}
+
+#[derive(diesel::QueryableByName)]
+struct PidRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pid: i32,
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// The Postgres backend PID serving `conn` (so a test can watch it in pg_stat_activity).
+pub async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
+    diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<PidRow>(conn)
+        .await
+        .expect("pg_backend_pid")
+        .pid
 }
