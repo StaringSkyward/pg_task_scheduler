@@ -498,6 +498,11 @@ values violate those invariants (e.g. edited directly in SQL) surfaces as `Sched
 not a silent or mis-typed success. `CreateJob::new` accepts a typed `args: impl Serialize` and a
 `JobLifecycle`, so neither a raw JSON value nor a bare bool crosses the creation boundary.
 
+`pause`, `resume`, and `delete` return `Applied { Changed, NotFound }`: a transition addressed at a
+nonexistent job id is reported as `NotFound` rather than a silent `Ok(())`. The Axum routes map
+`Changed` → `204 No Content` and `NotFound` → `404 Not Found`. (`reschedule` and `get` already signal a
+missing job via `Option<Job>`.)
+
 ### Testing
 
 Integration tests require a PostgreSQL instance reachable via the `DATABASE_URL` environment
