@@ -5,7 +5,8 @@ use chrono::Utc;
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::{
-    CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts, SchedulerError, store,
+    CorruptJobRow, CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts,
+    SchedulerError, store,
 };
 
 fn spec(name: &str, cron: &str) -> CreateJob {
@@ -201,5 +202,53 @@ async fn reschedule_reset_from_now_corrupt_cron_errors() {
     let mut conn = db.pool.get().await.unwrap();
     let res = jobs::reschedule(&mut conn, JobId(id), ScheduleUpdate::ResetFromNow).await;
     assert!(matches!(res, Err(SchedulerError::CorruptJob { .. })));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn get_unparseable_cron_is_corrupt_job() {
+    let db = TestDb::new().await;
+    let id = db
+        .insert_job("c", "*/5 * * * *", Utc::now() + chrono::Duration::hours(1))
+        .await;
+    {
+        use diesel_async::RunQueryDsl;
+        let mut conn = db.pool.get().await.unwrap();
+        diesel::sql_query("UPDATE scheduler_jobs SET cron_expression = 'garbage' WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let mut conn = db.pool.get().await.unwrap();
+    let res = jobs::get(&mut conn, JobId(id)).await;
+    assert!(matches!(
+        res,
+        Err(SchedulerError::CorruptJob { source: CorruptJobRow::Cron(_), .. })
+    ));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn get_calendar_lease_interval_is_corrupt_job() {
+    let db = TestDb::new().await;
+    // '1 day' passes the SQL CHECK (> 0) but is not a pure-microsecond lease,
+    // so it must surface as CorruptJob, not as a successful projection.
+    let id = db
+        .insert_job_full(
+            "d",
+            "*/5 * * * *",
+            Utc::now() + chrono::Duration::hours(1),
+            "1 day",
+            3,
+            false,
+        )
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let res = jobs::get(&mut conn, JobId(id)).await;
+    assert!(matches!(
+        res,
+        Err(SchedulerError::CorruptJob { source: CorruptJobRow::LeaseDuration(_), .. })
+    ));
     db.cleanup().await;
 }
