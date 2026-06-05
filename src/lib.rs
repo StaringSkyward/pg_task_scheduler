@@ -59,7 +59,7 @@ pub use crate::ids::{IdentifierError, JobId, JobName, LeaseToken, RunId, WorkerI
 pub use crate::jobs::{CreateJob, ScheduleUpdate};
 pub use crate::models::RunOutcome;
 pub use crate::models::{
-    ClaimedRun, JobLifecycle, Lease, LeaseDuration, LeaseDurationError, MaxAttempts,
+    ClaimedRun, Job, JobLifecycle, Lease, LeaseDuration, LeaseDurationError, MaxAttempts,
     MaxAttemptsError, Outcome, RunState, SchedulerJob,
 };
 pub use crate::pool::{PoolError, SchedulerPool};

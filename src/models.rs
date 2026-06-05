@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_types;
 
+use crate::cron::CronExpression;
+use crate::error::SchedulerError;
 use crate::ids::{JobId, JobName, LeaseToken, RunId, WorkerId};
 use crate::schema::scheduler_jobs;
 
@@ -194,6 +196,50 @@ pub struct ClaimedRun {
 }
 
 // ---------------------------------------------------------------------------
+// Job — public domain projection of a scheduler_jobs row
+// ---------------------------------------------------------------------------
+
+/// Public domain projection of a `scheduler_jobs` row. Every field is a domain
+/// type; `job_args` is intentionally omitted (reading is untyped — the handler
+/// argument type is not recoverable from a runtime `JobName`). Not `Serialize`:
+/// it must not become an accidental wire contract.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: JobId,
+    pub name: JobName,
+    pub cron: CronExpression,
+    pub lease_duration: LeaseDuration,
+    pub max_attempts: MaxAttempts,
+    pub lifecycle: JobLifecycle,
+    pub next_run_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<SchedulerJob> for Job {
+    type Error = SchedulerError;
+    fn try_from(row: SchedulerJob) -> Result<Self, SchedulerError> {
+        let job_id = row.id;
+        let cron = CronExpression::parse_stored(job_id, &row.cron_expression)?;
+        let lease_duration = LeaseDuration::from_pg_interval(row.lease_duration)
+            .map_err(|e| SchedulerError::CorruptJob { job_id, source: e.into() })?;
+        let max_attempts = MaxAttempts::from_db_i32(row.max_attempts)
+            .map_err(|e| SchedulerError::CorruptJob { job_id, source: e.into() })?;
+        Ok(Job {
+            id: job_id,
+            name: row.name,
+            cron,
+            lease_duration,
+            max_attempts,
+            lifecycle: JobLifecycle::from_paused(row.is_paused),
+            next_run_at: row.next_run_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Finalization outcome
 // ---------------------------------------------------------------------------
 
@@ -318,6 +364,66 @@ mod job_lifecycle_tests {
         assert_eq!(JobLifecycle::from_paused(false), JobLifecycle::Active);
         assert!(JobLifecycle::Paused.is_paused());
         assert!(!JobLifecycle::Active.is_paused());
+    }
+}
+
+#[cfg(test)]
+mod job_projection_tests {
+    use super::*;
+    use crate::error::CorruptJobRow;
+    use chrono::Utc;
+
+    fn good_row() -> SchedulerJob {
+        SchedulerJob {
+            id: JobId(uuid::Uuid::nil()),
+            name: JobName::try_from("p").unwrap(),
+            cron_expression: "*/5 * * * *".to_owned(),
+            job_args: serde_json::json!({}),
+            next_run_at: Utc::now(),
+            lease_duration: diesel::pg::data_types::PgInterval::from_microseconds(300_000_000),
+            max_attempts: 3,
+            is_paused: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn projects_valid_row() {
+        let job = Job::try_from(good_row()).expect("valid row projects");
+        assert_eq!(job.cron.as_str(), "*/5 * * * *");
+        assert_eq!(job.lifecycle, JobLifecycle::Paused);
+        assert_eq!(job.max_attempts.to_i32(), 3);
+    }
+
+    #[test]
+    fn non_positive_max_attempts_is_corrupt() {
+        let row = SchedulerJob { max_attempts: 0, ..good_row() };
+        assert!(matches!(
+            Job::try_from(row),
+            Err(SchedulerError::CorruptJob { source: CorruptJobRow::MaxAttempts(_), .. })
+        ));
+    }
+
+    #[test]
+    fn unparseable_cron_is_corrupt() {
+        let row = SchedulerJob { cron_expression: "garbage".to_owned(), ..good_row() };
+        assert!(matches!(
+            Job::try_from(row),
+            Err(SchedulerError::CorruptJob { source: CorruptJobRow::Cron(_), .. })
+        ));
+    }
+
+    #[test]
+    fn calendar_lease_is_corrupt() {
+        let row = SchedulerJob {
+            lease_duration: diesel::pg::data_types::PgInterval { microseconds: 0, days: 1, months: 0 },
+            ..good_row()
+        };
+        assert!(matches!(
+            Job::try_from(row),
+            Err(SchedulerError::CorruptJob { source: CorruptJobRow::LeaseDuration(_), .. })
+        ));
     }
 }
 
