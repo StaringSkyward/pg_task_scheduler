@@ -20,6 +20,34 @@ pub enum RunOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// JobLifecycle — named two-state lifecycle (replaces the stored `is_paused` bool)
+// ---------------------------------------------------------------------------
+
+/// A job's lifecycle state. Used at both the creation and read boundaries; the
+/// stored `is_paused` boolean never escapes the row mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobLifecycle {
+    Active,
+    Paused,
+}
+
+impl JobLifecycle {
+    /// Boundary helper for the `is_paused` column. `pub(crate)` because `jobs`
+    /// and `admin` (sibling modules) call it — a plain `fn` is private to `models`.
+    pub(crate) fn is_paused(self) -> bool {
+        matches!(self, JobLifecycle::Paused)
+    }
+
+    pub(crate) fn from_paused(paused: bool) -> Self {
+        if paused {
+            JobLifecycle::Paused
+        } else {
+            JobLifecycle::Active
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validated config types (input boundary)
 // ---------------------------------------------------------------------------
 
@@ -194,6 +222,19 @@ pub struct StatusRow {
     pub finished_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod job_lifecycle_tests {
+    use super::JobLifecycle;
+
+    #[test]
+    fn from_paused_round_trips() {
+        assert_eq!(JobLifecycle::from_paused(true), JobLifecycle::Paused);
+        assert_eq!(JobLifecycle::from_paused(false), JobLifecycle::Active);
+        assert!(JobLifecycle::Paused.is_paused());
+        assert!(!JobLifecycle::Active.is_paused());
+    }
 }
 
 #[cfg(test)]
