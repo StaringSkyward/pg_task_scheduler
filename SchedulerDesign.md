@@ -455,7 +455,7 @@ src/
   error.rs          SchedulerError, JobError
   pool.rs           SchedulerPool trait + feature-gated impls
   schema.rs         Diesel table! definitions
-  models.rs         Queryable/Insertable structs, RunStatus enum
+  models.rs         internal Diesel row structs + domain Job projection, RunState/Outcome
   cron.rs           parse + next-occurrence calc (UTC, croner)
   jobs.rs           programmatic job CRUD (create/ensure_job/reschedule/pause/resume/list)
   store/            one focused, independently testable fn per SQL operation
@@ -479,6 +479,14 @@ migrations/
 
 Creating, pausing, resuming, and listing job definitions is available programmatically (in
 `jobs.rs`), independent of the optional Axum routes, which are a thin wrapper over it.
+
+The job CRUD functions (`create`, `ensure_job`, `reschedule`, `get`, `list`) return a domain `Job`
+projection, not the internal `scheduler_jobs` Diesel row. Each storage primitive is parsed into a
+domain type at the read boundary (`cron_expression` → `CronExpression`, `lease_duration` →
+`LeaseDuration`, `max_attempts` → `MaxAttempts`, `is_paused` → `JobLifecycle`); a row whose stored
+values violate those invariants (e.g. edited directly in SQL) surfaces as `SchedulerError::CorruptJob`,
+not a silent or mis-typed success. `CreateJob::new` accepts a typed `args: impl Serialize` and a
+`JobLifecycle`, so neither a raw JSON value nor a bare bool crosses the creation boundary.
 
 ### Testing
 
