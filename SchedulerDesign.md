@@ -299,11 +299,17 @@ INSERT INTO scheduler_run_outcomes (run_id, outcome, last_error)
 SELECT $run_id, $outcome, $last_error
 FROM scheduler_run_leases
 WHERE run_id = $run_id AND lease_token = $lease_token
+ON CONFLICT (run_id) DO NOTHING
 RETURNING run_id;
 ```
 
-Zero rows returned means the finalization was fenced out (the lease was lost). `$outcome` is
-`completed` with a `NULL` error, or `failed` with the handler's error message.
+The result is one of three algebraic cases, never a database error: the insert applied (`Applied`); it
+applied nothing because our token no longer matches the lease — fenced out, the run was reclaimed
+(`Fenced`); or it applied nothing because an outcome already exists — the reaper or a concurrent
+finalizer won the race (`AlreadyTerminal`, a benign no-op). `ON CONFLICT (run_id) DO NOTHING` makes the
+concurrent terminal-insert race a no-op rather than a unique-constraint error, and the reaper's insert
+uses the same clause. `$outcome` is `completed` with a `NULL` error, or `failed` with the handler's
+error message.
 
 ## Lease Duration
 
