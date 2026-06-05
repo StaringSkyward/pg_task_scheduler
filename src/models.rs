@@ -1,4 +1,4 @@
-use std::num::{NonZeroI64, NonZeroU32};
+use std::num::{NonZeroI32, NonZeroI64, NonZeroU32};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -51,9 +51,28 @@ impl JobLifecycle {
 // Validated config types (input boundary)
 // ---------------------------------------------------------------------------
 
-/// Max claim attempts; zero is meaningless.
-#[derive(Debug, Clone, Copy)]
-pub struct MaxAttempts(pub NonZeroU32);
+/// Max claim attempts. Private `NonZeroI32` with the invariant `>= 1`, enforced by
+/// every constructor — so the stored-`i32` conversion is total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxAttempts(NonZeroI32);
+
+/// Why a value was rejected as a [`MaxAttempts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MaxAttemptsError {
+    #[error("max_attempts must be greater than zero")]
+    NonPositive,
+    #[error("max_attempts exceeds i32::MAX")]
+    TooLarge,
+}
+
+impl TryFrom<u32> for MaxAttempts {
+    type Error = MaxAttemptsError;
+    fn try_from(v: u32) -> Result<Self, MaxAttemptsError> {
+        let i = i32::try_from(v).map_err(|_| MaxAttemptsError::TooLarge)?; // v > i32::MAX
+        let nz = NonZeroI32::new(i).ok_or(MaxAttemptsError::NonPositive)?; // v == 0
+        Ok(MaxAttempts(nz)) // i > 0: v is unsigned and non-zero
+    }
+}
 
 /// Max single-attempt runtime / lease length. A positive, microsecond-exact
 /// duration: the persisted PG interval always equals what the caller asked for.
@@ -90,11 +109,17 @@ impl TryFrom<Duration> for LeaseDuration {
 }
 
 impl MaxAttempts {
-    /// Convert to the `i32` the column stores; errors if it exceeds `i32::MAX`.
-    pub fn to_i32(self) -> Result<i32, crate::error::SchedulerError> {
-        i32::try_from(self.0.get()).map_err(|_| {
-            crate::error::SchedulerError::Config("max_attempts exceeds i32::MAX".into())
-        })
+    /// Read boundary: parse the stored signed count. Rejects `<= 0`.
+    pub(crate) fn from_db_i32(i: i32) -> Result<Self, MaxAttemptsError> {
+        NonZeroI32::new(i)
+            .filter(|n| n.get() > 0)
+            .map(MaxAttempts)
+            .ok_or(MaxAttemptsError::NonPositive)
+    }
+
+    /// Total: the inner invariant guarantees `1..=i32::MAX`. No cast, no unwrap.
+    pub(crate) fn to_i32(self) -> i32 {
+        self.0.get()
     }
 }
 
@@ -222,6 +247,44 @@ pub struct StatusRow {
     pub finished_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod max_attempts_tests {
+    use super::{MaxAttempts, MaxAttemptsError};
+
+    #[test]
+    fn try_from_zero_is_non_positive() {
+        assert_eq!(MaxAttempts::try_from(0u32), Err(MaxAttemptsError::NonPositive));
+    }
+
+    #[test]
+    fn try_from_above_i32_max_is_too_large() {
+        let v = u32::try_from(i32::MAX).unwrap() + 1;
+        assert_eq!(MaxAttempts::try_from(v), Err(MaxAttemptsError::TooLarge));
+    }
+
+    #[test]
+    fn try_from_i32_max_is_accepted() {
+        let m = MaxAttempts::try_from(u32::try_from(i32::MAX).unwrap()).expect("i32::MAX valid");
+        assert_eq!(m.to_i32(), i32::MAX);
+    }
+
+    #[test]
+    fn try_from_typical_round_trips() {
+        assert_eq!(MaxAttempts::try_from(3u32).unwrap().to_i32(), 3);
+    }
+
+    #[test]
+    fn from_db_rejects_non_positive() {
+        assert_eq!(MaxAttempts::from_db_i32(0), Err(MaxAttemptsError::NonPositive));
+        assert_eq!(MaxAttempts::from_db_i32(-1), Err(MaxAttemptsError::NonPositive));
+    }
+
+    #[test]
+    fn from_db_accepts_positive() {
+        assert_eq!(MaxAttempts::from_db_i32(3).unwrap().to_i32(), 3);
+    }
 }
 
 #[cfg(test)]

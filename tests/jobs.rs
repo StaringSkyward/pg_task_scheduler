@@ -1,5 +1,4 @@
 mod common;
-use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -15,7 +14,7 @@ fn spec(name: &str, cron: &str) -> CreateJob {
         cron: CronExpression::parse(cron).unwrap(),
         job_args: serde_json::json!({"k": "v"}),
         lease_duration: LeaseDuration::try_from(Duration::from_secs(300)).unwrap(),
-        max_attempts: MaxAttempts(NonZeroU32::new(3).unwrap()),
+        max_attempts: MaxAttempts::try_from(3u32).unwrap(),
         is_paused: false,
     }
 }
