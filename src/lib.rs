@@ -56,7 +56,7 @@ pub mod admin;
 pub use crate::cron::CronExpression;
 pub use crate::error::{CorruptJobRow, DuplicateJobName, JobError, RegisterError, SchedulerError};
 pub use crate::ids::{IdentifierError, JobId, JobName, LeaseToken, RunId, WorkerId};
-pub use crate::jobs::{CreateJob, ScheduleUpdate};
+pub use crate::jobs::{Applied, CreateJob, ScheduleUpdate};
 pub use crate::models::RunOutcome;
 pub use crate::models::{
     ClaimedRun, FinalizeOutcome, Job, JobLifecycle, Lease, LeaseDuration, LeaseDurationError,

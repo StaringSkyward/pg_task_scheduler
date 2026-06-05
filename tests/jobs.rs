@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
-use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
+use pg_task_scheduler::jobs::{self, Applied, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::{
     CorruptJobRow, CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts,
     SchedulerError, store,
@@ -111,7 +111,10 @@ async fn pause_resume_list_get_delete() {
     let job = jobs::create(&mut conn, spec("p", "*/5 * * * *"))
         .await
         .unwrap();
-    jobs::pause(&mut conn, job.id).await.unwrap();
+    assert_eq!(
+        jobs::pause(&mut conn, job.id).await.unwrap(),
+        Applied::Changed
+    );
     assert_eq!(
         jobs::get(&mut conn, job.id)
             .await
@@ -120,7 +123,10 @@ async fn pause_resume_list_get_delete() {
             .lifecycle,
         JobLifecycle::Paused
     );
-    jobs::resume(&mut conn, job.id).await.unwrap();
+    assert_eq!(
+        jobs::resume(&mut conn, job.id).await.unwrap(),
+        Applied::Changed
+    );
     assert_eq!(
         jobs::get(&mut conn, job.id)
             .await
@@ -130,7 +136,10 @@ async fn pause_resume_list_get_delete() {
         JobLifecycle::Active
     );
     assert_eq!(jobs::list(&mut conn).await.unwrap().len(), 1);
-    jobs::delete(&mut conn, job.id).await.unwrap();
+    assert_eq!(
+        jobs::delete(&mut conn, job.id).await.unwrap(),
+        Applied::Changed
+    );
     assert!(jobs::get(&mut conn, job.id).await.unwrap().is_none());
     db.cleanup().await;
 }
@@ -265,5 +274,25 @@ async fn get_calendar_lease_interval_is_corrupt_job() {
             ..
         })
     ));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn pause_resume_delete_missing_is_not_found() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let missing = JobId(uuid::Uuid::new_v4());
+    assert_eq!(
+        jobs::pause(&mut conn, missing).await.unwrap(),
+        Applied::NotFound
+    );
+    assert_eq!(
+        jobs::resume(&mut conn, missing).await.unwrap(),
+        Applied::NotFound
+    );
+    assert_eq!(
+        jobs::delete(&mut conn, missing).await.unwrap(),
+        Applied::NotFound
+    );
     db.cleanup().await;
 }

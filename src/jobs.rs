@@ -65,6 +65,17 @@ pub enum ScheduleUpdate {
     SetNextRunAt(DateTime<Utc>),
 }
 
+/// Whether a job mutation addressed an existing row. The `Err` channel is reserved
+/// for genuine failures; a missing job is a normal, expected outcome the caller
+/// must handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// The addressed job existed and the transition was applied.
+    Changed,
+    /// No job has that id; nothing changed.
+    NotFound,
+}
+
 #[derive(diesel::QueryableByName)]
 struct NowRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
@@ -217,11 +228,21 @@ pub async fn list(conn: &mut AsyncPgConnection) -> Result<Vec<Job>, SchedulerErr
     rows.into_iter().map(Job::try_from).collect()
 }
 
-pub async fn pause(conn: &mut AsyncPgConnection, id: JobId) -> Result<(), SchedulerError> {
+/// Map a Diesel affected-row count to `Applied`. Centralizes the 0/1 meaning for
+/// the by-primary-key mutations (`set_paused`, `delete`), where the count is 0 or 1.
+fn applied_from_affected(affected: usize) -> Applied {
+    if affected > 0 {
+        Applied::Changed
+    } else {
+        Applied::NotFound
+    }
+}
+
+pub async fn pause(conn: &mut AsyncPgConnection, id: JobId) -> Result<Applied, SchedulerError> {
     set_paused(conn, id, true).await
 }
 
-pub async fn resume(conn: &mut AsyncPgConnection, id: JobId) -> Result<(), SchedulerError> {
+pub async fn resume(conn: &mut AsyncPgConnection, id: JobId) -> Result<Applied, SchedulerError> {
     set_paused(conn, id, false).await
 }
 
@@ -229,17 +250,17 @@ async fn set_paused(
     conn: &mut AsyncPgConnection,
     id: JobId,
     paused: bool,
-) -> Result<(), SchedulerError> {
-    diesel::update(j::scheduler_jobs.find(id))
+) -> Result<Applied, SchedulerError> {
+    let affected = diesel::update(j::scheduler_jobs.find(id))
         .set((j::is_paused.eq(paused), j::updated_at.eq(Utc::now())))
         .execute(conn)
         .await?;
-    Ok(())
+    Ok(applied_from_affected(affected))
 }
 
-pub async fn delete(conn: &mut AsyncPgConnection, id: JobId) -> Result<(), SchedulerError> {
-    diesel::delete(j::scheduler_jobs.find(id))
+pub async fn delete(conn: &mut AsyncPgConnection, id: JobId) -> Result<Applied, SchedulerError> {
+    let affected = diesel::delete(j::scheduler_jobs.find(id))
         .execute(conn)
         .await?;
-    Ok(())
+    Ok(applied_from_affected(affected))
 }
