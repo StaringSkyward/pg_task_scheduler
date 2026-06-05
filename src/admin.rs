@@ -16,13 +16,13 @@ struct JobView {
     is_paused: bool,
 }
 
-impl From<crate::models::SchedulerJob> for JobView {
-    fn from(j: crate::models::SchedulerJob) -> Self {
+impl From<crate::models::Job> for JobView {
+    fn from(j: crate::models::Job) -> Self {
         JobView {
             id: j.id,
             name: j.name.as_str().to_owned(),
-            cron_expression: j.cron_expression,
-            is_paused: j.is_paused,
+            cron_expression: j.cron.as_str().to_owned(),
+            is_paused: j.lifecycle.is_paused(),
         }
     }
 }

@@ -5,7 +5,7 @@ use chrono::Utc;
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::{
-    CronExpression, JobId, JobName, LeaseDuration, MaxAttempts, SchedulerError, store,
+    CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts, SchedulerError, store,
 };
 
 fn spec(name: &str, cron: &str) -> CreateJob {
@@ -42,7 +42,7 @@ async fn ensure_job_inserts_then_reconciles_config() {
         .await
         .unwrap();
     assert_eq!(a.id, b.id); // idempotent by name — same row
-    assert_eq!(b.cron_expression, "0 * * * *"); // config reconciled on conflict
+    assert_eq!(b.cron.as_str(), "0 * * * *"); // config reconciled on conflict
     db.cleanup().await;
 }
 
@@ -62,7 +62,7 @@ async fn ensure_job_preserves_due_cursor_and_no_slot_skipped() {
         .await
         .unwrap();
     assert_eq!(job.id, JobId(id)); // updated the existing row
-    assert_eq!(job.cron_expression, "0 * * * *"); // config reconciled
+    assert_eq!(job.cron.as_str(), "0 * * * *"); // config reconciled
     let after = db.job_next_run_at(id).await;
     assert_eq!(after, before, "cursor must be preserved, not advanced");
     assert!(
@@ -110,20 +110,14 @@ async fn pause_resume_list_get_delete() {
         .await
         .unwrap();
     jobs::pause(&mut conn, job.id).await.unwrap();
-    assert!(
-        jobs::get(&mut conn, job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_paused
+    assert_eq!(
+        jobs::get(&mut conn, job.id).await.unwrap().unwrap().lifecycle,
+        JobLifecycle::Paused
     );
     jobs::resume(&mut conn, job.id).await.unwrap();
-    assert!(
-        !jobs::get(&mut conn, job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_paused
+    assert_eq!(
+        jobs::get(&mut conn, job.id).await.unwrap().unwrap().lifecycle,
+        JobLifecycle::Active
     );
     assert_eq!(jobs::list(&mut conn).await.unwrap().len(), 1);
     jobs::delete(&mut conn, job.id).await.unwrap();
@@ -206,6 +200,6 @@ async fn reschedule_reset_from_now_corrupt_cron_errors() {
     }
     let mut conn = db.pool.get().await.unwrap();
     let res = jobs::reschedule(&mut conn, JobId(id), ScheduleUpdate::ResetFromNow).await;
-    assert!(matches!(res, Err(SchedulerError::Cron(_))));
+    assert!(matches!(res, Err(SchedulerError::CorruptJob { .. })));
     db.cleanup().await;
 }

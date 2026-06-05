@@ -16,7 +16,7 @@ use scoped_futures::ScopedFutureExt;
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
 use crate::ids::{JobId, JobName};
-use crate::models::{LeaseDuration, MaxAttempts, NewJob, SchedulerJob};
+use crate::models::{Job, LeaseDuration, MaxAttempts, NewJob, SchedulerJob};
 use crate::schema::scheduler_jobs::dsl as j;
 
 #[derive(Debug, Clone)]
@@ -72,20 +72,22 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
 pub async fn create(
     conn: &mut AsyncPgConnection,
     spec: CreateJob,
-) -> Result<SchedulerJob, SchedulerError> {
-    conn.transaction::<SchedulerJob, SchedulerError, _>(|c| {
-        async move {
-            let db_now = fetch_db_now(c).await?;
-            let row = new_job(&spec, db_now)?;
-            Ok(diesel::insert_into(j::scheduler_jobs)
-                .values(row)
-                .returning(SchedulerJob::as_returning())
-                .get_result(c)
-                .await?)
-        }
-        .scope_boxed()
-    })
-    .await
+) -> Result<Job, SchedulerError> {
+    let row = conn
+        .transaction::<SchedulerJob, SchedulerError, _>(|c| {
+            async move {
+                let db_now = fetch_db_now(c).await?;
+                let row = new_job(&spec, db_now)?;
+                Ok(diesel::insert_into(j::scheduler_jobs)
+                    .values(row)
+                    .returning(SchedulerJob::as_returning())
+                    .get_result(c)
+                    .await?)
+            }
+            .scope_boxed()
+        })
+        .await?;
+    Job::try_from(row)
 }
 
 /// Idempotent declarative registration. Inserts the job if its name is new (the
@@ -97,32 +99,34 @@ pub async fn create(
 pub async fn ensure_job(
     conn: &mut AsyncPgConnection,
     spec: CreateJob,
-) -> Result<SchedulerJob, SchedulerError> {
-    conn.transaction::<SchedulerJob, SchedulerError, _>(|c| {
-        async move {
-            let db_now = fetch_db_now(c).await?;
-            let row = new_job(&spec, db_now)?;
-            // next_run_at and is_paused are supplied as INSERT values but are
-            // deliberately ABSENT from the DO UPDATE SET list, so a conflict
-            // leaves the cursor and lifecycle untouched.
-            Ok(diesel::insert_into(j::scheduler_jobs)
-                .values(&row)
-                .on_conflict(j::name)
-                .do_update()
-                .set((
-                    j::cron_expression.eq(&row.cron_expression),
-                    j::job_args.eq(&row.job_args),
-                    j::lease_duration.eq(&row.lease_duration),
-                    j::max_attempts.eq(row.max_attempts),
-                    j::updated_at.eq(db_now),
-                ))
-                .returning(SchedulerJob::as_returning())
-                .get_result(c)
-                .await?)
-        }
-        .scope_boxed()
-    })
-    .await
+) -> Result<Job, SchedulerError> {
+    let row = conn
+        .transaction::<SchedulerJob, SchedulerError, _>(|c| {
+            async move {
+                let db_now = fetch_db_now(c).await?;
+                let row = new_job(&spec, db_now)?;
+                // next_run_at and is_paused are supplied as INSERT values but are
+                // deliberately ABSENT from the DO UPDATE SET list, so a conflict
+                // leaves the cursor and lifecycle untouched.
+                Ok(diesel::insert_into(j::scheduler_jobs)
+                    .values(&row)
+                    .on_conflict(j::name)
+                    .do_update()
+                    .set((
+                        j::cron_expression.eq(&row.cron_expression),
+                        j::job_args.eq(&row.job_args),
+                        j::lease_duration.eq(&row.lease_duration),
+                        j::max_attempts.eq(row.max_attempts),
+                        j::updated_at.eq(db_now),
+                    ))
+                    .returning(SchedulerJob::as_returning())
+                    .get_result(c)
+                    .await?)
+            }
+            .scope_boxed()
+        })
+        .await?;
+    Job::try_from(row)
 }
 
 /// Explicitly move a job's `next_run_at` — the only non-materializer operation
@@ -132,62 +136,66 @@ pub async fn reschedule(
     conn: &mut AsyncPgConnection,
     id: JobId,
     update: ScheduleUpdate,
-) -> Result<Option<SchedulerJob>, SchedulerError> {
-    conn.transaction::<Option<SchedulerJob>, SchedulerError, _>(|c| {
-        async move {
-            let db_now = fetch_db_now(c).await?;
-            let next = match update {
-                ScheduleUpdate::SetNextRunAt(ts) => ts,
-                ScheduleUpdate::ResetFromNow => {
-                    // Lock the row and read its stored cron; absent => no such job.
-                    let cron_str: Option<String> = j::scheduler_jobs
-                        .find(id)
-                        .select(j::cron_expression)
-                        .for_update()
-                        .first(c)
-                        .await
-                        .optional()?;
-                    let Some(cron_str) = cron_str else {
-                        return Ok(None);
-                    };
-                    // Corrupt stored cron surfaces loudly; never a silent skip.
-                    CronExpression::parse(&cron_str)?.next_after(db_now)?
-                }
-            };
-            // `.optional()` yields Ok(None) for an unknown id: in the
-            // SetNextRunAt branch no row was locked so the UPDATE matches
-            // nothing; the ResetFromNow branch already returned early above
-            // when its FOR UPDATE read found no row.
-            Ok(diesel::update(j::scheduler_jobs.find(id))
-                .set((j::next_run_at.eq(next), j::updated_at.eq(db_now)))
-                .returning(SchedulerJob::as_returning())
-                .get_result(c)
-                .await
-                .optional()?)
-        }
-        .scope_boxed()
-    })
-    .await
+) -> Result<Option<Job>, SchedulerError> {
+    let row = conn
+        .transaction::<Option<SchedulerJob>, SchedulerError, _>(|c| {
+            async move {
+                let db_now = fetch_db_now(c).await?;
+                let next = match update {
+                    ScheduleUpdate::SetNextRunAt(ts) => ts,
+                    ScheduleUpdate::ResetFromNow => {
+                        // Lock the row and read its stored cron; absent => no such job.
+                        let cron_str: Option<String> = j::scheduler_jobs
+                            .find(id)
+                            .select(j::cron_expression)
+                            .for_update()
+                            .first(c)
+                            .await
+                            .optional()?;
+                        let Some(cron_str) = cron_str else {
+                            return Ok(None);
+                        };
+                        // A corrupt stored cron surfaces loudly as CorruptJob; never a silent skip.
+                        CronExpression::parse_stored(id, &cron_str)?.next_after(db_now)?
+                    }
+                };
+                // `.optional()` yields Ok(None) for an unknown id: in the
+                // SetNextRunAt branch no row was locked so the UPDATE matches
+                // nothing; the ResetFromNow branch already returned early above
+                // when its FOR UPDATE read found no row.
+                Ok(diesel::update(j::scheduler_jobs.find(id))
+                    .set((j::next_run_at.eq(next), j::updated_at.eq(db_now)))
+                    .returning(SchedulerJob::as_returning())
+                    .get_result(c)
+                    .await
+                    .optional()?)
+            }
+            .scope_boxed()
+        })
+        .await?;
+    row.map(Job::try_from).transpose()
 }
 
 pub async fn get(
     conn: &mut AsyncPgConnection,
     id: JobId,
-) -> Result<Option<SchedulerJob>, SchedulerError> {
-    Ok(j::scheduler_jobs
+) -> Result<Option<Job>, SchedulerError> {
+    let row: Option<SchedulerJob> = j::scheduler_jobs
         .find(id)
         .select(SchedulerJob::as_returning())
         .first(conn)
         .await
-        .optional()?)
+        .optional()?;
+    row.map(Job::try_from).transpose()
 }
 
-pub async fn list(conn: &mut AsyncPgConnection) -> Result<Vec<SchedulerJob>, SchedulerError> {
-    Ok(j::scheduler_jobs
+pub async fn list(conn: &mut AsyncPgConnection) -> Result<Vec<Job>, SchedulerError> {
+    let rows: Vec<SchedulerJob> = j::scheduler_jobs
         .order(j::name.asc())
         .select(SchedulerJob::as_returning())
         .load(conn)
-        .await?)
+        .await?;
+    rows.into_iter().map(Job::try_from).collect()
 }
 
 pub async fn pause(conn: &mut AsyncPgConnection, id: JobId) -> Result<(), SchedulerError> {
