@@ -2,7 +2,7 @@ mod common;
 use chrono::{Duration, Utc};
 use common::TestDb;
 use pg_task_scheduler::store;
-use pg_task_scheduler::{LeaseToken, Outcome, RunState, WorkerId};
+use pg_task_scheduler::{FinalizeOutcome, LeaseToken, Outcome, RunState, WorkerId};
 
 #[tokio::test]
 async fn completes_with_matching_token() {
@@ -20,10 +20,11 @@ async fn completes_with_matching_token() {
     .unwrap()
     .unwrap();
 
-    assert!(
+    assert_eq!(
         store::finalize_run(&mut conn, c.run_id, c.lease_token, Outcome::Completed)
             .await
-            .unwrap()
+            .unwrap(),
+        FinalizeOutcome::Applied
     );
     assert!(matches!(
         store::run_state(&mut conn, c.run_id).await.unwrap(),
@@ -48,7 +49,7 @@ async fn fails_with_error_and_clears_lease() {
     .unwrap()
     .unwrap();
 
-    assert!(
+    assert_eq!(
         store::finalize_run(
             &mut conn,
             c.run_id,
@@ -56,7 +57,8 @@ async fn fails_with_error_and_clears_lease() {
             Outcome::Failed("boom".into())
         )
         .await
-        .unwrap()
+        .unwrap(),
+        FinalizeOutcome::Applied
     );
     match store::run_state(&mut conn, c.run_id).await.unwrap() {
         Some(RunState::Failed { error, .. }) => assert_eq!(error, "boom"),
@@ -81,7 +83,7 @@ async fn stale_token_is_fenced_out() {
     .unwrap()
     .unwrap();
 
-    let applied = store::finalize_run(
+    let outcome = store::finalize_run(
         &mut conn,
         c.run_id,
         LeaseToken::generate(),
@@ -89,7 +91,7 @@ async fn stale_token_is_fenced_out() {
     )
     .await
     .unwrap();
-    assert!(!applied);
+    assert_eq!(outcome, FinalizeOutcome::Fenced);
     assert!(matches!(
         store::run_state(&mut conn, c.run_id).await.unwrap(),
         Some(RunState::Running(_))

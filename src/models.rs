@@ -275,6 +275,19 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Result of attempting to record a run's terminal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// We inserted the terminal fact.
+    Applied,
+    /// Our lease token no longer matches the current lease (the run was reclaimed);
+    /// we recorded nothing.
+    Fenced,
+    /// An outcome already exists (the reaper or a concurrent finalizer won the race);
+    /// a benign no-op, not an error.
+    AlreadyTerminal,
+}
+
 // ---------------------------------------------------------------------------
 // DB row structs
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::SchedulerError;
 use crate::ids::WorkerId;
 use crate::metrics;
-use crate::models::{ClaimedRun, Outcome};
+use crate::models::{ClaimedRun, FinalizeOutcome, Outcome};
 use crate::pool::SchedulerPool;
 use crate::runtime::builder::Scheduler;
 use crate::runtime::context::JobContext;
@@ -178,8 +178,13 @@ async fn dispatch<P: SchedulerPool>(
     match pool.acquire().await {
         Ok(mut c) => {
             match store::finalize_run(&mut c, claimed.run_id, claimed.lease_token, outcome).await {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(run = %claimed.run_id.0, "finalize fenced out"),
+                Ok(FinalizeOutcome::Applied) => {}
+                Ok(FinalizeOutcome::Fenced) => {
+                    tracing::warn!(run = %claimed.run_id.0, "finalize fenced: lease lost/reclaimed")
+                }
+                Ok(FinalizeOutcome::AlreadyTerminal) => {
+                    tracing::debug!(run = %claimed.run_id.0, "run already terminal (race); finalize no-op")
+                }
                 Err(e) => tracing::error!(error = %e, "finalize failed"),
             }
         }
