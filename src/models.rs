@@ -276,6 +276,7 @@ pub enum Outcome {
 }
 
 /// Result of attempting to record a run's terminal outcome.
+#[must_use = "Fenced / AlreadyTerminal mean this call did not record the outcome"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizeOutcome {
     /// We inserted the terminal fact.

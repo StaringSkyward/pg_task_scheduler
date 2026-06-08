@@ -33,3 +33,4 @@ axum = ["dep:axum"]
 [dev-dependencies]
 dotenvy = "0.15.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tower = { version = "0.5", features = ["util"] }

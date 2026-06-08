@@ -1,7 +1,7 @@
 //! Optional Axum admin routes over job CRUD. Enable with the `axum` feature.
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use crate::ids::JobId;
@@ -31,8 +31,9 @@ impl From<crate::models::Job> for JobView {
 pub fn router<P: SchedulerPool>(pool: P) -> Router {
     Router::new()
         .route("/jobs", get(list_jobs::<P>))
-        .route("/jobs/{id}/pause", post(pause_job::<P>))
-        .route("/jobs/{id}/resume", post(resume_job::<P>))
+        .route("/jobs/:id/pause", post(pause_job::<P>))
+        .route("/jobs/:id/resume", post(resume_job::<P>))
+        .route("/jobs/:id", delete(delete_job::<P>))
         .with_state(pool)
 }
 
@@ -72,6 +73,20 @@ async fn resume_job<P: SchedulerPool>(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut c = acquire(&pool).await?;
     match jobs::resume(&mut c, JobId(id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Applied::Changed => Ok(StatusCode::NO_CONTENT),
+        Applied::NotFound => Err((StatusCode::NOT_FOUND, format!("no job with id {id}"))),
+    }
+}
+
+async fn delete_job<P: SchedulerPool>(
+    State(pool): State<P>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut c = acquire(&pool).await?;
+    match jobs::delete(&mut c, JobId(id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
