@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `bb8`        | no      | `SchedulerPool` impl for `diesel-async`'s bb8 integration            |
 | `mobc`       | no      | `SchedulerPool` impl for `diesel-async`'s mobc integration           |
 | `metrics`    | no      | Emit counters via `gnort` (runs materialized, claimed, completed, failed, reaped) |
-| `axum`       | no      | Admin routes for listing, pausing, resuming, and inspecting jobs     |
+| `axum`       | no      | Admin routes for listing, pausing, resuming, and deleting jobs       |
 
 Enable exactly one pool feature. `deadpool` is selected by default.
 
