@@ -8,11 +8,11 @@ The scheduler provides **leased at-least-once execution per scheduled occurrence
 
 ## Data model
 
-Run state is decomposed across three relations so that invalid combinations are unrepresentable. `scheduler_runs` is the immutable occurrence (created once; carries no status, lease, or outcome columns). `scheduler_run_leases` exists *if and only if* the run is currently claimed: its presence means "running" and its absence means "pending". `scheduler_run_outcomes` exists *if and only if* the run is terminal (completed or failed). Derived status — `Pending`, `Running`, `Completed`, `Failed` — is a Rust sum type computed from the presence or absence of these rows, never stored as a column. Two database triggers enforce the "lease XOR outcome" invariant at the schema level. See [`SchedulerDesign.md`](SchedulerDesign.md) for the full design.
+Run state is decomposed across three relations so that invalid combinations are unrepresentable. `scheduler_runs` is the immutable occurrence (created once; carries no status, lease, or outcome columns). `scheduler_run_leases` exists *if and only if* the run is currently claimed: its presence means "running" and its absence means "pending". `scheduler_run_outcomes` exists *if and only if* the run is terminal (completed or failed). Derived status — `Pending`, `Running`, `Completed`, `Failed` — is a Rust sum type computed from the presence or absence of these rows, never stored as a column. Two database triggers enforce the "lease XOR outcome" invariant at the schema level. See [`SchedulerDesign.md`](docs/SchedulerDesign.md) for the full design.
 
 ## Concurrency
 
-See [Concurrency Model](Concurrency.md) for multi-worker behavior, fencing, failure races, scaling limits, and operational guidance.
+See [Concurrency Model](docs/Concurrency.md) for multi-worker behavior, fencing, failure races, scaling limits, and operational guidance.
 
 ## Database Schema
 
