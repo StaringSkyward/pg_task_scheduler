@@ -83,12 +83,13 @@ mod tests {
     fn ctx() -> JobContext {
         JobContext {
             run_id: RunId(uuid::Uuid::new_v4()),
-            job_id: JobId(uuid::Uuid::new_v4()),
+            job_id: Some(JobId(uuid::Uuid::new_v4())),
             job_name: JobName::try_from("t").unwrap(),
             scheduled_for: Utc::now(),
             attempt: NonZeroU32::new(1).unwrap(),
             lease_token: LeaseToken::generate(),
             lease_expires_at: Utc::now(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
 

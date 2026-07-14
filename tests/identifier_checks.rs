@@ -75,7 +75,11 @@ async fn empty_worker_id_is_rejected_by_check() {
     .id;
 
     let run_id = diesel::sql_query(
-        "INSERT INTO scheduler_runs (job_id, scheduled_for) VALUES ($1, now()) RETURNING id",
+        "INSERT INTO scheduler_runs (\
+             job_id, job_name, job_args, scheduled_for, available_at, max_attempts,\
+             lease_duration, retry_backoff\
+         ) VALUES ($1, 'wjob', '{}'::jsonb, now(), now(), 3, interval '5 minutes', interval '1 second')\
+         RETURNING id",
     )
     .bind::<diesel::sql_types::Uuid, _>(job_id)
     .get_result::<IdRow>(&mut conn)
@@ -84,8 +88,9 @@ async fn empty_worker_id_is_rejected_by_check() {
     .id;
 
     let err = diesel::sql_query(
-        "INSERT INTO scheduler_run_leases (run_id, worker_id, lease_token, lease_expires_at) \
-         VALUES ($1, '', gen_random_uuid(), now() + interval '5 minutes')",
+        "UPDATE scheduler_runs SET state = 'running'::scheduler_run_state, attempt_count = 1,\
+             worker_id = '', lease_token = gen_random_uuid(), started_at = now(),\
+             lease_expires_at = now() + interval '5 minutes' WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(run_id)
     .execute(&mut conn)

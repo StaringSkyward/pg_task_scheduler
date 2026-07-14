@@ -44,6 +44,7 @@ mod imp {
             crate::metrics::RUNS_COMPLETED => named_lock!(M2, RUNS_COMPLETED),
             crate::metrics::RUNS_FAILED => named_lock!(M3, RUNS_FAILED),
             crate::metrics::RUNS_REAPED => named_lock!(M4, RUNS_REAPED),
+            crate::metrics::RUNS_REQUEUED => named_lock!(M5, RUNS_REQUEUED),
             // Fallback for any name not in the known set: register each time (slow path).
             _ => {
                 // Safety: 'static str keys are unique enough for the registry's DashMap;
@@ -96,3 +97,4 @@ pub const RUNS_CLAIMED: &str = "pg_task_scheduler.runs.claimed";
 pub const RUNS_COMPLETED: &str = "pg_task_scheduler.runs.completed";
 pub const RUNS_FAILED: &str = "pg_task_scheduler.runs.failed";
 pub const RUNS_REAPED: &str = "pg_task_scheduler.runs.reaped";
+pub const RUNS_REQUEUED: &str = "pg_task_scheduler.runs.requeued";

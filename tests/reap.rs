@@ -1,9 +1,9 @@
 mod common;
 use chrono::{Duration, Utc};
 use common::TestDb;
-use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 use pg_task_scheduler::store;
 use pg_task_scheduler::{RunState, WorkerId};
+use std::num::NonZeroUsize;
 
 #[tokio::test]
 async fn dead_letters_exhausted_runs() {
@@ -35,7 +35,7 @@ async fn dead_letters_exhausted_runs() {
 }
 
 #[tokio::test]
-async fn leaves_reclaimable_runs() {
+async fn requeues_reclaimable_runs() {
     let db = TestDb::new().await;
     let job = db
         .insert_job_full(
@@ -58,13 +58,13 @@ async fn leaves_reclaimable_runs() {
     assert_eq!(store::reap_expired(&mut conn).await.unwrap(), 0);
     assert!(matches!(
         store::run_state(&mut conn, c.run_id).await.unwrap(),
-        Some(RunState::Running(_))
+        Some(RunState::Pending)
     ));
     db.cleanup().await;
 }
 
 #[tokio::test]
-async fn reap_race_is_noop_not_error() {
+async fn concurrent_recovery_processes_task_once() {
     let db = TestDb::new().await;
     let job = db
         .insert_job_full(
@@ -85,33 +85,15 @@ async fn reap_race_is_noop_not_error() {
     db.force_lease_expired(job).await;
     drop(setup);
 
-    // Conn A: hold an UNCOMMITTED terminal-outcome insert for the run (contends the PK).
     let mut a = db.pool.get().await.unwrap();
-    a.batch_execute("BEGIN").await.unwrap();
-    diesel::sql_query(
-        "INSERT INTO scheduler_run_outcomes (run_id, outcome, last_error) \
-         VALUES ($1, 'failed'::run_outcome, 'race')",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(c.run_id.0)
-    .execute(&mut a)
-    .await
-    .unwrap();
-
-    // Conn B: capture its pid, then reap in a task; its insert blocks on A's row.
     let mut b = db.pool.get().await.unwrap();
-    let b_pid = common::backend_pid(&mut b).await;
-    let handle = tokio::spawn(async move { store::reap_expired(&mut b).await });
-
-    // Deterministically wait until B is blocked, THEN release A.
-    db.wait_until_lock_blocked(b_pid).await;
-    a.batch_execute("COMMIT").await.unwrap();
-
-    // B unblocks: ON CONFLICT DO NOTHING => Ok(0), NOT a unique violation.
-    let reaped = handle
-        .await
-        .unwrap()
-        .expect("reap must not error on a concurrent terminal-insert race");
-    assert_eq!(reaped, 0, "the race-loser dead-letters nothing");
+    let limit = NonZeroUsize::new(10).unwrap();
+    let (left, right) = tokio::join!(
+        store::recover_expired(&mut a, limit),
+        store::recover_expired(&mut b, limit),
+    );
+    let total = left.unwrap().failed + right.unwrap().failed;
+    assert_eq!(total, 1, "exactly one recovery owns the expired row");
 
     let mut chk = db.pool.get().await.unwrap();
     assert!(matches!(

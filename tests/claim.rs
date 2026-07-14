@@ -3,6 +3,7 @@ use chrono::{Duration, Utc};
 use common::TestDb;
 use pg_task_scheduler::store;
 use pg_task_scheduler::{RunId, RunState, WorkerId};
+use std::num::NonZeroUsize;
 
 fn names(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -103,12 +104,20 @@ async fn reclaims_expired_until_max_attempts() {
         .unwrap();
     assert_eq!(a.attempt.get(), 1);
     db.force_lease_expired(job).await;
+    let recovered = store::recover_expired(&mut conn, NonZeroUsize::new(10).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(recovered.requeued, 1);
     let b = store::claim_one(&mut conn, &w, &names(&["j"]))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(b.attempt.get(), 2);
     db.force_lease_expired(job).await;
+    let recovered = store::recover_expired(&mut conn, NonZeroUsize::new(10).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(recovered.failed, 1);
     assert!(
         store::claim_one(&mut conn, &w, &names(&["j"]))
             .await

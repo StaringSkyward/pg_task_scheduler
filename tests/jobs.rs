@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
+use diesel_async::RunQueryDsl;
 use pg_task_scheduler::jobs::{self, Applied, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::{
     CorruptJobRow, CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts,
@@ -251,28 +252,19 @@ async fn get_unparseable_cron_is_corrupt_job() {
 }
 
 #[tokio::test]
-async fn get_calendar_lease_interval_is_corrupt_job() {
+async fn database_rejects_calendar_lease_interval() {
     let db = TestDb::new().await;
-    // '1 day' passes the SQL CHECK (> 0) but is not a pure-microsecond lease,
-    // so it must surface as CorruptJob, not as a successful projection.
-    let id = db
-        .insert_job_full(
-            "d",
-            "*/5 * * * *",
-            Utc::now() + chrono::Duration::hours(1),
-            "1 day",
-            3,
-            false,
-        )
-        .await;
     let mut conn = db.pool.get().await.unwrap();
-    let res = jobs::get(&mut conn, JobId(id)).await;
+    let error = diesel::sql_query(
+        "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at, lease_duration) \
+         VALUES ('d', '*/5 * * * *', now(), interval '1 day')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect_err("calendar lease intervals must be rejected by PostgreSQL");
     assert!(matches!(
-        res,
-        Err(SchedulerError::CorruptJob {
-            source: CorruptJobRow::LeaseDuration(_),
-            ..
-        })
+        error,
+        diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, _)
     ));
     db.cleanup().await;
 }

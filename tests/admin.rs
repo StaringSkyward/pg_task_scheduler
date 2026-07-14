@@ -8,6 +8,13 @@ use common::TestDb;
 use tower::ServiceExt; // for `oneshot`
 use uuid::Uuid;
 
+struct AdminTask;
+
+impl pg_task_scheduler::Task for AdminTask {
+    const NAME: &'static str = "admin-task";
+    type Args = serde_json::Value;
+}
+
 /// Send one request through the router and return the response status. `oneshot`
 /// consumes the service, so callers pass `app.clone()` when sending twice.
 async fn status_of(app: Router, method: Method, uri: String) -> StatusCode {
@@ -86,6 +93,43 @@ async fn delete_existing_204_then_404() {
     // Deleting again → 404: proves the first call actually deleted (not a no-op/pause).
     assert_eq!(
         status_of(app, Method::DELETE, format!("/jobs/{id}")).await,
+        StatusCode::NOT_FOUND
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn task_state_and_cancel_routes() {
+    let db = TestDb::new().await;
+    let mut connection = db.pool.get().await.unwrap();
+    let task = pg_task_scheduler::enqueue::<AdminTask>(
+        &mut connection,
+        serde_json::json!({}),
+        pg_task_scheduler::EnqueueOptions::immediate(),
+    )
+    .await
+    .unwrap();
+    let app = pg_task_scheduler::admin::router(db.pool.clone());
+    assert_eq!(
+        status_of(
+            app.clone(),
+            Method::GET,
+            format!("/tasks/{}", task.task_id.0)
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(
+            app.clone(),
+            Method::POST,
+            format!("/tasks/{}/cancel", task.task_id.0)
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        status_of(app, Method::GET, format!("/tasks/{}", Uuid::new_v4())).await,
         StatusCode::NOT_FOUND
     );
     db.cleanup().await;

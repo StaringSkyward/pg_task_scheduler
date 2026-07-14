@@ -11,14 +11,32 @@ use crate::ids::{JobId, JobName, LeaseToken, RunId, WorkerId};
 use crate::schema::scheduler_jobs;
 
 // ---------------------------------------------------------------------------
-// RunOutcome — PG enum via diesel-derive-enum
+// Database state enums
 // ---------------------------------------------------------------------------
 
-#[derive(diesel_derive_enum::DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[ExistingTypePath = "crate::schema::sql_types::RunOutcome"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     Completed,
     Failed,
+}
+
+#[derive(diesel_derive_enum::DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[ExistingTypePath = "crate::schema::sql_types::SchedulerRunState"]
+pub(crate) enum StoredRunState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(diesel_derive_enum::DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[ExistingTypePath = "crate::schema::sql_types::SchedulerAttemptOutcome"]
+pub(crate) enum StoredAttemptOutcome {
+    Completed,
+    Failed,
+    Expired,
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +101,59 @@ pub struct LeaseDuration {
     micros: NonZeroI64, // invariant: always in 1..=i64::MAX, enforced by TryFrom
 }
 
+/// Delay before a retryable handler failure becomes claimable again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBackoff {
+    micros: i64,
+}
+
+impl TryFrom<Duration> for RetryBackoff {
+    type Error = LeaseDurationError;
+
+    fn try_from(d: Duration) -> Result<Self, Self::Error> {
+        if !d.subsec_nanos().is_multiple_of(1000) {
+            return Err(LeaseDurationError::PrecisionLoss);
+        }
+        let micros = i64::try_from(d.as_micros()).map_err(|_| LeaseDurationError::TooLarge)?;
+        Ok(Self { micros })
+    }
+}
+
+impl RetryBackoff {
+    pub(crate) fn to_pg_interval(self) -> diesel::pg::data_types::PgInterval {
+        diesel::pg::data_types::PgInterval::from_microseconds(self.micros)
+    }
+
+    pub(crate) fn from_pg_interval(
+        iv: diesel::pg::data_types::PgInterval,
+    ) -> Result<Self, LeaseDurationError> {
+        if iv.months != 0 || iv.days != 0 {
+            return Err(LeaseDurationError::CalendarComponent {
+                months: iv.months,
+                days: iv.days,
+            });
+        }
+        if iv.microseconds < 0 {
+            return Err(LeaseDurationError::Negative {
+                microseconds: iv.microseconds,
+            });
+        }
+        Ok(Self {
+            micros: iv.microseconds,
+        })
+    }
+
+    pub fn as_duration(self) -> Duration {
+        Duration::from_micros(self.micros.unsigned_abs())
+    }
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self { micros: 1_000_000 }
+    }
+}
+
 /// Why a `Duration` was rejected as a `LeaseDuration`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LeaseDurationError {
@@ -117,6 +188,9 @@ impl TryFrom<Duration> for LeaseDuration {
 }
 
 impl MaxAttempts {
+    pub(crate) fn default_value() -> Self {
+        Self(NonZeroI32::new(3).unwrap())
+    }
     /// Read boundary: parse the stored signed count. Rejects `<= 0`.
     pub(crate) fn from_db_i32(i: i32) -> Result<Self, MaxAttemptsError> {
         NonZeroI32::new(i)
@@ -138,6 +212,11 @@ impl MaxAttempts {
 }
 
 impl LeaseDuration {
+    pub(crate) fn default_value() -> Self {
+        Self {
+            micros: NonZeroI64::new(300_000_000).unwrap(),
+        }
+    }
     /// Total, infallible: `micros` is already a validated positive i64.
     pub(crate) fn to_pg_interval(self) -> diesel::pg::data_types::PgInterval {
         diesel::pg::data_types::PgInterval::from_microseconds(self.micros.get())
@@ -196,6 +275,28 @@ pub enum RunState {
         finished_at: DateTime<Utc>,
         error: String,
     },
+    Cancelled {
+        finished_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptState {
+    Running,
+    Completed,
+    Failed { error: Option<String> },
+    Expired { error: Option<String> },
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskAttempt {
+    pub attempt: NonZeroU32,
+    pub worker_id: WorkerId,
+    pub started_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub state: AttemptState,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,13 +306,14 @@ pub enum RunState {
 #[derive(Debug, Clone)]
 pub struct ClaimedRun {
     pub run_id: RunId,
-    pub job_id: JobId,
+    pub job_id: Option<JobId>,
     pub job_name: JobName,
     pub job_args: serde_json::Value,
     pub scheduled_for: DateTime<Utc>,
     pub attempt: NonZeroU32,
     pub lease_token: LeaseToken,
     pub lease_expires_at: DateTime<Utc>,
+    pub lease_duration: LeaseDuration,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +331,7 @@ pub struct Job {
     pub cron: CronExpression,
     pub lease_duration: LeaseDuration,
     pub max_attempts: MaxAttempts,
+    pub retry_backoff: RetryBackoff,
     pub lifecycle: JobLifecycle,
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -257,6 +360,12 @@ impl TryFrom<SchedulerJob> for Job {
             cron,
             lease_duration,
             max_attempts,
+            retry_backoff: RetryBackoff::from_pg_interval(row.retry_backoff).map_err(|e| {
+                SchedulerError::CorruptJob {
+                    job_id,
+                    source: e.into(),
+                }
+            })?,
             lifecycle: JobLifecycle::from_paused(row.is_paused),
             next_run_at: row.next_run_at,
             created_at: row.created_at,
@@ -289,6 +398,20 @@ pub enum FinalizeOutcome {
     AlreadyTerminal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureOutcome {
+    Retried { available_at: DateTime<Utc> },
+    Failed,
+    Fenced,
+    AlreadyTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalOutcome {
+    Renewed { lease_expires_at: DateTime<Utc> },
+    Fenced,
+}
+
 // ---------------------------------------------------------------------------
 // DB row structs
 // ---------------------------------------------------------------------------
@@ -308,6 +431,7 @@ pub struct SchedulerJob {
     pub is_paused: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub retry_backoff: diesel::pg::data_types::PgInterval,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -320,6 +444,7 @@ pub struct NewJob {
     pub lease_duration: diesel::pg::data_types::PgInterval,
     pub max_attempts: i32,
     pub is_paused: bool,
+    pub retry_backoff: diesel::pg::data_types::PgInterval,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,8 +459,8 @@ pub struct NewJob {
 pub struct StatusRow {
     #[diesel(sql_type = sql_types::Uuid)]
     pub id: RunId,
-    #[diesel(sql_type = sql_types::Uuid)]
-    pub job_id: JobId,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Uuid>)]
+    pub job_id: Option<JobId>,
     #[diesel(sql_type = sql_types::Timestamptz)]
     pub scheduled_for: DateTime<Utc>,
     #[diesel(sql_type = sql_types::Integer)]
@@ -348,8 +473,8 @@ pub struct StatusRow {
     pub lease_expires_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
     pub started_at: Option<DateTime<Utc>>,
-    #[diesel(sql_type = sql_types::Nullable<crate::schema::sql_types::RunOutcome>)]
-    pub outcome: Option<RunOutcome>,
+    #[diesel(sql_type = crate::schema::sql_types::SchedulerRunState)]
+    pub state: StoredRunState,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
     pub finished_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
@@ -439,6 +564,7 @@ mod job_projection_tests {
             is_paused: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            retry_backoff: diesel::pg::data_types::PgInterval::from_microseconds(1_000_000),
         }
     }
 

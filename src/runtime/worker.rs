@@ -1,5 +1,8 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -7,12 +10,21 @@ use tokio_util::sync::CancellationToken;
 use crate::error::SchedulerError;
 use crate::ids::WorkerId;
 use crate::metrics;
-use crate::models::{ClaimedRun, FinalizeOutcome, Outcome};
+use crate::models::{ClaimedRun, FailureOutcome, FinalizeOutcome, Outcome, RenewalOutcome};
 use crate::pool::SchedulerPool;
 use crate::runtime::builder::Scheduler;
 use crate::runtime::context::JobContext;
+use crate::runtime::health::{HealthStatus, WorkerHealth};
 use crate::runtime::registry::{Handler, Registry};
 use crate::store;
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 async fn conn<P: SchedulerPool>(pool: &P) -> Result<P::Conn, SchedulerError> {
     pool.acquire()
@@ -26,59 +38,141 @@ impl<P: SchedulerPool> Scheduler<P> {
             pool,
             registry,
             config,
+            health_tx,
         } = self;
         let registry = Arc::new(registry);
         let names = Arc::new(registry.names());
         let semaphore = Arc::new(Semaphore::new(config.max_concurrency.get()));
         let mut in_flight = JoinSet::new();
+        let mut poll = tokio::time::interval(config.poll_interval);
+        let mut recover = tokio::time::interval(config.reaper_interval);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        recover.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failures = 0u64;
 
-        let reaper = spawn_reaper(pool.clone(), config.reaper_interval, cancel.clone());
-
+        // Tokio intervals tick immediately. The first iteration therefore
+        // materializes/reclaims/claims without an artificial startup delay.
         loop {
+            let mut cycle_error = None;
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(config.poll_interval) => {
-                    if let Ok(mut c) = conn(&pool).await {
-                        match store::materialize_due_jobs(&mut c).await {
-                            Ok(n) if n > 0 => {
-                                metrics::incr_by(
-                                    metrics::RUNS_MATERIALIZED,
-                                    u64::try_from(n).unwrap_or(u64::MAX),
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::error!(error = %e, "materialize tick failed"),
-                        }
-                    }
-                    claim_and_dispatch(&pool, &registry, &names, &config.worker_id,
-                                       &semaphore, &mut in_flight, &cancel).await;
-                    while let Some(res) = in_flight.try_join_next() {
-                        log_handler_join(res);
+                _ = poll.tick() => {
+                    if let Err(error) = materialize(&pool).await {
+                        cycle_error = Some(error);
                     }
                 }
+                _ = recover.tick() => {
+                    if let Err(error) = recover_leases(&pool).await {
+                        cycle_error = Some(error);
+                    }
+                }
+                joined = in_flight.join_next(), if !in_flight.is_empty() => {
+                    if let Some(result) = joined {
+                        log_handler_join(result);
+                    }
+                }
+            }
+
+            while let Some(result) = in_flight.try_join_next() {
+                log_handler_join(result);
+            }
+
+            if cycle_error.is_none()
+                && let Err(error) = claim_and_dispatch(
+                    &pool,
+                    &registry,
+                    &names,
+                    &config.worker_id,
+                    &semaphore,
+                    &mut in_flight,
+                )
+                .await
+            {
+                cycle_error = Some(error);
+            }
+
+            update_health(&health_tx, &mut failures, cycle_error.as_ref());
+            if let Some(error) = cycle_error {
+                tracing::error!(error = %error, "scheduler cycle failed");
             }
         }
 
         tracing::info!("draining in-flight handlers");
         let _ = tokio::time::timeout(config.shutdown_timeout, async {
-            while let Some(res) = in_flight.join_next().await {
-                log_handler_join(res);
+            while let Some(result) = in_flight.join_next().await {
+                log_handler_join(result);
             }
         })
         .await;
-        // Deadline passed (or all drained): abort whatever remains. Because each
-        // task now owns its handler future directly, abort cancels the handler
-        // rather than detaching it. Still drain so a panic is logged, not swallowed.
         in_flight.abort_all();
-        while let Some(res) = in_flight.join_next().await {
-            log_handler_join(res);
+        while let Some(result) = in_flight.join_next().await {
+            log_handler_join(result);
         }
-        reaper.abort();
+        health_tx.send_replace(WorkerHealth {
+            status: HealthStatus::Stopped,
+            consecutive_failures: failures,
+            last_error: None,
+        });
         Ok(())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn update_health(
+    health: &tokio::sync::watch::Sender<WorkerHealth>,
+    failures: &mut u64,
+    error: Option<&SchedulerError>,
+) {
+    match error {
+        Some(error) => {
+            *failures = failures.saturating_add(1);
+            health.send_replace(WorkerHealth {
+                status: HealthStatus::Degraded,
+                consecutive_failures: *failures,
+                last_error: Some(error.to_string()),
+            });
+        }
+        None => {
+            *failures = 0;
+            health.send_replace(WorkerHealth {
+                status: HealthStatus::Healthy,
+                consecutive_failures: 0,
+                last_error: None,
+            });
+        }
+    }
+}
+
+async fn materialize<P: SchedulerPool>(pool: &P) -> Result<(), SchedulerError> {
+    let mut connection = conn(pool).await?;
+    let count = store::materialize_due_jobs(&mut connection).await?;
+    if count > 0 {
+        metrics::incr_by(
+            metrics::RUNS_MATERIALIZED,
+            u64::try_from(count).unwrap_or(u64::MAX),
+        );
+    }
+    Ok(())
+}
+
+async fn recover_leases<P: SchedulerPool>(pool: &P) -> Result<(), SchedulerError> {
+    let mut connection = conn(pool).await?;
+    let summary =
+        store::recover_expired(&mut connection, NonZeroUsize::new(1_000).unwrap()).await?;
+    if summary.requeued > 0 {
+        metrics::incr_by(
+            metrics::RUNS_REQUEUED,
+            u64::try_from(summary.requeued).unwrap_or(u64::MAX),
+        );
+    }
+    if summary.failed > 0 {
+        metrics::incr_by(
+            metrics::RUNS_REAPED,
+            u64::try_from(summary.failed).unwrap_or(u64::MAX),
+        );
+    }
+    Ok(())
+}
+
 async fn claim_and_dispatch<P: SchedulerPool>(
     pool: &P,
     registry: &Arc<Registry>,
@@ -86,74 +180,37 @@ async fn claim_and_dispatch<P: SchedulerPool>(
     worker_id: &WorkerId,
     semaphore: &Arc<Semaphore>,
     in_flight: &mut JoinSet<()>,
-    cancel: &CancellationToken,
-) {
-    loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-            break;
-        };
-        let mut c = match conn(pool).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "claim: no connection");
-                break;
-            }
-        };
-        match store::claim_one(&mut c, worker_id, names).await {
-            Ok(Some(claimed)) => {
-                metrics::incr(metrics::RUNS_CLAIMED);
-                drop(c);
-                // On a handler miss, `handler_for` has already logged the scheduler-
-                // invariant error; deliberately take NO further action. No finalize
-                // (that would write a bogus `Failed` outcome) and no release (a broken
-                // names/registry invariant would then tight-loop reclaiming). The permit
-                // and `claimed` drop here; the lease expires and the run is recovered by
-                // the reaper / a later claim. The loop continues to claim other work.
-                if let Some(handler) = handler_for(registry, &claimed) {
-                    let fut = dispatch(pool.clone(), handler, claimed, permit);
-                    in_flight.spawn(fut);
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::error!(error = %e, "claim failed");
-                break;
-            }
-        }
+) -> Result<(), SchedulerError> {
+    let available = semaphore.available_permits();
+    let Some(limit) = NonZeroUsize::new(available) else {
+        return Ok(());
+    };
+    let mut connection = conn(pool).await?;
+    let claimed = store::claim_batch(&mut connection, worker_id, names, limit).await?;
+    drop(connection);
+
+    for task in claimed {
+        let permit = semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SchedulerError::Invariant("claimed more tasks than worker capacity"))?;
+        let handler = registry
+            .get(&task.job_name)
+            .ok_or(SchedulerError::Invariant(
+                "claimed task has no registered handler",
+            ))?;
+        metrics::incr(metrics::RUNS_CLAIMED);
+        in_flight.spawn(dispatch(pool.clone(), handler, task, permit));
     }
+    Ok(())
 }
 
-/// Log a handler task's join result. A cancellation is expected during shutdown
-/// (we `abort_all` past the deadline), so only non-cancellation errors — i.e.
-/// handler panics — are surfaced.
-fn log_handler_join(res: Result<(), tokio::task::JoinError>) {
-    if let Err(e) = res
-        && !e.is_cancelled()
+fn log_handler_join(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && !error.is_cancelled()
     {
-        tracing::error!(error = %e, "handler task error");
+        tracing::error!(error = %error, "handler task panicked");
     }
-}
-
-/// Resolve the handler for a freshly-claimed run. `claim_one` filters by registered
-/// names (`ANY($names)`, `names` derived from this same registry), so a miss is a
-/// scheduler-invariant violation — the registry and the claim filter cannot diverge
-/// by construction. Surface it loudly and return `None`; the caller then skips
-/// dispatch, leaving the lease for expiry-based recovery, and never finalizes a
-/// bogus application `Failed` outcome.
-fn handler_for(registry: &Registry, claimed: &ClaimedRun) -> Option<Handler> {
-    let handler = registry.get(&claimed.job_name);
-    if handler.is_none() {
-        tracing::error!(
-            run = %claimed.run_id.0,
-            job = claimed.job_name.as_str(),
-            "claimed run has no registered handler (scheduler invariant); \
-             leaving lease for expiry-based recovery"
-        );
-    }
-    handler
 }
 
 async fn dispatch<P: SchedulerPool>(
@@ -163,6 +220,8 @@ async fn dispatch<P: SchedulerPool>(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let ctx = JobContext {
         run_id: claimed.run_id,
         job_id: claimed.job_id,
@@ -171,108 +230,108 @@ async fn dispatch<P: SchedulerPool>(
         attempt: claimed.attempt,
         lease_token: claimed.lease_token,
         lease_expires_at: claimed.lease_expires_at,
+        cancellation: cancellation.clone(),
     };
-    let args = claimed.job_args.clone();
-    // Run the handler directly in this JoinSet task so the scheduler owns its
-    // future: on shutdown, aborting this task drops the handler at its current
-    // await point (cooperative cancellation). A panic unwinds this task and
-    // surfaces as a JoinError on the JoinSet; the run is left un-finalized and
-    // recovered via lease expiry.
-    let outcome = match handler(ctx, args).await {
-        Ok(()) => Outcome::Completed,
-        Err(e) => Outcome::Failed(e.to_string()),
-    };
+    let mut handler_future = handler(ctx, claimed.job_args.clone());
+    let heartbeat = heartbeat_interval(claimed.lease_duration.as_duration());
+    let mut lease_expires_at = claimed.lease_expires_at;
 
-    match &outcome {
-        Outcome::Completed => metrics::incr(metrics::RUNS_COMPLETED),
-        Outcome::Failed(_) => metrics::incr(metrics::RUNS_FAILED),
-    }
-
-    match pool.acquire().await {
-        Ok(mut c) => {
-            match store::finalize_run(&mut c, claimed.run_id, claimed.lease_token, outcome).await {
-                Ok(FinalizeOutcome::Applied) => {}
-                Ok(FinalizeOutcome::Fenced) => {
-                    tracing::warn!(run = %claimed.run_id.0, "finalize fenced: lease lost/reclaimed")
-                }
-                Ok(FinalizeOutcome::AlreadyTerminal) => {
-                    tracing::debug!(run = %claimed.run_id.0, "run already terminal (race); finalize no-op")
-                }
-                Err(e) => tracing::error!(error = %e, "finalize failed"),
-            }
-        }
-        Err(e) => tracing::error!(error = %e, "finalize: no connection"),
-    }
-}
-
-fn spawn_reaper<P: SchedulerPool>(
-    pool: P,
-    interval: std::time::Duration,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(interval) => {
-                    match pool.acquire().await {
-                        Ok(mut c) => match store::reap_expired(&mut c).await {
-                            Ok(n) if n > 0 => {
-                                metrics::incr_by(
-                                    metrics::RUNS_REAPED,
-                                    u64::try_from(n).unwrap_or(u64::MAX),
-                                );
+    let result = loop {
+        tokio::select! {
+            result = &mut handler_future => break Some(result),
+            _ = tokio::time::sleep(heartbeat) => {
+                match pool.acquire().await {
+                    Ok(mut connection) => {
+                        match store::renew_lease(
+                            &mut connection,
+                            claimed.run_id,
+                            claimed.lease_token,
+                        ).await {
+                            Ok(RenewalOutcome::Renewed { lease_expires_at: renewed }) => {
+                                lease_expires_at = renewed;
                             }
-                            Ok(_) => {}
-                            Err(e) => tracing::error!(error = %e, "reaper failed"),
-                        },
-                        Err(e) => tracing::error!(error = %e, "reaper: no connection"),
+                            Ok(RenewalOutcome::Fenced) => {
+                                cancellation.cancel();
+                                break None;
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, run = %claimed.run_id.0, "lease renewal failed");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, run = %claimed.run_id.0, "lease renewal connection failed");
                     }
                 }
+                if Utc::now() >= lease_expires_at {
+                    cancellation.cancel();
+                    break None;
+                }
             }
         }
-    })
+    };
+
+    let Some(result) = result else {
+        tracing::warn!(run = %claimed.run_id.0, "handler cancelled after lease loss");
+        return;
+    };
+    finalize_handler(&pool, &claimed, result).await;
 }
 
-#[cfg(test)]
-mod handler_for_tests {
-    use super::*;
-    use crate::ids::{JobId, JobName, LeaseToken, RunId};
-    use chrono::Utc;
-    use std::num::NonZeroU32;
+fn heartbeat_interval(lease: Duration) -> Duration {
+    let third = lease / 3;
+    if third.is_zero() {
+        Duration::from_micros(1)
+    } else {
+        third
+    }
+}
 
-    fn claimed(name: &str) -> ClaimedRun {
-        ClaimedRun {
-            run_id: RunId(uuid::Uuid::new_v4()),
-            job_id: JobId(uuid::Uuid::new_v4()),
-            job_name: JobName::try_from(name).unwrap(),
-            job_args: serde_json::json!({}),
-            scheduled_for: Utc::now(),
-            attempt: NonZeroU32::new(1).unwrap(),
-            lease_token: LeaseToken::generate(),
-            lease_expires_at: Utc::now(),
+async fn finalize_handler<P: SchedulerPool>(
+    pool: &P,
+    claimed: &ClaimedRun,
+    result: Result<(), crate::error::JobError>,
+) {
+    let mut connection = match pool.acquire().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::error!(error = %error, run = %claimed.run_id.0, "finalize connection failed");
+            return;
         }
-    }
-
-    fn registry_with(name: &str) -> Registry {
-        let mut reg = Registry::new();
-        reg.register::<serde_json::Value, _, _>(
-            JobName::try_from(name).unwrap(),
-            |_ctx, _args| async { Ok(()) },
+    };
+    match result {
+        Ok(()) => match store::finalize_run(
+            &mut connection,
+            claimed.run_id,
+            claimed.lease_token,
+            Outcome::Completed,
         )
-        .unwrap();
-        reg
-    }
-
-    #[test]
-    fn resolves_registered_handler() {
-        let reg = registry_with("known");
-        assert!(handler_for(&reg, &claimed("known")).is_some());
-    }
-
-    #[test]
-    fn missing_handler_is_none() {
-        let reg = registry_with("known");
-        assert!(handler_for(&reg, &claimed("unknown")).is_none());
+        .await
+        {
+            Ok(FinalizeOutcome::Applied) => metrics::incr(metrics::RUNS_COMPLETED),
+            Ok(FinalizeOutcome::Fenced | FinalizeOutcome::AlreadyTerminal) => {
+                tracing::warn!(run = %claimed.run_id.0, "completion was fenced")
+            }
+            Err(error) => tracing::error!(error = %error, "completion failed"),
+        },
+        Err(error) => {
+            let retryable = error.is_retryable();
+            match store::fail_run(
+                &mut connection,
+                claimed.run_id,
+                claimed.lease_token,
+                error.to_string(),
+                retryable,
+            )
+            .await
+            {
+                Ok(FailureOutcome::Retried { .. }) => metrics::incr(metrics::RUNS_REQUEUED),
+                Ok(FailureOutcome::Failed) => metrics::incr(metrics::RUNS_FAILED),
+                Ok(FailureOutcome::Fenced | FailureOutcome::AlreadyTerminal) => {
+                    tracing::warn!(run = %claimed.run_id.0, "failure was fenced")
+                }
+                Err(error) => tracing::error!(error = %error, "failure finalization failed"),
+            }
+        }
     }
 }
