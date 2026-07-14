@@ -136,7 +136,7 @@ async fn already_terminal_after_reap() {
 }
 
 #[tokio::test]
-async fn finalize_race_is_already_terminal() {
+async fn stale_finalize_blocked_by_reclaim_is_fenced() {
     let db = TestDb::new().await;
     db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
         .await;
@@ -148,20 +148,22 @@ async fn finalize_race_is_already_terminal() {
         .unwrap();
     drop(setup);
 
-    // Conn A: hold an UNCOMMITTED terminal-outcome insert for the run.
+    // Conn A takes the task-row mutex before rotating the fencing token.
     let mut a = db.pool.get().await.unwrap();
     a.batch_execute("BEGIN").await.unwrap();
-    diesel::sql_query(
-        "INSERT INTO scheduler_run_outcomes (run_id, outcome, last_error) \
-         VALUES ($1, 'completed'::run_outcome, NULL)",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(c.run_id.0)
-    .execute(&mut a)
-    .await
-    .unwrap();
+    #[derive(diesel::QueryableByName)]
+    struct Locked {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        #[allow(dead_code)]
+        id: uuid::Uuid,
+    }
+    diesel::sql_query("SELECT id FROM scheduler_runs WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(c.run_id.0)
+        .get_result::<Locked>(&mut a)
+        .await
+        .unwrap();
 
-    // Conn B: finalize with the ORIGINAL token; B's snapshot still sees the lease,
-    // so it attempts the insert and blocks on A's uncommitted PK row.
+    // Conn B uses the original token and blocks on the same task row.
     let mut b = db.pool.get().await.unwrap();
     let b_pid = common::backend_pid(&mut b).await;
     let run_id = c.run_id;
@@ -171,12 +173,36 @@ async fn finalize_race_is_already_terminal() {
     });
 
     db.wait_until_lock_blocked(b_pid).await;
+    let new_token = LeaseToken::generate();
+    diesel::sql_query(
+        "UPDATE scheduler_run_attempts SET lease_token = $1, worker_id = 'new-worker' \
+         WHERE lease_token = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(new_token)
+    .bind::<diesel::sql_types::Uuid, _>(c.lease_token)
+    .execute(&mut a)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "UPDATE scheduler_runs SET lease_token = $1, worker_id = 'new-worker' WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(new_token)
+    .bind::<diesel::sql_types::Uuid, _>(c.run_id.0)
+    .execute(&mut a)
+    .await
+    .unwrap();
     a.batch_execute("COMMIT").await.unwrap();
 
     let outcome = handle
         .await
         .unwrap()
-        .expect("finalize must not error on a concurrent terminal-insert race");
-    assert_eq!(outcome, FinalizeOutcome::AlreadyTerminal);
+        .expect("stale finalize must resolve without a database error");
+    assert_eq!(outcome, FinalizeOutcome::Fenced);
+
+    let mut check = db.pool.get().await.unwrap();
+    match store::run_state(&mut check, c.run_id).await.unwrap() {
+        Some(RunState::Running(lease)) => assert_eq!(lease.lease_token, new_token),
+        other => panic!("new claim must remain running, got {other:?}"),
+    }
     db.cleanup().await;
 }

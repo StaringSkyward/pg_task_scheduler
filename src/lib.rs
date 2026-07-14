@@ -1,6 +1,7 @@
 //! # pg_task_scheduler
 //!
-//! Cron-like, PostgreSQL-backed scheduling with **leased at-least-once** execution.
+//! PostgreSQL-backed immediate, delayed, and recurring work with
+//! **leased at-least-once** execution.
 //!
 //! Each scheduled occurrence is a durable row in PostgreSQL.  A worker claims it
 //! using `FOR UPDATE SKIP LOCKED` and a fencing token.  If the worker crashes or
@@ -9,8 +10,8 @@
 //! **handlers must be idempotent** — use `ctx.run_id` or `ctx.scheduled_for` as
 //! idempotency keys.
 //!
-//! Apply `migrations/0001_create_scheduler_tables/up.sql` (e.g. via your Diesel
-//! migration set) before starting the scheduler.
+//! Install the schema in `migrations/0001_create_scheduler_tables/up.sql`
+//! before starting the scheduler.
 //!
 //! ## Quick start
 //!
@@ -44,6 +45,7 @@ mod ids;
 mod metrics;
 mod models;
 mod pool;
+pub mod queue;
 mod schema;
 pub mod store;
 
@@ -55,13 +57,21 @@ pub mod admin;
 
 pub use crate::cron::CronExpression;
 pub use crate::error::{CorruptJobRow, DuplicateJobName, JobError, RegisterError, SchedulerError};
-pub use crate::ids::{IdentifierError, JobId, JobName, LeaseToken, RunId, WorkerId};
+pub use crate::ids::{
+    DeduplicationKey, IdentifierError, JobId, JobName, LeaseToken, RunId, ScheduleId, TaskId,
+    WorkerId,
+};
 pub use crate::jobs::{Applied, CreateJob, ScheduleUpdate};
 pub use crate::models::RunOutcome;
 pub use crate::models::{
-    ClaimedRun, FinalizeOutcome, Job, JobLifecycle, Lease, LeaseDuration, LeaseDurationError,
-    MaxAttempts, MaxAttemptsError, Outcome, RunState,
+    AttemptState, ClaimedRun, FailureOutcome, FinalizeOutcome, Job, JobLifecycle, Lease,
+    LeaseDuration, LeaseDurationError, MaxAttempts, MaxAttemptsError, Outcome, RenewalOutcome,
+    RetryBackoff, RunState, TaskAttempt,
 };
 pub use crate::pool::{PoolError, SchedulerPool};
+pub use crate::queue::{
+    Availability, CancelOutcome, Deduplication, EnqueueOptions, EnqueuedTask, Priority, Task,
+    cancel, enqueue, prune_terminal,
+};
 pub use crate::runtime::JobContext;
-pub use crate::runtime::{Scheduler, SchedulerBuilder};
+pub use crate::runtime::{HealthStatus, Scheduler, SchedulerBuilder, WorkerHealth};

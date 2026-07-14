@@ -16,7 +16,9 @@ use scoped_futures::ScopedFutureExt;
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
 use crate::ids::{JobId, JobName};
-use crate::models::{Job, JobLifecycle, LeaseDuration, MaxAttempts, NewJob, SchedulerJob};
+use crate::models::{
+    Job, JobLifecycle, LeaseDuration, MaxAttempts, NewJob, RetryBackoff, SchedulerJob,
+};
 use crate::schema::scheduler_jobs::dsl as j;
 
 #[derive(Debug, Clone)]
@@ -27,6 +29,7 @@ pub struct CreateJob {
     lease_duration: LeaseDuration,
     max_attempts: MaxAttempts,
     lifecycle: JobLifecycle,
+    retry_backoff: RetryBackoff,
 }
 
 impl CreateJob {
@@ -49,8 +52,14 @@ impl CreateJob {
             lease_duration,
             max_attempts,
             lifecycle,
+            retry_backoff: RetryBackoff::default(),
             args: serde_json::to_value(args)?, // SchedulerError::Serde on failure
         })
+    }
+
+    pub fn with_retry_backoff(mut self, retry_backoff: RetryBackoff) -> Self {
+        self.retry_backoff = retry_backoff;
+        self
     }
 }
 
@@ -101,6 +110,7 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
         lease_duration: spec.lease_duration.to_pg_interval(),
         max_attempts: spec.max_attempts.to_i32(),
         is_paused: spec.lifecycle.is_paused(),
+        retry_backoff: spec.retry_backoff.to_pg_interval(),
     })
 }
 
@@ -151,6 +161,7 @@ pub async fn ensure_job(
                         j::job_args.eq(&row.job_args),
                         j::lease_duration.eq(&row.lease_duration),
                         j::max_attempts.eq(row.max_attempts),
+                        j::retry_backoff.eq(&row.retry_backoff),
                         j::updated_at.eq(db_now),
                     ))
                     .returning(SchedulerJob::as_returning())
@@ -253,7 +264,7 @@ async fn set_paused(
     paused: bool,
 ) -> Result<Applied, SchedulerError> {
     let affected = diesel::update(j::scheduler_jobs.find(id))
-        .set((j::is_paused.eq(paused), j::updated_at.eq(Utc::now())))
+        .set((j::is_paused.eq(paused), j::updated_at.eq(diesel::dsl::now)))
         .execute(conn)
         .await?;
     Ok(applied_from_affected(affected))

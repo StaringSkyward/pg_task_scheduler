@@ -3,10 +3,9 @@
 //!
 //! Each [`TestDb`] gets its own randomly-named Postgres schema on a shared
 //! database. Every connection handed out by the pool sets `search_path` to that
-//! schema via diesel-async's `ManagerConfig::custom_setup`, so all queries —
-//! including the unqualified table references inside the migration's trigger
-//! functions — resolve into the per-test schema. This isolates concurrent tests
-//! on one database.
+//! schema via diesel-async's `ManagerConfig::custom_setup`, so all queries
+//! resolve into the per-test schema. This isolates concurrent tests on one
+//! database.
 //!
 //! This is test code: `unwrap`/`expect` are intentional (fail loudly). The one
 //! place we must be careful is the `custom_setup` error mapping, which maps a
@@ -86,14 +85,10 @@ impl TestDb {
             AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
         let pool = Pool::builder(manager).build().expect("pool");
 
-        // Apply the full migration into the schema. `batch_execute` sends the
-        // whole script as a single simple-query, so the dollar-quoted plpgsql
-        // function bodies (`$$ ... $$`) are preserved intact — do NOT split on
-        // `;`. `search_path` is already pinned by `custom_setup`, so unqualified
-        // names in the migration resolve into this test's schema.
+        // Install the complete schema into this test's isolated namespace.
         let up = include_str!("../../migrations/0001_create_scheduler_tables/up.sql");
         let mut conn = pool.get().await.expect("conn");
-        conn.batch_execute(up).await.expect("migrate");
+        conn.batch_execute(up).await.expect("install schema");
 
         TestDb { pool, schema }
     }
@@ -174,8 +169,8 @@ impl TestDb {
     pub async fn force_lease_expired(&self, job_id: Uuid) {
         let mut conn = self.pool.get().await.unwrap();
         diesel::sql_query(
-            "UPDATE scheduler_run_leases SET lease_expires_at = now() - interval '1 second' \
-             WHERE run_id IN (SELECT id FROM scheduler_runs WHERE job_id = $1)",
+            "UPDATE scheduler_runs SET lease_expires_at = started_at + interval '1 microsecond' \
+             WHERE job_id = $1 AND state = 'running'::scheduler_run_state",
         )
         .bind::<diesel::sql_types::Uuid, _>(job_id)
         .execute(&mut conn)

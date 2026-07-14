@@ -1,0 +1,71 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DATABASE_URL: postgres://postgres:password@localhost:5432/pg_scheduler_test
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Start PostgreSQL with SSL
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=password \
+            -e POSTGRES_DB=pg_scheduler_test \
+            -p 5432:5432 \
+            postgres:13
+          until docker exec postgres pg_isready -U postgres; do sleep 1; done
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.14.0"
+        if: github.event_name != 'release' && github.event_name != 'workflow_dispatch'
+
+      - name: Set Rust caching env vars
+        if: github.event_name != 'release' && github.event_name != 'workflow_dispatch'
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+      - name: Check formatting
+        run: cargo +nightly fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test --all-features
+

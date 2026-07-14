@@ -4,7 +4,9 @@ use std::time::Duration;
 use crate::error::{JobError, RegisterError, SchedulerError};
 use crate::ids::{IdentifierError, JobName, WorkerId};
 use crate::pool::SchedulerPool;
+use crate::queue::Task;
 use crate::runtime::context::JobContext;
+use crate::runtime::health::WorkerHealth;
 use crate::runtime::registry::Registry;
 
 /// Compile-time constant so there is no runtime partiality (no `unwrap`/`expect`
@@ -91,12 +93,32 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         Ok(self)
     }
 
+    pub fn register_task<T, F, Fut>(self, handler: F) -> Result<Self, RegisterError>
+    where
+        T: Task,
+        F: Fn(JobContext, T::Args) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
+    {
+        self.register::<T::Args, _, _>(T::NAME, handler)
+    }
+
     pub fn build(self) -> Result<Scheduler<P>, SchedulerError> {
         if self.registry.is_empty() {
             return Err(SchedulerError::Config(
                 "at least one handler must be registered".into(),
             ));
         }
+        if self.poll_interval.is_zero() {
+            return Err(SchedulerError::Config(
+                "poll_interval must be greater than zero".into(),
+            ));
+        }
+        if self.reaper_interval.is_zero() {
+            return Err(SchedulerError::Config(
+                "reaper_interval must be greater than zero".into(),
+            ));
+        }
+        let (health_tx, _) = tokio::sync::watch::channel(WorkerHealth::default());
         Ok(Scheduler {
             pool: self.pool,
             registry: self.registry,
@@ -107,6 +129,7 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
                 shutdown_timeout: self.shutdown_timeout,
                 max_concurrency: self.max_concurrency,
             },
+            health_tx,
         })
     }
 }
@@ -115,6 +138,7 @@ pub struct Scheduler<P: SchedulerPool> {
     pub(crate) pool: P,
     pub(crate) registry: Registry,
     pub(crate) config: Config,
+    pub(crate) health_tx: tokio::sync::watch::Sender<WorkerHealth>,
 }
 
 impl<P: SchedulerPool> Scheduler<P> {
@@ -122,6 +146,10 @@ impl<P: SchedulerPool> Scheduler<P> {
     /// exist without one (no `Option`, no runtime "missing worker_id" error).
     pub fn builder(pool: P, worker_id: WorkerId) -> SchedulerBuilder<P> {
         SchedulerBuilder::new(pool, worker_id)
+    }
+
+    pub fn health(&self) -> tokio::sync::watch::Receiver<WorkerHealth> {
+        self.health_tx.subscribe()
     }
 }
 

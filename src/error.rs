@@ -66,29 +66,56 @@ pub enum RegisterError {
 /// coherent — if `JobError` were itself an `Error`, that blanket would collide
 /// with the std reflexive `From<JobError> for JobError`. Its `Display` is what
 /// gets stored in `scheduler_run_outcomes.last_error`.
-pub struct JobError(Box<dyn std::error::Error + Send + Sync>);
+pub struct JobError {
+    source: Box<dyn std::error::Error + Send + Sync>,
+    retryable: bool,
+}
 
 impl JobError {
     pub fn msg(message: impl Into<String>) -> Self {
-        JobError(message.into().into())
+        Self::permanent(message)
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            source: message.into().into(),
+            retryable: false,
+        }
+    }
+
+    pub fn retry(message: impl Into<String>) -> Self {
+        Self {
+            source: message.into().into(),
+            retryable: true,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
     }
 }
 
 impl std::fmt::Debug for JobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
+        f.debug_struct("JobError")
+            .field("source", &self.source)
+            .field("retryable", &self.retryable)
+            .finish()
     }
 }
 
 impl std::fmt::Display for JobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
+        std::fmt::Display::fmt(&self.source, f)
     }
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> From<E> for JobError {
     fn from(e: E) -> Self {
-        JobError(Box::new(e))
+        JobError {
+            source: Box::new(e),
+            retryable: false,
+        }
     }
 }
 

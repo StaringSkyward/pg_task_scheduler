@@ -56,6 +56,13 @@ pub struct JobId(pub Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
 pub struct RunId(pub Uuid);
 
+/// Queue-oriented name for [`RunId`]. Scheduled occurrences and immediate work
+/// use the same durable identifier and execution path.
+pub type TaskId = RunId;
+
+/// Queue-oriented name for [`JobId`].
+pub type ScheduleId = JobId;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
 #[serde(try_from = "String")]
 pub struct JobName(String);
@@ -129,6 +136,36 @@ impl std::str::FromStr for WorkerId {
     type Err = IdentifierError;
     fn from_str(s: &str) -> Result<Self, IdentifierError> {
         WorkerId::try_from(s)
+    }
+}
+
+/// Optional producer-supplied idempotency key. Uniqueness is scoped to the task
+/// name in PostgreSQL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
+#[serde(try_from = "String")]
+pub struct DeduplicationKey(String);
+
+impl DeduplicationKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for DeduplicationKey {
+    type Error = IdentifierError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        validate_identifier(value)?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl TryFrom<String> for DeduplicationKey {
+    type Error = IdentifierError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_identifier(&value)?;
+        Ok(Self(value))
     }
 }
 

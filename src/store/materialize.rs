@@ -16,16 +16,30 @@ struct DueJob {
     cron_expression: String,
     #[diesel(sql_type = sql_types::Timestamptz)]
     db_now: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = sql_types::Jsonb)]
+    job_args: serde_json::Value,
+    #[diesel(sql_type = sql_types::Integer)]
+    max_attempts: i32,
+    #[diesel(sql_type = sql_types::Interval)]
+    lease_duration: diesel::pg::data_types::PgInterval,
+    #[diesel(sql_type = sql_types::Interval)]
+    retry_backoff: diesel::pg::data_types::PgInterval,
 }
 
 const SELECT_DUE: &str = "\
-    SELECT id, next_run_at, cron_expression, now() AS db_now \
+    SELECT id, next_run_at, cron_expression, now() AS db_now, name, job_args, \
+           max_attempts, lease_duration, retry_backoff \
     FROM scheduler_jobs \
     WHERE next_run_at <= now() AND is_paused = false \
     ORDER BY next_run_at ASC FOR UPDATE SKIP LOCKED LIMIT 1";
 const INSERT_RUN: &str = "\
-    INSERT INTO scheduler_runs (job_id, scheduled_for) VALUES ($1, $2) \
-    ON CONFLICT (job_id, scheduled_for) DO NOTHING";
+    INSERT INTO scheduler_runs (\
+        job_id, job_name, job_args, scheduled_for, available_at, max_attempts,\
+        lease_duration, retry_backoff\
+    ) VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
+    ON CONFLICT (job_id, scheduled_for) WHERE job_id IS NOT NULL DO NOTHING";
 const ADVANCE: &str =
     "UPDATE scheduler_jobs SET next_run_at = $1, updated_at = now() WHERE id = $2";
 const PAUSE: &str = "UPDATE scheduler_jobs SET is_paused = true, updated_at = now() WHERE id = $1";
@@ -49,7 +63,7 @@ enum Tick {
 /// advanced.
 pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize, SchedulerError> {
     let mut count = 0;
-    loop {
+    while count < 100 {
         match materialize_one(conn).await? {
             Tick::Idle => break,
             Tick::Processed => count += 1,
@@ -77,7 +91,12 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Tick, Scheduler
                     // run_once misfire: the occurrence is for the OLD next_run_at.
                     diesel::sql_query(INSERT_RUN)
                         .bind::<sql_types::Uuid, _>(job.id)
+                        .bind::<sql_types::Text, _>(job.name)
+                        .bind::<sql_types::Jsonb, _>(job.job_args)
                         .bind::<sql_types::Timestamptz, _>(job.next_run_at)
+                        .bind::<sql_types::Integer, _>(job.max_attempts)
+                        .bind::<sql_types::Interval, _>(job.lease_duration)
+                        .bind::<sql_types::Interval, _>(job.retry_backoff)
                         .execute(c)
                         .await?;
                     diesel::sql_query(ADVANCE)

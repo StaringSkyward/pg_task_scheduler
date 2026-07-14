@@ -1,7 +1,12 @@
 mod common;
 use chrono::{Duration, Utc};
 use common::TestDb;
+use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::store;
+use pg_task_scheduler::{
+    CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts, WorkerId,
+};
+use std::time::Duration as StdDuration;
 
 #[tokio::test]
 async fn materializes_missed_slot_and_advances() {
@@ -60,5 +65,48 @@ async fn pauses_job_with_uncorrupted_cron_left_intact() {
     let mut conn = db.pool.get().await.unwrap();
     let _ = store::materialize_due_jobs(&mut conn).await.unwrap();
     assert!(db.is_paused(job).await, "bad cron pauses the job");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let make_spec = |version| {
+        CreateJob::new(
+            JobName::try_from("snapshot").unwrap(),
+            CronExpression::parse("*/5 * * * *").unwrap(),
+            LeaseDuration::try_from(StdDuration::from_secs(60)).unwrap(),
+            MaxAttempts::try_from(3).unwrap(),
+            JobLifecycle::Active,
+            serde_json::json!({ "version": version }),
+        )
+        .unwrap()
+    };
+    let job = jobs::create(&mut conn, make_spec(1)).await.unwrap();
+    jobs::reschedule(
+        &mut conn,
+        job.id,
+        ScheduleUpdate::SetNextRunAt(Utc::now() - Duration::seconds(1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    jobs::ensure_job(&mut conn, make_spec(2)).await.unwrap();
+    assert_eq!(
+        jobs::delete(&mut conn, job.id).await.unwrap(),
+        jobs::Applied::Changed
+    );
+
+    let claimed = store::claim_one(
+        &mut conn,
+        &WorkerId::try_from("worker").unwrap(),
+        &["snapshot".into()],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claimed.job_id, Some(JobId(job.id.0)));
+    assert_eq!(claimed.job_args["version"], 1);
     db.cleanup().await;
 }

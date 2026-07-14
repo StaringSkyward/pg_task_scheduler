@@ -1,7 +1,11 @@
 pub mod sql_types {
     #[derive(diesel::query_builder::QueryId, diesel::sql_types::SqlType)]
-    #[diesel(postgres_type(name = "run_outcome"))]
-    pub struct RunOutcome;
+    #[diesel(postgres_type(name = "scheduler_run_state"))]
+    pub struct SchedulerRunState;
+
+    #[derive(diesel::query_builder::QueryId, diesel::sql_types::SqlType)]
+    #[diesel(postgres_type(name = "scheduler_attempt_outcome"))]
+    pub struct SchedulerAttemptOutcome;
 }
 
 diesel::table! {
@@ -16,47 +20,55 @@ diesel::table! {
         is_paused -> diesel::sql_types::Bool,
         created_at -> diesel::sql_types::Timestamptz,
         updated_at -> diesel::sql_types::Timestamptz,
+        retry_backoff -> diesel::sql_types::Interval,
     }
 }
 
 diesel::table! {
     scheduler_runs (id) {
         id -> diesel::sql_types::Uuid,
-        job_id -> diesel::sql_types::Uuid,
+        job_id -> diesel::sql_types::Nullable<diesel::sql_types::Uuid>,
         scheduled_for -> diesel::sql_types::Timestamptz,
         attempt_count -> diesel::sql_types::Integer,
         created_at -> diesel::sql_types::Timestamptz,
         updated_at -> diesel::sql_types::Timestamptz,
-    }
-}
-
-diesel::table! {
-    scheduler_run_leases (run_id) {
-        run_id -> diesel::sql_types::Uuid,
-        worker_id -> diesel::sql_types::Text,
-        lease_token -> diesel::sql_types::Uuid,
-        lease_expires_at -> diesel::sql_types::Timestamptz,
-        started_at -> diesel::sql_types::Timestamptz,
+        job_name -> diesel::sql_types::Text,
+        job_args -> diesel::sql_types::Jsonb,
+        available_at -> diesel::sql_types::Timestamptz,
+        priority -> diesel::sql_types::SmallInt,
+        state -> crate::schema::sql_types::SchedulerRunState,
+        max_attempts -> diesel::sql_types::Integer,
+        lease_duration -> diesel::sql_types::Interval,
+        retry_backoff -> diesel::sql_types::Interval,
+        worker_id -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        lease_token -> diesel::sql_types::Nullable<diesel::sql_types::Uuid>,
+        lease_expires_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+        started_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+        finished_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+        last_error -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        deduplication_key -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
-    use super::sql_types::RunOutcome;
-    scheduler_run_outcomes (run_id) {
+    use super::sql_types::SchedulerAttemptOutcome;
+    scheduler_run_attempts (run_id, attempt_number) {
         run_id -> Uuid,
-        outcome -> RunOutcome,
-        finished_at -> Timestamptz,
-        last_error -> Nullable<Text>,
+        attempt_number -> Integer,
+        worker_id -> Text,
+        lease_token -> Uuid,
+        started_at -> Timestamptz,
+        lease_expires_at -> Timestamptz,
+        finished_at -> Nullable<Timestamptz>,
+        outcome -> Nullable<SchedulerAttemptOutcome>,
+        error -> Nullable<Text>,
     }
 }
 
-diesel::joinable!(scheduler_runs -> scheduler_jobs (job_id));
-diesel::joinable!(scheduler_run_leases -> scheduler_runs (run_id));
-diesel::joinable!(scheduler_run_outcomes -> scheduler_runs (run_id));
+diesel::joinable!(scheduler_run_attempts -> scheduler_runs (run_id));
 diesel::allow_tables_to_appear_in_same_query!(
     scheduler_jobs,
     scheduler_runs,
-    scheduler_run_leases,
-    scheduler_run_outcomes,
+    scheduler_run_attempts,
 );
