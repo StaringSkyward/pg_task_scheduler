@@ -30,20 +30,25 @@ This is the hot queue table. A row snapshots everything required to execute:
 - maximum attempts, retry backoff, and lease duration;
 - current state, lease, and terminal facts.
 
-State is a PostgreSQL enum. One `CHECK` constraint defines the complete product
-type:
+State is a PostgreSQL enum. The intended current-row product type is:
 
 ```text
 Pending   = no lease, no terminal facts, attempts < max_attempts
-Running   = complete lease, no terminal facts, attempts >= 1
+Running   = complete lease, no terminal facts
 Completed = no lease, finished_at, no error
 Failed    = no lease, finished_at, error
 Cancelled = no lease, finished_at, no error
 ```
 
-Keeping current state on one row is deliberate. PostgreSQL can enforce the full
-invariant with a local constraint, every transition contends on the same row
-lock, and partial indexes can isolate hot pending/running rows from history.
+Two local constraints enforce the state/column nullability combinations and the
+attempt-count bounds. The normal claim path also guarantees that a running task
+has a positive attempt count and exactly one corresponding open attempt row.
+Those cross-table facts cannot be expressed by a row-local `CHECK`; the writable
+claim CTE and transactional transitions maintain them.
+
+Keeping current state on one row is deliberate. PostgreSQL can enforce its
+current-row invariants locally, every transition contends on the same row lock,
+and partial indexes can isolate hot pending/running rows from history.
 
 ### `scheduler_run_attempts`
 
@@ -57,9 +62,12 @@ claim path.
 ### Enqueue
 
 Immediate and delayed enqueue insert a pending `scheduler_runs` row using the
-caller's connection. PostgreSQL notifications are emitted transactionally after
-enqueue; polling remains the correctness mechanism. A partial unique index on
-`(job_name, deduplication_key)` provides optional producer idempotency.
+caller's connection, then request a PostgreSQL notification. If the caller has
+opened a transaction, the task and notification commit together. In autocommit
+mode they are separate statements, so notification failure can be reported after
+the task has already committed. Polling remains the correctness mechanism. A
+partial unique index on `(job_name, deduplication_key)` provides optional
+producer idempotency.
 
 ### Materialize
 
@@ -77,7 +85,9 @@ A single writable CTE:
 3. inserts matching attempt rows;
 4. returns complete typed claims.
 
-Ordering is priority descending, then availability and id ascending.
+Candidate selection orders by priority descending, then availability and id
+ascending. This is a preference rather than a strict global execution order; see
+the [Concurrency Model](Concurrency.md).
 
 ### Complete, Fail, Renew
 
@@ -123,6 +133,8 @@ scheduler_runs_running_expiry_idx
 scheduler_runs_terminal_retention_idx
 scheduler_runs_schedule_occurrence_idx
 scheduler_runs_deduplication_idx
+scheduler_jobs_due_idx
+scheduler_run_attempts_run_idx
 ```
 
 Claiming is one database round trip per capacity batch. Handlers hold no database
@@ -134,7 +146,7 @@ an unlimited backlog.
 
 The PostgreSQL integration suite covers:
 
-- concurrent workers claiming disjoint tasks;
+- two concurrent claimers cannot both own the same task;
 - stale finalization blocked behind token rotation;
 - concurrent expired-lease recovery;
 - transactional enqueue rollback and deduplication;

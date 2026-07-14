@@ -1,82 +1,152 @@
 # pg_task_scheduler
 
-`pg_task_scheduler` is an embeddable Rust crate for cron-like distributed job scheduling backed by PostgreSQL. It is designed to slot into an existing Rust application that already uses PostgreSQL, Diesel, and Tokio, without introducing external infrastructure such as Redis or a workflow engine.
+`pg_task_scheduler` is an embeddable PostgreSQL work queue for Rust applications
+using Diesel, `diesel-async`, and Tokio. Immediate, delayed, and recurring work
+all become durable task rows and execute through the same concurrent worker.
 
-## Execution guarantee
+## Guarantees
 
-The scheduler provides **leased at-least-once execution per scheduled occurrence**. Each occurrence is a durable row in PostgreSQL. A worker claims it using `FOR UPDATE SKIP LOCKED` and a fencing token; if the worker crashes or exceeds its lease, another worker reclaims the row after the lease expires. Because a handler may therefore run more than once for the same occurrence, **handlers must be idempotent** — use `ctx.run_id` or `ctx.scheduled_for` as idempotency keys.
+- Durable at-least-once execution after a task transaction commits.
+- Concurrent batch claim with `FOR UPDATE SKIP LOCKED`.
+- Token-fenced completion, failure, cancellation, and lease renewal.
+- Automatic recovery after worker death or lease expiry.
+- Atomic recurring materialization: create the task and advance the schedule
+  cursor in the same transaction.
+- Immutable execution snapshots: payload, retry policy, and lease policy are
+  copied onto the task when it is created.
 
-## Data model
+Exactly-once external side effects are not possible. Handlers must use the stable
+`ctx.run_id` as an idempotency key.
 
-Run state is decomposed across three relations so that invalid combinations are unrepresentable. `scheduler_runs` is the immutable occurrence (created once; carries no status, lease, or outcome columns). `scheduler_run_leases` exists *if and only if* the run is currently claimed: its presence means "running" and its absence means "pending". `scheduler_run_outcomes` exists *if and only if* the run is terminal (completed or failed). Derived status — `Pending`, `Running`, `Completed`, `Failed` — is a Rust sum type computed from the presence or absence of these rows, never stored as a column. Two database triggers enforce the "lease XOR outcome" invariant at the schema level. See [`SchedulerDesign.md`](docs/SchedulerDesign.md) for the full design.
-
-## Concurrency
-
-See [Concurrency Model](docs/Concurrency.md) for multi-worker behavior, fencing, failure races, scaling limits, and operational guidance.
+See [Concurrency Model](docs/Concurrency.md) for multi-worker behavior, fencing,
+failure races, scaling limits, and operational guidance.
 
 ## Database Schema
 
-### Applying migrations
+The crate ships its complete, forward-only schema in
+`migrations/0001_create_scheduler_tables/up.sql`. It does not embed or install
+the schema automatically. Include that SQL in the host application's database
+setup before starting workers.
 
-The crate ships raw SQL in `migrations/0001_create_scheduler_tables/up.sql`. It does **not** embed or auto-run this. Copy it into your application's Diesel migration set, apply with the Diesel CLI or manually before starting the scheduler.
+No `down.sql` is provided. Applications that need to remove the queue should
+define teardown SQL appropriate to their own data-retention and deployment
+requirements.
 
-### Removal
+See [Scheduler Design](docs/SchedulerDesign.md) for the data model, state
+transitions, Rust boundaries, and performance design.
 
-Note that there is no `down.sql` file as many people opt for forward-only migrations. It is up to you to create your own migration to remove the tables added by this crate in the manner that best suits your circumstances.
+## Immediate Work
 
-## Usage
+Define a task once so enqueueing and handler registration share the same payload
+type and stable name:
 
-```rust
-use std::time::Duration;
-use pg_task_scheduler::{Scheduler, WorkerId, JobContext, JobError};
-use tokio_util::sync::CancellationToken;
+```rust,no_run
+use pg_task_scheduler::{Task, EnqueueOptions, enqueue};
 
-#[derive(serde::Deserialize)]
-struct DigestArgs { user_id: uuid::Uuid }
+struct SendEmail;
 
-async fn send_digest(ctx: JobContext, _args: DigestArgs) -> Result<(), JobError> {
-    // ctx.run_id and ctx.scheduled_for are stable across retries —
-    // use them as idempotency keys so re-execution is safe.
-    let _ = ctx.run_id;
-    Ok(())
+impl Task for SendEmail {
+    const NAME: &'static str = "send-email";
+    type Args = SendEmailArgs;
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `pool` is a diesel_async deadpool (or bb8/mobc) Pool<AsyncPgConnection>.
-    let scheduler = Scheduler::builder(pool, WorkerId::try_from("api-1")?)
-        .poll_interval(Duration::from_secs(1))
-        .register::<DigestArgs, _, _>("send_digest_email", send_digest)?
-        .build()?;
-    scheduler.run_until_shutdown(CancellationToken::new()).await?;
-    Ok(())
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SendEmailArgs {
+    user_id: uuid::Uuid,
 }
+
+# async fn example(conn: &mut diesel_async::AsyncPgConnection) -> Result<(), pg_task_scheduler::SchedulerError> {
+let task = enqueue::<SendEmail>(
+    conn,
+    SendEmailArgs { user_id: uuid::Uuid::new_v4() },
+    EnqueueOptions::immediate(),
+).await?;
+# let _ = task;
+# Ok(())
+# }
 ```
 
-`build()` errors if no handler has been registered. `run_until_shutdown` drains in-flight handlers on cancellation before returning.
+`enqueue` accepts the caller's `&mut AsyncPgConnection`. When called inside an
+existing Diesel transaction, application data and queued work commit or roll back
+together. `EnqueueOptions::at(timestamp)` creates delayed one-off work. Options
+also configure priority, lease duration, attempts, retry backoff, and an optional
+deduplication key.
 
-## Feature flags
+## Worker
 
-| Feature      | Default | Description                                                          |
-|--------------|---------|----------------------------------------------------------------------|
-| `deadpool`   | yes     | `SchedulerPool` impl for `diesel-async`'s deadpool integration       |
-| `bb8`        | no      | `SchedulerPool` impl for `diesel-async`'s bb8 integration            |
-| `mobc`       | no      | `SchedulerPool` impl for `diesel-async`'s mobc integration           |
-| `metrics`    | no      | Emit counters via `gnort` (runs materialized, claimed, completed, failed, reaped) |
-| `axum`       | no      | Admin routes for listing, pausing, resuming, and deleting jobs       |
+```rust,no_run
+use std::time::Duration;
+use pg_task_scheduler::{JobError, Scheduler, WorkerId};
+use tokio_util::sync::CancellationToken;
+# use pg_task_scheduler::Task;
+# struct SendEmail;
+# impl Task for SendEmail { const NAME: &'static str = "send-email"; type Args = serde_json::Value; }
+# async fn example(pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>) -> Result<(), Box<dyn std::error::Error>> {
+let scheduler = Scheduler::builder(pool, WorkerId::try_from("api-1")?)
+    .poll_interval(Duration::from_millis(250))
+    .register_task::<SendEmail, _, _>(|ctx, args| async move {
+        // Stop optional work promptly if lease ownership is lost.
+        if ctx.cancellation.is_cancelled() {
+            return Err(JobError::retry("lease lost"));
+        }
+        let _ = args;
+        Ok(())
+    })?
+    .build()?;
 
-Enable exactly one pool feature. `deadpool` is selected by default.
+let health = scheduler.health();
+let _ = health;
+scheduler.run_until_shutdown(CancellationToken::new()).await?;
+# Ok(())
+# }
+```
 
-## Running the tests
+`JobError::retry` requeues work using the task's snapshotted backoff until
+`max_attempts` is exhausted. `JobError::permanent`, `JobError::msg`, and ordinary
+errors converted with `From` are terminal. Long-running handlers are protected by
+automatic token-guarded lease renewal.
 
-Integration tests require a PostgreSQL 13+ instance. Set `DATABASE_URL` and run:
+## Recurring Schedules
+
+Recurring definitions remain available through `jobs::create`,
+`jobs::ensure_job`, pause/resume, and reschedule. When a definition is due, the
+materializer creates a normal queue task. Later edits or deletion of the schedule
+cannot change or delete that materialized work.
+
+The current misfire policy is `run_once`: after downtime, one occurrence is
+created for the missed cursor and the next cursor moves to the next future time.
+
+## Operations
+
+- `store::run_state` inspects current state.
+- `cancel` atomically cancels pending or running work and fences its worker.
+- `prune_terminal` deletes bounded batches of old terminal history.
+- `Scheduler::health` reports starting, healthy, degraded, or stopped state.
+- The optional Axum router exposes schedule administration plus task state and
+  cancellation routes.
+
+The claim hot path is backed by a partial pending index; expired leases and
+terminal retention have separate partial indexes. Attempt history is stored in
+`scheduler_run_attempts` and cascades only when terminal history is explicitly
+pruned.
+
+## Feature Flags
+
+| Feature | Default | Purpose |
+| --- | --- | --- |
+| `deadpool` | yes | Deadpool implementation of `SchedulerPool` |
+| `bb8` | no | bb8 implementation of `SchedulerPool` |
+| `mobc` | no | mobc implementation of `SchedulerPool` |
+| `metrics` | no | Datadog counters through `gnort` |
+| `axum` | no | Optional administration router |
+
+## Tests
 
 ```sh
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/mydb cargo test
+cp .env.example .env
+docker compose up -d db
+cargo test --all-features
 ```
 
-Each test creates its own randomly-named schema and tears it down after, so they are safe to run against a shared development database.
-
-## Design reference
-
-See [`SchedulerDesign.md`](docs/SchedulerDesign.md) for the full architecture, data model, execution semantics, and Rust stack.
+Every integration test installs the complete schema into an isolated PostgreSQL
+namespace.
