@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use diesel::sql_types;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use scoped_futures::ScopedFutureExt;
 
 use crate::error::SchedulerError;
 use crate::ids::{LeaseToken, RunId};
@@ -127,36 +126,33 @@ pub async fn finalize_run(
         ),
     };
 
-    conn.transaction::<FinalizeOutcome, SchedulerError, _>(|c| {
-        async move {
-            let applied = diesel::sql_query(FINALIZE)
-                .bind::<sql_types::Uuid, _>(run_id)
-                .bind::<sql_types::Uuid, _>(lease_token)
-                .bind::<crate::schema::sql_types::SchedulerRunState, _>(state)
-                .bind::<sql_types::Nullable<sql_types::Text>, _>(&error)
-                .get_results::<IdRow>(c)
-                .await?;
-            if applied.is_empty() {
-                return Ok(if terminal(c, run_id).await? {
-                    FinalizeOutcome::AlreadyTerminal
-                } else {
-                    FinalizeOutcome::Fenced
-                });
-            }
-            let attempts = diesel::sql_query(RECORD_ATTEMPT)
-                .bind::<sql_types::Uuid, _>(lease_token)
-                .bind::<crate::schema::sql_types::SchedulerAttemptOutcome, _>(attempt_outcome)
-                .bind::<sql_types::Nullable<sql_types::Text>, _>(error)
-                .execute(c)
-                .await?;
-            if attempts != 1 {
-                return Err(SchedulerError::Invariant(
-                    "finalized task did not have one live attempt",
-                ));
-            }
-            Ok(FinalizeOutcome::Applied)
+    conn.transaction::<FinalizeOutcome, SchedulerError, _>(async |c| {
+        let applied = diesel::sql_query(FINALIZE)
+            .bind::<sql_types::Uuid, _>(run_id)
+            .bind::<sql_types::Uuid, _>(lease_token)
+            .bind::<crate::schema::sql_types::SchedulerRunState, _>(state)
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(&error)
+            .get_results::<IdRow>(c)
+            .await?;
+        if applied.is_empty() {
+            return Ok(if terminal(c, run_id).await? {
+                FinalizeOutcome::AlreadyTerminal
+            } else {
+                FinalizeOutcome::Fenced
+            });
         }
-        .scope_boxed()
+        let attempts = diesel::sql_query(RECORD_ATTEMPT)
+            .bind::<sql_types::Uuid, _>(lease_token)
+            .bind::<crate::schema::sql_types::SchedulerAttemptOutcome, _>(attempt_outcome)
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(error)
+            .execute(c)
+            .await?;
+        if attempts != 1 {
+            return Err(SchedulerError::Invariant(
+                "finalized task did not have one live attempt",
+            ));
+        }
+        Ok(FinalizeOutcome::Applied)
     })
     .await
 }
@@ -168,44 +164,41 @@ pub async fn fail_run(
     error: String,
     retryable: bool,
 ) -> Result<FailureOutcome, SchedulerError> {
-    conn.transaction::<FailureOutcome, SchedulerError, _>(|c| {
-        async move {
-            let rows = diesel::sql_query(FAIL)
-                .bind::<sql_types::Uuid, _>(run_id)
-                .bind::<sql_types::Uuid, _>(lease_token)
-                .bind::<sql_types::Bool, _>(retryable)
-                .bind::<sql_types::Text, _>(&error)
-                .get_results::<FailureRow>(c)
-                .await?;
-            let Some(row) = rows.into_iter().next() else {
-                return Ok(if terminal(c, run_id).await? {
-                    FailureOutcome::AlreadyTerminal
-                } else {
-                    FailureOutcome::Fenced
-                });
-            };
-            let attempts = diesel::sql_query(RECORD_ATTEMPT)
-                .bind::<sql_types::Uuid, _>(lease_token)
-                .bind::<crate::schema::sql_types::SchedulerAttemptOutcome, _>(
-                    StoredAttemptOutcome::Failed,
-                )
-                .bind::<sql_types::Nullable<sql_types::Text>, _>(Some(error))
-                .execute(c)
-                .await?;
-            if attempts != 1 {
-                return Err(SchedulerError::Invariant(
-                    "failed task did not have one live attempt",
-                ));
-            }
-            Ok(match row.state {
-                StoredRunState::Pending => FailureOutcome::Retried {
-                    available_at: row.available_at,
-                },
-                StoredRunState::Failed => FailureOutcome::Failed,
-                _ => return Err(SchedulerError::Invariant("failure produced invalid state")),
-            })
+    conn.transaction::<FailureOutcome, SchedulerError, _>(async |c| {
+        let rows = diesel::sql_query(FAIL)
+            .bind::<sql_types::Uuid, _>(run_id)
+            .bind::<sql_types::Uuid, _>(lease_token)
+            .bind::<sql_types::Bool, _>(retryable)
+            .bind::<sql_types::Text, _>(&error)
+            .get_results::<FailureRow>(c)
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(if terminal(c, run_id).await? {
+                FailureOutcome::AlreadyTerminal
+            } else {
+                FailureOutcome::Fenced
+            });
+        };
+        let attempts = diesel::sql_query(RECORD_ATTEMPT)
+            .bind::<sql_types::Uuid, _>(lease_token)
+            .bind::<crate::schema::sql_types::SchedulerAttemptOutcome, _>(
+                StoredAttemptOutcome::Failed,
+            )
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(Some(error))
+            .execute(c)
+            .await?;
+        if attempts != 1 {
+            return Err(SchedulerError::Invariant(
+                "failed task did not have one live attempt",
+            ));
         }
-        .scope_boxed()
+        Ok(match row.state {
+            StoredRunState::Pending => FailureOutcome::Retried {
+                available_at: row.available_at,
+            },
+            StoredRunState::Failed => FailureOutcome::Failed,
+            _ => return Err(SchedulerError::Invariant("failure produced invalid state")),
+        })
     })
     .await
 }
@@ -215,31 +208,28 @@ pub async fn renew_lease(
     run_id: RunId,
     lease_token: LeaseToken,
 ) -> Result<RenewalOutcome, SchedulerError> {
-    conn.transaction::<RenewalOutcome, SchedulerError, _>(|c| {
-        async move {
-            let rows = diesel::sql_query(RENEW)
-                .bind::<sql_types::Uuid, _>(run_id)
-                .bind::<sql_types::Uuid, _>(lease_token)
-                .get_results::<RenewalRow>(c)
-                .await?;
-            let Some(row) = rows.into_iter().next() else {
-                return Ok(RenewalOutcome::Fenced);
-            };
-            let attempts = diesel::sql_query(RENEW_ATTEMPT)
-                .bind::<sql_types::Uuid, _>(lease_token)
-                .bind::<sql_types::Timestamptz, _>(row.lease_expires_at)
-                .execute(c)
-                .await?;
-            if attempts != 1 {
-                return Err(SchedulerError::Invariant(
-                    "renewed task did not have one live attempt",
-                ));
-            }
-            Ok(RenewalOutcome::Renewed {
-                lease_expires_at: row.lease_expires_at,
-            })
+    conn.transaction::<RenewalOutcome, SchedulerError, _>(async |c| {
+        let rows = diesel::sql_query(RENEW)
+            .bind::<sql_types::Uuid, _>(run_id)
+            .bind::<sql_types::Uuid, _>(lease_token)
+            .get_results::<RenewalRow>(c)
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(RenewalOutcome::Fenced);
+        };
+        let attempts = diesel::sql_query(RENEW_ATTEMPT)
+            .bind::<sql_types::Uuid, _>(lease_token)
+            .bind::<sql_types::Timestamptz, _>(row.lease_expires_at)
+            .execute(c)
+            .await?;
+        if attempts != 1 {
+            return Err(SchedulerError::Invariant(
+                "renewed task did not have one live attempt",
+            ));
         }
-        .scope_boxed()
+        Ok(RenewalOutcome::Renewed {
+            lease_expires_at: row.lease_expires_at,
+        })
     })
     .await
 }

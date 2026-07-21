@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use diesel::sql_types;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use scoped_futures::ScopedFutureExt;
 
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
@@ -73,49 +72,46 @@ pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize,
 }
 
 async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Tick, SchedulerError> {
-    conn.transaction::<Tick, SchedulerError, _>(|c| {
-        async move {
-            let Some(job) = diesel::sql_query(SELECT_DUE)
-                .get_results::<DueJob>(c)
-                .await?
-                .into_iter()
-                .next()
-            else {
-                return Ok(Tick::Idle);
-            };
+    conn.transaction::<Tick, SchedulerError, _>(async |c| {
+        let Some(job) = diesel::sql_query(SELECT_DUE)
+            .get_results::<DueJob>(c)
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(Tick::Idle);
+        };
 
-            match CronExpression::parse(&job.cron_expression) {
-                Ok(cron) => {
-                    // Base the next run on the DB clock, never the Rust clock.
-                    let next = cron.next_after(job.db_now)?;
-                    // run_once misfire: the occurrence is for the OLD next_run_at.
-                    diesel::sql_query(INSERT_RUN)
-                        .bind::<sql_types::Uuid, _>(job.id)
-                        .bind::<sql_types::Text, _>(job.name)
-                        .bind::<sql_types::Jsonb, _>(job.job_args)
-                        .bind::<sql_types::Timestamptz, _>(job.next_run_at)
-                        .bind::<sql_types::Integer, _>(job.max_attempts)
-                        .bind::<sql_types::Interval, _>(job.lease_duration)
-                        .bind::<sql_types::Interval, _>(job.retry_backoff)
-                        .execute(c)
-                        .await?;
-                    diesel::sql_query(ADVANCE)
-                        .bind::<sql_types::Timestamptz, _>(next)
-                        .bind::<sql_types::Uuid, _>(job.id)
-                        .execute(c)
-                        .await?;
-                }
-                Err(e) => {
-                    tracing::error!(job_id = %job.id, error = %e, "corrupt cron; pausing job");
-                    diesel::sql_query(PAUSE)
-                        .bind::<sql_types::Uuid, _>(job.id)
-                        .execute(c)
-                        .await?;
-                }
+        match CronExpression::parse(&job.cron_expression) {
+            Ok(cron) => {
+                // Base the next run on the DB clock, never the Rust clock.
+                let next = cron.next_after(job.db_now)?;
+                // run_once misfire: the occurrence is for the OLD next_run_at.
+                diesel::sql_query(INSERT_RUN)
+                    .bind::<sql_types::Uuid, _>(job.id)
+                    .bind::<sql_types::Text, _>(job.name)
+                    .bind::<sql_types::Jsonb, _>(job.job_args)
+                    .bind::<sql_types::Timestamptz, _>(job.next_run_at)
+                    .bind::<sql_types::Integer, _>(job.max_attempts)
+                    .bind::<sql_types::Interval, _>(job.lease_duration)
+                    .bind::<sql_types::Interval, _>(job.retry_backoff)
+                    .execute(c)
+                    .await?;
+                diesel::sql_query(ADVANCE)
+                    .bind::<sql_types::Timestamptz, _>(next)
+                    .bind::<sql_types::Uuid, _>(job.id)
+                    .execute(c)
+                    .await?;
             }
-            Ok(Tick::Processed)
+            Err(e) => {
+                tracing::error!(job_id = %job.id, error = %e, "corrupt cron; pausing job");
+                diesel::sql_query(PAUSE)
+                    .bind::<sql_types::Uuid, _>(job.id)
+                    .execute(c)
+                    .await?;
+            }
         }
-        .scope_boxed()
+        Ok(Tick::Processed)
     })
     .await
 }
