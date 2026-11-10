@@ -86,7 +86,7 @@ impl TestDb {
         let pool = Pool::builder(manager).build().expect("pool");
 
         // Install the complete schema into this test's isolated namespace.
-        let up = include_str!("../../migrations/0001_create_scheduler_tables/up.sql");
+        let up = include_str!("../../migrations/0001_create_queue_tables/up.sql");
         let mut conn = pool.get().await.expect("conn");
         conn.batch_execute(up).await.expect("install schema");
 
@@ -99,6 +99,16 @@ impl TestDb {
                 .execute(&mut admin)
                 .await;
         }
+    }
+
+    /// Run a `SELECT ... AS n` count query and return `n`.
+    pub async fn scalar(&self, sql: &str) -> i64 {
+        let mut conn = self.pool.get().await.unwrap();
+        diesel::sql_query(sql)
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .unwrap()
+            .n
     }
 
     /// Insert a job; returns its id. Cron validated by the DB only — pass valid cron.

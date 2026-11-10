@@ -1,3 +1,4 @@
+#![cfg(feature = "cron")]
 mod common;
 
 use common::TestDb;

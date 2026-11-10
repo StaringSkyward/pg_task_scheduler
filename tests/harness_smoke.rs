@@ -6,7 +6,7 @@ use diesel_async::RunQueryDsl;
 async fn harness_isolates_schema() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let c = diesel::sql_query("SELECT count(*)::bigint AS n FROM scheduler_runs")
+    let c = diesel::sql_query("SELECT count(*)::bigint AS n FROM queue_tasks")
         .get_result::<Count>(&mut conn)
         .await
         .unwrap()

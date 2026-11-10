@@ -7,7 +7,6 @@ edition = "2024"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 diesel = { version = "2.3", default-features = false, features = ["postgres_backend", "uuid", "chrono", "serde_json", "32-column-tables"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
-diesel-derive-enum = { version = "2", features = ["postgres"] }
 diesel-derive-newtype = "2"
 croner = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -18,7 +17,6 @@ tracing = "0.1"
 thiserror = "2"
 tokio-util = "0.7"
 futures = "0.3"
-gnort = { version = "0.2", optional = true }  # plan specified 0.4; crates.io only has 0.2 — CONCERN: update when 0.4 ships
 axum = { version = "0.7", optional = true }
 
 [features]
@@ -26,7 +24,7 @@ default = ["deadpool"]
 deadpool = ["diesel-async/deadpool"]
 bb8 = ["diesel-async/bb8"]
 mobc = ["diesel-async/mobc"]
-metrics = ["dep:gnort"]
+cron = []
 axum = ["dep:axum"]
 
 [dev-dependencies]
