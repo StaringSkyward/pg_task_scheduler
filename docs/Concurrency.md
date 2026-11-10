@@ -205,7 +205,7 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 | Worker crashes after claim | The lease expires; the reaper requeues the task or marks it `dead`. |
 | Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
 | Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
-| PostgreSQL unavailable | No transition happens; workers report `Degraded` and retry without inventing local state. |
+| PostgreSQL unavailable | No transition happens; workers report `Degraded` once a claim cycle fails (a fully busy worker runs no claim cycle, so it may show its last status until a permit frees) and retry without inventing local state. |
 | Graceful shutdown with handlers still running | Handlers drain until `shutdown_timeout`, then are aborted; their leases are left for the reaper. |
 
 ## Validation Status

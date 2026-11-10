@@ -1,10 +1,5 @@
 # pg_task_scheduler
 
-> **v2 status:** this README describes the queue specified in
-> [docs/postgresql_queue_design.md](docs/postgresql_queue_design.md). The
-> implementation is tracked by
-> [the v2 plan](docs/superpowers/plans/2026-11-10-postgresql-queue-design.md).
-
 `pg_task_scheduler` is an embeddable PostgreSQL task queue for Rust applications
 using Diesel, `diesel-async`, and Tokio. PostgreSQL is the system of record for
 task state, scheduling, retries, ownership, and completion. Immediate tasks,
@@ -200,7 +195,9 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
   (counts by status, due count, oldest due age, depth by name and priority, and
   outbox backlog).
 - **Health:** `Scheduler::health()` reports starting, healthy, degraded, or
-  stopped.
+  stopped. Health becomes degraded when a claim cycle fails; while every permit
+  is busy no claim cycle runs, so a saturated worker may still show its last
+  status.
 - **Timeouts:** set `statement_timeout` and `lock_timeout` on pool connections.
   Queue statements are short.
 - **Connections:** each running scheduler holds one pool connection for
@@ -235,7 +232,10 @@ them:
 | `pg_task_scheduler_cleanup_deleted_total` | counter | `kind` = `task` or `outbox` |
 | `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name` (claim time − `due_at`, database clock) |
 | `pg_task_scheduler_task_duration_seconds` | histogram | `task_name` |
-| `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `reap` or `cleanup` |
+| `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `reap`, `cleanup` or `materialize` (`materialize` is `cron` only) |
+
+Tasks the reaper marks dead are counted only in
+`pg_task_scheduler_leases_expired_total`, not in `pg_task_scheduler_tasks_dead_total`.
 
 Queue-level gauges (counts by status, due count, oldest due age, depth by name
 and priority, outbox backlog) come from `store::queue_stats`. They are not

@@ -1,10 +1,4 @@
-//! # pg_task_scheduler
-//!
-//! A PostgreSQL-backed task queue with idempotent enqueue and leased, fenced,
-//! at-least-once execution (see `docs/postgresql_queue_design.md`). Install the
-//! schema in `migrations/0001_create_queue_tables/up.sql` before use; tasks are
-//! enqueued with [`queue::enqueue`] on the caller's connection, so they commit or
-//! roll back with the caller's own writes. Handlers must be idempotent.
+#![doc = include_str!("../README.md")]
 
 #[cfg(feature = "axum")]
 pub mod admin;
