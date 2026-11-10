@@ -1,15 +1,20 @@
-//! Optional Axum admin routes over job CRUD. Enable with the `axum` feature.
+//! Optional Axum admin routes: task inspection, audited replay and (with `cron`) job CRUD.
+//! Enable with the `axum` feature.
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+#[cfg(feature = "cron")]
+use axum::routing::delete;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use crate::ids::JobId;
-use crate::jobs;
-use crate::jobs::Applied;
+#[cfg(feature = "cron")]
+use crate::JobId;
+#[cfg(feature = "cron")]
+use crate::jobs::{self, Applied};
 use crate::pool::SchedulerPool;
-use crate::{CancelOutcome, RunId, RunState, queue, store};
+use crate::{TaskId, TaskView, queue, store};
 
+#[cfg(feature = "cron")]
 #[derive(serde::Serialize)]
 struct JobView {
     id: JobId,
@@ -18,6 +23,7 @@ struct JobView {
     is_paused: bool,
 }
 
+#[cfg(feature = "cron")]
 impl From<crate::models::Job> for JobView {
     fn from(j: crate::models::Job) -> Self {
         JobView {
@@ -29,15 +35,19 @@ impl From<crate::models::Job> for JobView {
     }
 }
 
+/// Admin routes. The host MUST authenticate these routes itself and supply a trustworthy
+/// `operator` for replay: the body's `operator` is recorded in the audit table as given (§26).
 pub fn router<P: SchedulerPool>(pool: P) -> Router {
-    Router::new()
+    let router = Router::new()
+        .route("/tasks/:id", get(task::<P>))
+        .route("/tasks/:id/replay", post(replay_task::<P>));
+    #[cfg(feature = "cron")]
+    let router = router
         .route("/jobs", get(list_jobs::<P>))
         .route("/jobs/:id/pause", post(pause_job::<P>))
         .route("/jobs/:id/resume", post(resume_job::<P>))
-        .route("/jobs/:id", delete(delete_job::<P>))
-        .route("/tasks/:id", get(task_state::<P>))
-        .route("/tasks/:id/cancel", post(cancel_task::<P>))
-        .with_state(pool)
+        .route("/jobs/:id", delete(delete_job::<P>));
+    router.with_state(pool)
 }
 
 async fn acquire<P: SchedulerPool>(pool: &P) -> Result<P::Conn, (StatusCode, String)> {
@@ -46,6 +56,7 @@ async fn acquire<P: SchedulerPool>(pool: &P) -> Result<P::Conn, (StatusCode, Str
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))
 }
 
+#[cfg(feature = "cron")]
 async fn list_jobs<P: SchedulerPool>(
     State(pool): State<P>,
 ) -> Result<Json<Vec<JobView>>, (StatusCode, String)> {
@@ -56,6 +67,7 @@ async fn list_jobs<P: SchedulerPool>(
     Ok(Json(jobs.into_iter().map(JobView::from).collect()))
 }
 
+#[cfg(feature = "cron")]
 async fn pause_job<P: SchedulerPool>(
     State(pool): State<P>,
     Path(id): Path<uuid::Uuid>,
@@ -70,6 +82,7 @@ async fn pause_job<P: SchedulerPool>(
     }
 }
 
+#[cfg(feature = "cron")]
 async fn resume_job<P: SchedulerPool>(
     State(pool): State<P>,
     Path(id): Path<uuid::Uuid>,
@@ -84,6 +97,7 @@ async fn resume_job<P: SchedulerPool>(
     }
 }
 
+#[cfg(feature = "cron")]
 async fn delete_job<P: SchedulerPool>(
     State(pool): State<P>,
     Path(id): Path<uuid::Uuid>,
@@ -99,73 +113,69 @@ async fn delete_job<P: SchedulerPool>(
 }
 
 #[derive(serde::Serialize)]
-struct TaskStateView {
-    state: &'static str,
-    worker_id: Option<String>,
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    error: Option<String>,
+struct TaskJson {
+    id: i64,
+    task_key: String,
+    task_name: String,
+    status: &'static str,
+    attempts: i32,
+    max_attempts: i32,
+    due_at: chrono::DateTime<chrono::Utc>,
+    locked_by: Option<String>,
+    last_error: Option<String>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl From<RunState> for TaskStateView {
-    fn from(state: RunState) -> Self {
-        match state {
-            RunState::Pending => Self {
-                state: "pending",
-                worker_id: None,
-                finished_at: None,
-                error: None,
-            },
-            RunState::Running(lease) => Self {
-                state: "running",
-                worker_id: Some(lease.worker_id.as_str().to_owned()),
-                finished_at: None,
-                error: None,
-            },
-            RunState::Completed { finished_at } => Self {
-                state: "completed",
-                worker_id: None,
-                finished_at: Some(finished_at),
-                error: None,
-            },
-            RunState::Failed { finished_at, error } => Self {
-                state: "failed",
-                worker_id: None,
-                finished_at: Some(finished_at),
-                error: Some(error),
-            },
-            RunState::Cancelled { finished_at } => Self {
-                state: "cancelled",
-                worker_id: None,
-                finished_at: Some(finished_at),
-                error: None,
-            },
+impl From<TaskView> for TaskJson {
+    fn from(t: TaskView) -> Self {
+        TaskJson {
+            id: t.id.0,
+            task_key: t.task_key.as_str().to_owned(),
+            task_name: t.task_name.as_str().to_owned(),
+            status: t.status.as_str(),
+            attempts: t.attempts,
+            max_attempts: t.max_attempts,
+            due_at: t.due_at,
+            locked_by: t.locked_by.map(|w| w.as_str().to_owned()),
+            last_error: t.last_error,
+            completed_at: t.completed_at,
         }
     }
 }
 
-async fn task_state<P: SchedulerPool>(
+async fn task<P: SchedulerPool>(
     State(pool): State<P>,
-    Path(id): Path<uuid::Uuid>,
-) -> Result<Json<TaskStateView>, (StatusCode, String)> {
-    let mut connection = acquire(&pool).await?;
-    let state = store::run_state(&mut connection, RunId(id))
+    Path(id): Path<i64>,
+) -> Result<Json<TaskJson>, (StatusCode, String)> {
+    let mut c = acquire(&pool).await?;
+    let t = store::task(&mut c, TaskId(id))
         .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("no task with id {id}")))?;
-    Ok(Json(state.into()))
+    Ok(Json(t.into()))
 }
 
-async fn cancel_task<P: SchedulerPool>(
+#[derive(serde::Deserialize)]
+struct ReplayRequest {
+    operator: String,
+    reason: String,
+}
+
+async fn replay_task<P: SchedulerPool>(
     State(pool): State<P>,
-    Path(id): Path<uuid::Uuid>,
+    Path(id): Path<i64>,
+    Json(req): Json<ReplayRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut connection = acquire(&pool).await?;
-    match queue::cancel(&mut connection, RunId(id))
+    let mut c = acquire(&pool).await?;
+    if queue::replay(&mut c, TaskId(id), &req.operator, &req.reason)
         .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        CancelOutcome::Cancelled => Ok(StatusCode::NO_CONTENT),
-        CancelOutcome::AlreadyTerminal => Ok(StatusCode::NO_CONTENT),
-        CancelOutcome::NotFound => Err((StatusCode::NOT_FOUND, format!("no task with id {id}"))),
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            "task is not dead or does not exist".to_owned(),
+        ))
     }
 }

@@ -6,6 +6,8 @@
 //! enqueued with [`queue::enqueue`] on the caller's connection, so they commit or
 //! roll back with the caller's own writes. Handlers must be idempotent.
 
+#[cfg(feature = "axum")]
+pub mod admin;
 #[cfg(feature = "cron")]
 mod cron;
 mod error;
