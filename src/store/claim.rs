@@ -103,7 +103,8 @@ struct WaitRow {
     wait: Option<diesel::pg::data_types::PgInterval>,
 }
 
-// min(GREATEST(..)) not GREATEST(min(..)): GREATEST ignores NULL, which would turn "no rows" into zero.
+// Bare `min(due_at)` lets PostgreSQL use queue_tasks_due_idx (an expression inside min() would scan
+// every queued row). NULL on no rows is preserved; `interval_to_duration` clamps overdue to zero.
 /// Time until the earliest queued task for `task_names` is due (zero if one
 /// already is), or `None` if there is none.
 pub async fn next_due_in(
@@ -111,7 +112,7 @@ pub async fn next_due_in(
     task_names: &[String],
 ) -> Result<Option<Duration>, SchedulerError> {
     let row = diesel::sql_query(
-        "SELECT min(GREATEST(due_at - now(), interval '0')) AS wait FROM queue_tasks \
+        "SELECT min(due_at) - now() AS wait FROM queue_tasks \
          WHERE status = 'queued' AND attempts < max_attempts AND task_name = ANY($1)",
     )
     .bind::<sql_types::Array<sql_types::Text>, _>(task_names)

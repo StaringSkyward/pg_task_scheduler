@@ -36,3 +36,28 @@ async fn claim_uses_claim_index() {
     );
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn next_due_in_uses_due_index() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let plan = diesel::sql_query(
+        "EXPLAIN SELECT min(due_at) - now() AS wait FROM queue_tasks \
+         WHERE status = 'queued' AND attempts < max_attempts AND task_name = ANY('{email}')",
+    )
+    .get_results::<PlanLine>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.line)
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        plan.contains("queue_tasks_due_idx") || plan.contains("queue_tasks_claim_idx"),
+        "unexpected query plan:\n{plan}"
+    );
+    db.cleanup().await;
+}
