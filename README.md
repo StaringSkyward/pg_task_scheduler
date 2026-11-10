@@ -195,9 +195,9 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
   (counts by status, due count, oldest due age, depth by name and priority, and
   outbox backlog).
 - **Health:** `Scheduler::health()` reports starting, healthy, degraded, or
-  stopped. Health becomes degraded when a claim cycle fails; while every permit
-  is busy no claim cycle runs, so a saturated worker may still show its last
-  status.
+  stopped. Claim errors (and, with `cron`, materialize errors) set degraded;
+  heartbeat and maintenance failures do not affect health. A fully busy worker
+  runs no claim cycle, so it keeps its last status.
 - **Timeouts:** set `statement_timeout` and `lock_timeout` on pool connections.
   Queue statements are short.
 - **Connections:** each running scheduler holds one pool connection for
