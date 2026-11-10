@@ -23,4 +23,4 @@ pub use crate::models::{
 };
 pub use crate::pool::{PoolError, SchedulerPool};
 pub use crate::queue::{EnqueueOptions, Enqueued, Priority, Task, enqueue, replay};
-pub use crate::runtime::{HealthStatus, TaskContext, WorkerHealth};
+pub use crate::runtime::{HealthStatus, Scheduler, SchedulerBuilder, TaskContext, WorkerHealth};

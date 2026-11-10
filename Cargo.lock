@@ -945,6 +945,7 @@ dependencies = [
  "diesel-derive-newtype",
  "dotenvy",
  "futures",
+ "metrics",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
