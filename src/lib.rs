@@ -17,7 +17,8 @@ pub mod store;
 pub use crate::error::{DuplicateTaskName, RegisterError, SchedulerError, TaskError};
 pub use crate::ids::{IdentifierError, LockToken, TaskId, TaskKey, TaskName, WorkerId};
 pub use crate::models::{
-    AttemptOutcome, MaxAttempts, MaxAttemptsError, ParseEnumError, TaskLease, TaskStatus,
+    Attempt, AttemptOutcome, ClaimedTask, MaxAttempts, MaxAttemptsError, ParseEnumError, TaskLease,
+    TaskStatus, TaskView,
 };
 pub use crate::pool::{PoolError, SchedulerPool};
 pub use crate::queue::{EnqueueOptions, Enqueued, Priority, Task, enqueue};

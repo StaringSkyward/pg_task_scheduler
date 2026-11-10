@@ -265,3 +265,18 @@ pub async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
         .expect("pg_backend_pid")
         .pid
 }
+
+impl TestDb {
+    /// Force a running task's lease into the past.
+    pub async fn expire_lease(&self, id: pg_task_scheduler::TaskId) {
+        let mut conn = self.pool.get().await.unwrap();
+        diesel::sql_query(
+            "UPDATE queue_tasks SET locked_until = clock_timestamp() - interval '1 second' \
+             WHERE id = $1 AND status = 'running'",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+}

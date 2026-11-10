@@ -3,14 +3,15 @@ use std::time::Duration;
 
 use diesel::pg::data_types::PgInterval;
 
-use crate::ids::{LockToken, TaskId, WorkerId};
+use chrono::{DateTime, Utc};
+
+use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
 #[cfg(feature = "cron")]
 use {
     crate::cron::CronExpression,
     crate::error::SchedulerError,
     crate::ids::{JobId, JobName},
     crate::schema::scheduler_jobs,
-    chrono::{DateTime, Utc},
     diesel::prelude::*,
 };
 
@@ -67,6 +68,52 @@ text_enum!(AttemptOutcome, "attempt outcome", {
     Done => "done", Retry => "retry", Dead => "dead", LeaseExpired => "lease_expired",
 });
 
+/// A task handed to a worker by `store::claim`.
+#[derive(Debug, Clone)]
+pub struct ClaimedTask {
+    pub lease: TaskLease,
+    pub task_key: TaskKey,
+    pub task_name: TaskName,
+    pub payload: serde_json::Value,
+    pub max_attempts: i32,
+    pub due_at: DateTime<Utc>,
+    pub claimed_at: DateTime<Utc>,
+    pub locked_until: DateTime<Utc>,
+}
+
+/// Every `queue_tasks` column as a domain type.
+#[derive(Debug, Clone)]
+pub struct TaskView {
+    pub id: TaskId,
+    pub task_key: TaskKey,
+    pub task_name: TaskName,
+    pub payload: serde_json::Value,
+    pub status: TaskStatus,
+    pub priority: i32,
+    pub due_at: DateTime<Utc>,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub locked_by: Option<WorkerId>,
+    pub lock_token: LockToken,
+    pub locked_until: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// One `queue_task_attempts` row.
+#[derive(Debug, Clone)]
+pub struct Attempt {
+    pub attempt_no: i32,
+    pub lock_token: LockToken,
+    pub worker_id: WorkerId,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub outcome: Option<AttemptOutcome>,
+    pub error: Option<String>,
+}
+
 /// Proof of ownership of one claimed attempt; every worker-owned mutation is
 /// guarded by it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,13 +124,11 @@ pub struct TaskLease {
     pub attempt_no: i32,
 }
 
-#[allow(dead_code)] // used by the store tasks that follow
 /// `Duration` to a pure-microsecond PG interval, saturating at `i64::MAX`.
 pub(crate) fn pg_interval(d: Duration) -> PgInterval {
     PgInterval::from_microseconds(i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
-#[allow(dead_code)] // used by the store tasks that follow
 /// PG interval to `Duration` (days count as 86 400 s); negative becomes zero.
 pub(crate) fn interval_to_duration(iv: PgInterval) -> Duration {
     let micros = u64::try_from(iv.microseconds).unwrap_or(0);

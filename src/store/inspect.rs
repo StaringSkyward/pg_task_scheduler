@@ -1,0 +1,132 @@
+use chrono::{DateTime, Utc};
+use diesel::sql_types;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+
+use crate::error::SchedulerError;
+use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
+use crate::models::{Attempt, TaskView};
+
+#[derive(diesel::QueryableByName)]
+struct TaskRow {
+    #[diesel(sql_type = sql_types::BigInt)]
+    id: TaskId,
+    #[diesel(sql_type = sql_types::Text)]
+    task_key: TaskKey,
+    #[diesel(sql_type = sql_types::Text)]
+    task_name: TaskName,
+    #[diesel(sql_type = sql_types::Jsonb)]
+    payload: serde_json::Value,
+    #[diesel(sql_type = sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = sql_types::Integer)]
+    priority: i32,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    due_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Integer)]
+    attempts: i32,
+    #[diesel(sql_type = sql_types::Integer)]
+    max_attempts: i32,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    locked_by: Option<WorkerId>,
+    #[diesel(sql_type = sql_types::BigInt)]
+    lock_token: LockToken,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    locked_until: Option<DateTime<Utc>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    last_error: Option<String>,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    created_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    updated_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(diesel::QueryableByName)]
+struct AttemptRow {
+    #[diesel(sql_type = sql_types::Integer)]
+    attempt_no: i32,
+    #[diesel(sql_type = sql_types::BigInt)]
+    lock_token: LockToken,
+    #[diesel(sql_type = sql_types::Text)]
+    worker_id: WorkerId,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    started_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    finished_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    outcome: Option<String>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    error: Option<String>,
+}
+
+/// Read one task, or `None` if it does not exist.
+pub async fn task(
+    conn: &mut AsyncPgConnection,
+    id: TaskId,
+) -> Result<Option<TaskView>, SchedulerError> {
+    let row = diesel::sql_query(
+        "SELECT id, task_key, task_name, payload, status, priority, due_at, attempts, \
+         max_attempts, locked_by, lock_token, locked_until, last_error, created_at, \
+         updated_at, completed_at FROM queue_tasks WHERE id = $1",
+    )
+    .bind::<sql_types::BigInt, _>(id)
+    .get_results::<TaskRow>(conn)
+    .await?
+    .pop();
+    row.map(|r| {
+        Ok(TaskView {
+            id: r.id,
+            task_key: r.task_key,
+            task_name: r.task_name,
+            payload: r.payload,
+            status: r
+                .status
+                .parse()
+                .map_err(|_| SchedulerError::Invariant("unknown task status"))?,
+            priority: r.priority,
+            due_at: r.due_at,
+            attempts: r.attempts,
+            max_attempts: r.max_attempts,
+            locked_by: r.locked_by,
+            lock_token: r.lock_token,
+            locked_until: r.locked_until,
+            last_error: r.last_error,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            completed_at: r.completed_at,
+        })
+    })
+    .transpose()
+}
+
+/// Attempt history of a task, oldest claim first.
+pub async fn attempts(
+    conn: &mut AsyncPgConnection,
+    id: TaskId,
+) -> Result<Vec<Attempt>, SchedulerError> {
+    diesel::sql_query(
+        "SELECT attempt_no, lock_token, worker_id, started_at, finished_at, outcome, error \
+         FROM queue_task_attempts WHERE task_id = $1 ORDER BY lock_token",
+    )
+    .bind::<sql_types::BigInt, _>(id)
+    .get_results::<AttemptRow>(conn)
+    .await?
+    .into_iter()
+    .map(|r| {
+        Ok(Attempt {
+            attempt_no: r.attempt_no,
+            lock_token: r.lock_token,
+            worker_id: r.worker_id,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            outcome: r
+                .outcome
+                .map(|o| o.parse())
+                .transpose()
+                .map_err(|_| SchedulerError::Invariant("unknown attempt outcome"))?,
+            error: r.error,
+        })
+    })
+    .collect()
+}
