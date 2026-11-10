@@ -81,6 +81,24 @@ pub struct ClaimedTask {
     pub locked_until: DateTime<Utc>,
 }
 
+/// What `store::retry` did with the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOutcome {
+    /// Requeued; due again at `due_at` (PostgreSQL time).
+    Queued { due_at: DateTime<Utc> },
+    /// Attempts exhausted; the task is now dead.
+    Dead,
+}
+
+/// A command written to `queue_outbox` atomically with task completion.
+#[derive(Debug, Clone)]
+pub struct OutboxCommand {
+    pub effect_name: String,
+    pub command_key: String,
+    pub topic: String,
+    pub payload: serde_json::Value,
+}
+
 /// Every `queue_tasks` column as a domain type.
 #[derive(Debug, Clone)]
 pub struct TaskView {
