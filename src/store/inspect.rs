@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
+use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::error::SchedulerError;
 use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
-use crate::models::{Attempt, TaskView};
+use crate::models::{Attempt, QueueDepth, QueueStats, TaskView, interval_to_duration};
 
 #[derive(diesel::QueryableByName)]
 struct TaskRow {
@@ -129,4 +130,85 @@ pub async fn attempts(
         })
     })
     .collect()
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountsRow {
+    #[diesel(sql_type = sql_types::BigInt)]
+    queued: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    running: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    done: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    dead: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    due: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
+    oldest_due_age: Option<PgInterval>,
+}
+
+#[derive(diesel::QueryableByName)]
+struct DepthRow {
+    #[diesel(sql_type = sql_types::Text)]
+    task_name: TaskName,
+    #[diesel(sql_type = sql_types::Integer)]
+    priority: i32,
+    #[diesel(sql_type = sql_types::BigInt)]
+    queued: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct OutboxStatsRow {
+    #[diesel(sql_type = sql_types::BigInt)]
+    unpublished: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
+    oldest_age: Option<PgInterval>,
+}
+
+/// Queue counts, per-name depth and outbox backlog.
+pub async fn queue_stats(conn: &mut AsyncPgConnection) -> Result<QueueStats, SchedulerError> {
+    // ponytail: full scan of retained rows; keep a counter table if this gets slow
+    let c = diesel::sql_query(
+        "SELECT count(*) FILTER (WHERE status = 'queued') AS queued, \
+                count(*) FILTER (WHERE status = 'running') AS running, \
+                count(*) FILTER (WHERE status = 'done') AS done, \
+                count(*) FILTER (WHERE status = 'dead') AS dead, \
+                count(*) FILTER (WHERE status = 'queued' AND due_at <= now()) AS due, \
+                now() - min(due_at) FILTER (WHERE status = 'queued' AND due_at <= now()) \
+                    AS oldest_due_age \
+         FROM queue_tasks",
+    )
+    .get_result::<CountsRow>(conn)
+    .await?;
+    let depth = diesel::sql_query(
+        "SELECT task_name, priority, count(*) AS queued FROM queue_tasks \
+         WHERE status = 'queued' GROUP BY task_name, priority ORDER BY task_name, priority DESC",
+    )
+    .get_results::<DepthRow>(conn)
+    .await?;
+    let o = diesel::sql_query(
+        "SELECT count(*) AS unpublished, now() - min(created_at) AS oldest_age \
+         FROM queue_outbox WHERE published_at IS NULL",
+    )
+    .get_result::<OutboxStatsRow>(conn)
+    .await?;
+    Ok(QueueStats {
+        queued: c.queued,
+        running: c.running,
+        done: c.done,
+        dead: c.dead,
+        due: c.due,
+        oldest_due_age: c.oldest_due_age.map(interval_to_duration),
+        depth: depth
+            .into_iter()
+            .map(|r| QueueDepth {
+                task_name: r.task_name,
+                priority: r.priority,
+                queued: r.queued,
+            })
+            .collect(),
+        outbox_unpublished: o.unpublished,
+        oldest_unpublished_age: o.oldest_age.map(interval_to_duration),
+    })
 }

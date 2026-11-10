@@ -183,3 +183,39 @@ pub async fn enqueue<T: Task>(
     }
     .into_enqueued(false)
 }
+
+// §18 replay; the audit row carries the new token. No FK, so it outlives retention.
+const REPLAY: &str = r#"
+    WITH replayed AS (
+        UPDATE queue_tasks
+        SET status = 'queued', attempts = 0, due_at = now(), locked_by = NULL,
+            lock_token = lock_token + 1, locked_until = NULL, last_error = NULL,
+            completed_at = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'dead'
+        RETURNING id, task_key, lock_token
+    )
+    INSERT INTO queue_task_replays (task_id, task_key, lock_token, operator, reason)
+    SELECT id, task_key, lock_token, $2, $3 FROM replayed
+"#;
+
+/// Requeue a dead task with a fresh attempt budget and audit it. `false` if the task is missing
+/// or not dead. Keeps the same `task_key`; use a new key for a genuinely new effect (§18).
+pub async fn replay(
+    conn: &mut AsyncPgConnection,
+    id: TaskId,
+    operator: &str,
+    reason: &str,
+) -> Result<bool, SchedulerError> {
+    let n = diesel::sql_query(REPLAY)
+        .bind::<sql_types::BigInt, _>(id)
+        .bind::<sql_types::Text, _>(operator)
+        .bind::<sql_types::Text, _>(reason)
+        .execute(conn)
+        .await?;
+    if n == 1 {
+        diesel::sql_query("SELECT pg_notify('queue_available', '')")
+            .execute(conn)
+            .await?;
+    }
+    Ok(n == 1)
+}

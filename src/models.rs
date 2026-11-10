@@ -1,4 +1,4 @@
-use std::num::NonZeroI32;
+use std::num::{NonZeroI32, NonZeroUsize};
 use std::time::Duration;
 
 use diesel::pg::data_types::PgInterval;
@@ -140,6 +140,68 @@ pub struct TaskLease {
     pub worker_id: WorkerId,
     pub lock_token: LockToken,
     pub attempt_no: i32,
+}
+
+/// What one `store::reap_expired` pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReapSummary {
+    pub requeued: usize,
+    pub dead: usize,
+}
+
+/// Rows deleted by one `store::cleanup` pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupSummary {
+    pub tasks: usize,
+    pub outbox: usize,
+}
+
+const DEFAULT_CLEANUP_BATCH: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+
+/// How long terminal rows are kept; `batch_size` bounds each delete statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    pub done: Duration,
+    pub dead: Duration,
+    pub idempotency_horizon: Duration,
+    pub outbox_published: Duration,
+    pub batch_size: NonZeroUsize,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        const DAY: u64 = 86_400;
+        Self {
+            done: Duration::from_secs(7 * DAY),
+            dead: Duration::from_secs(30 * DAY),
+            idempotency_horizon: Duration::from_secs(7 * DAY),
+            outbox_published: Duration::from_secs(7 * DAY),
+            batch_size: DEFAULT_CLEANUP_BATCH,
+        }
+    }
+}
+
+/// Queued tasks of one name and priority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDepth {
+    pub task_name: TaskName,
+    pub priority: i32,
+    pub queued: i64,
+}
+
+/// Point-in-time queue health from `store::queue_stats`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueStats {
+    pub queued: i64,
+    pub running: i64,
+    pub done: i64,
+    pub dead: i64,
+    /// Queued tasks whose `due_at` has passed.
+    pub due: i64,
+    pub oldest_due_age: Option<Duration>,
+    pub depth: Vec<QueueDepth>,
+    pub outbox_unpublished: i64,
+    pub oldest_unpublished_age: Option<Duration>,
 }
 
 /// `Duration` to a pure-microsecond PG interval, saturating at `i64::MAX`.
