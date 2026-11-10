@@ -196,7 +196,19 @@ async fn stale_token_cannot_complete_after_reclaim() {
     .execute(&mut conn)
     .await
     .unwrap();
-    let new = claim_one(&mut conn).await.unwrap();
+    // Same worker reclaims, so the old lease differs from the new one only by token.
+    let new = store::claim(
+        &mut conn,
+        &old.lease.worker_id,
+        &names(),
+        NonZeroUsize::new(1).unwrap(),
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    assert_eq!(new.lease.worker_id, old.lease.worker_id);
     assert_eq!(new.lease.lock_token, LockToken(2));
     lost(store::complete(&mut conn, &old.lease).await, &old.lease);
     store::complete(&mut conn, &new.lease).await.unwrap();
