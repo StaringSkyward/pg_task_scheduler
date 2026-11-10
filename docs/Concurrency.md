@@ -2,202 +2,226 @@
 
 ## Summary
 
-The queue is designed to run multiple scheduler instances and multiple handlers
-per instance against the same PostgreSQL database. It does not require a leader
-or an external coordinator. PostgreSQL row locks choose task ownership, and a
-per-attempt lease token fences workers that no longer own a task.
+Many scheduler instances, each running many handlers, can share one PostgreSQL
+database with no leader or external coordinator. PostgreSQL row locks decide who
+claims a task. A hard lease plus a monotonic `lock_token` fences any worker that
+no longer owns it.
 
-The execution guarantee is leased at-least-once, not exactly-once. Queue state
-remains consistent under concurrency, but an expired worker and its replacement
-can briefly execute the same task at the same time. Handlers must therefore make
-external side effects idempotent.
+Queue state stays consistent under any interleaving. Execution of external work
+is **at-least-once**. A worker that lost its lease, or crashed after a remote call
+succeeded, may overlap with or precede a retry. Effects that live entirely in
+PostgreSQL can be made exactly-once by committing them in the same transaction as
+completion.
 
-## Claiming Work
+## Ownership
 
-`store::claim_batch` claims tasks with one writable CTE:
-
-1. Select eligible pending rows in priority and availability order.
-2. Lock them with `FOR UPDATE SKIP LOCKED`.
-3. Change them to `running`, increment their attempt counts, and assign fresh
-   lease tokens.
-4. Insert their attempt-history rows.
-5. Return complete claims to the worker.
-
-The statement is atomic. If the task update or attempt insertion fails, none of
-the claims commit. Concurrent workers skip rows already locked by another
-claiming transaction, so a pending task cannot be successfully claimed by two
-workers at once.
-
-Each scheduler claims no more than its currently available Tokio semaphore
-permits. `max_concurrency` is a per-instance limit, with a default of 16. For
-example, ten instances configured with 16 permits can run up to 160 handlers,
-subject to database, connection-pool, and application capacity.
-
-Workers only claim task names for which they have registered handlers. Different
-worker groups can consequently consume different task types from the same queue.
-
-## Fencing and State Transitions
-
-Completion, failure, and lease renewal update the task only when all of these
-facts still hold:
+A task attempt has at most one valid owner. Ownership is all four of:
 
 ```sql
 id = $task_id
-AND state = 'running'
-AND lease_token = $lease_token
-AND lease_expires_at > clock_timestamp()
+AND status = 'running'
+AND locked_by = $worker_id          -- unique UUID per scheduler process
+AND lock_token = $lock_token        -- +1 on every claim and every replay
+AND locked_until > clock_timestamp()  -- hard lease, database time
 ```
 
-Cancellation and recovery also lock and update the same `scheduler_runs` row.
-PostgreSQL serializes competing transitions on that row. If an update waits for
-another transaction, PostgreSQL rechecks its predicate after acquiring the lock.
-A token rotated or cleared by the winning transaction therefore causes the stale
-operation to affect no rows.
+Heartbeat, completion, completion with outbox, retry, permanent failure, and the
+DB-contained `lock_owned` all use this predicate. A guarded statement that
+matches zero rows means ownership is lost (`SchedulerError::LostOwnership`). It
+never means success.
 
-This resolves the main races as follows:
+The lease is **hard**. Once `locked_until` passes, the old worker is stale even if
+no reaper has touched the row yet. It can no longer heartbeat or finalize.
+
+## Claiming Work
+
+`store::claim` is a single statement:
+
+1. Select due, claimable `queued` rows for the worker's registered task names, in
+   `priority DESC, due_at, id` order, `FOR UPDATE SKIP LOCKED`, up to the batch
+   limit.
+2. Move them to `running`: `attempts + 1`, `lock_token + 1`,
+   `locked_by = worker`, `locked_until = clock_timestamp() + lease`.
+3. Insert one `queue_task_attempts` row per claim.
+4. Return the claims.
+
+The statement is atomic, so a claim and its attempt row commit together or not at
+all. Concurrent claimers skip each other's locked rows, so a queued task gets one
+owner. A scheduler claims at most `min(free permits, claim_batch_size)` tasks.
+`max_concurrency` limits each instance separately, so ten instances at 16 can run
+160 handlers.
+
+Workers claim only task names they have handlers for. Worker groups with
+different registrations can share one queue.
+
+## Races
 
 | Race | Result |
 | --- | --- |
-| Two workers claim one pending task | One locks and claims it; the other skips it. |
-| Completion races with cancellation | One transition wins the row lock; the other observes terminal or fenced state. |
-| Renewal races with expired-lease recovery | A valid renewal extends the lease, or recovery closes the attempt and fences the renewal. |
-| Completion races with recovery | Completion succeeds only with the current unexpired token; otherwise recovery wins. |
-| Two recovery processes select one expired task | One locks it; the other skips it. |
-| An old attempt completes after a new claim | Its old token no longer matches, so finalization is fenced. |
-
-`worker_id` is useful for attribution but is not the security boundary. Reusing a
-worker id does not allow stale finalization because lease tokens, rather than
-worker ids, prove ownership. Unique worker ids are still recommended for useful
-logs and attempt history.
+| Two workers claim one task | One locks and claims it; the other skips it. |
+| Two producers enqueue one `task_key` | `ON CONFLICT DO NOTHING` waits for the first insert to commit; the second returns the existing task. |
+| Worker ACKs after its hard lease expired | The predicate fails on `locked_until`; zero rows; the worker cannot complete. |
+| Old generation ACKs after a reclaim | `lock_token` no longer matches; zero rows. |
+| Heartbeat races the reaper | Either the heartbeat extends a still-valid lease, or the reaper requeues the expired row and the heartbeat matches zero rows. |
+| Completion races the reaper | Completion needs an unexpired lease; once expired, only the reaper can move the row. |
+| Reaper races a DB-contained transaction | The handler holds the task row via `lock_owned`; the reaper's `SKIP LOCKED` passes over it. |
+| Two reapers select one expired task | One locks it; the other skips it. |
+| Stale worker emits an outbox command | The outbox insert depends on the guarded completion CTE; no completed row means no outbox row. |
+| Replay while a very late worker is still running | Replay bumps `lock_token`, so the late worker's token is fenced. |
 
 ## Leases and Heartbeats
 
-A running handler does not hold a database connection. The runtime acquires a
-connection briefly to renew its lease every third of the lease duration and
-again to record completion or failure. Successful renewal extends both the task
-lease and its current attempt in one transaction.
+Handlers hold no database connection by default. Each dispatched task runs two
+futures concurrently:
 
-If renewal is fenced, or the locally observed deadline passes after renewal
-errors, the runtime cancels the handler's `CancellationToken` and drops the
-handler future. Cancellation is cooperative:
+- the handler;
+- a lease keeper that briefly takes a connection every `heartbeat_interval`
+  (default 20 s, at most a third of `lease_duration`) to extend `locked_until`.
 
-- async code stops when its future is dropped or it observes the token;
-- synchronous blocking work cannot be preempted while it is running;
-- work spawned independently by a handler is not owned by the scheduler;
-- an external request or side effect already issued cannot be undone.
+The lease keeper gives up, cancels `ctx.cancellation`, and drops the handler
+future when either:
 
-If a worker process crashes, its task remains `running` until the lease expires.
-Any scheduler instance may then recover it. Recovery closes the attempt as
-expired and either returns the task to `pending` or marks it `failed` when its
-attempt budget is exhausted.
+- a heartbeat matches zero rows; or
+- a local monotonic deadline passes: claim send time plus `lease_duration`,
+  advanced on each successful heartbeat. This covers heartbeats that keep failing
+  or hang, for example during a database outage.
 
-## At-Least-Once Overlap
+The local deadline only makes the worker give up early. It never extends
+ownership, and host clocks never decide validity.
 
-Fencing protects queue state, not arbitrary external systems. The following is a
-valid execution:
+Cancellation is cooperative. Async code stops when its future is dropped or when
+it observes the token. Blocking code, independently spawned work, and remote
+requests already in flight cannot be recalled.
 
-1. Worker A starts a task and becomes unable to renew its lease.
-2. The lease expires and another scheduler recovers the task.
-3. Worker B claims and starts a new attempt.
-4. Worker A has not yet observed lease loss and continues briefly.
+A DB-contained handler holds its row lock while a heartbeat may be waiting on it.
+Because the lease keeper is a separate future, the handler keeps being polled and
+commits, and the heartbeat then sees a `done` row. The lease must still outlast
+the database transaction. An expired lease makes the final guarded update match
+zero rows, and the transaction rolls back.
 
-Worker A cannot complete the queue row, but both handlers may have performed
-external work. A handler may also finish an external side effect immediately
-after its lease expires; its finalization will be fenced and the task may run
-again.
+## Crash Recovery
 
-Use the stable `JobContext::run_id` as the idempotency key across attempts. For
-database effects, prefer a unique application-side idempotency record in the
-same transaction as the effect. For remote services, pass the run id as the
-remote idempotency key when supported. A random lease token identifies a single
-attempt and should not replace the stable run id for task-level idempotency.
+A worker that dies leaves its task `running` until `locked_until`. Every scheduler
+runs the reaper every `reaper_interval` in bounded `SKIP LOCKED` batches. It moves
+expired rows back to `queued` with `due_at = now() + crash_retry_delay` (default
+10 s, to avoid a tight crash loop), or to `dead` when `attempts` has reached
+`max_attempts`. The open attempt row closes as `lease_expired`.
 
-## Concurrent Producers
+A panicking handler counts as a crash. The runtime does not finalize it, so the
+reaper recovers it after the lease.
 
-Recurring materialization is also safe to run on every scheduler instance. A
-materializer locks a due schedule with `FOR UPDATE SKIP LOCKED`, inserts an
-immutable task snapshot, and advances the schedule cursor in the same
-transaction. The partial unique index on `(job_id, scheduled_for)` is a second
-line of defense against duplicate occurrences.
+## External Effects
 
-Immediate and delayed producers may enqueue concurrently. When a deduplication
-key is supplied, the partial unique index on `(job_name, deduplication_key)`
-returns the existing task id to competing producers. That key remains occupied
-while the task row exists, including after it becomes terminal, and becomes
-available again only after retention deletes the row.
+Fencing protects PostgreSQL state, not remote systems. This is a valid history:
+
+1. Worker A calls a remote API, and the remote accepts.
+2. Worker A crashes, or loses its lease, before recording completion.
+3. The reaper requeues the task, and worker B makes the same call again.
+
+So:
+
+- pass `ctx.task_key` as the remote idempotency key for every once-per-task
+  effect. It is stable across retries and replay.
+- where the remote supports ordered conditional writes, also pass
+  `ctx.lease.lock_token` as a fencing token.
+- without remote idempotency or fencing, duplicate external effects remain
+  possible.
+
+## PostgreSQL-Contained Effects and the Outbox
+
+When all business effects are writes in the same database, the handler opens a
+transaction, calls `store::lock_owned`, performs the writes, and calls
+`store::complete` before committing. Either both commit or neither does. The
+runtime's own completion attempt afterwards matches zero rows, sees that this
+lease generation already completed the task, and does nothing.
+
+To hand work to another system, `store::complete_with_outbox` inserts the outbox
+row in the same guarded statement as completion. The application's relay
+publishes at-least-once, and receivers deduplicate by `command_key`.
+
+## Producers and the Idempotency Horizon
+
+Producers can enqueue concurrently. `task_key` uniqueness gives one logical task
+per key, and a duplicate returns the existing task. Enqueue inside the producer's
+own transaction to make the domain change and the task atomic. Use
+`READ COMMITTED`: the duplicate path re-reads the committed winner.
+
+A key stays reserved while its row exists. Retention never deletes terminal rows
+younger than `Retention::idempotency_horizon`, and the builder rejects a
+retention configuration that would.
+
+With the `cron` feature, every scheduler also materializes due schedules. It
+locks one schedule row with `SKIP LOCKED`, inserts the occurrence with a
+deterministic `task_key`, and advances the cursor in one transaction.
 
 ## Ordering and Fairness
 
-Eligible tasks are considered by priority descending, then availability and id.
-This is deterministic within a claim query, but it is not strict global
-execution order. `SKIP LOCKED` deliberately allows a worker to take a lower
-ranked row while a higher ranked row is locked or already executing. Handler
-duration and process scheduling can also change completion order.
+The claim order (`priority DESC, due_at, id`) is a preference, not a guarantee.
+`SKIP LOCKED` lets a worker take a lower-ranked row while a higher one is locked.
+Handler durations reorder completion. Future tasks are never claimed before
+`due_at`, measured in database time. Sustained high-priority load can starve low
+priorities. If that matters, add aging, quotas, or separate worker groups based on
+measurement.
 
-Use priority as a preference, not as a serialization mechanism. Tasks requiring
-strict ordering or mutual exclusion need a separate domain-level mechanism.
+## Wakeups and Polling
+
+Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
+
+- enqueue sends `NOTIFY queue_available` on commit when it inserts a task;
+- an idle worker waits for the first of: a notification, the next `due_at`
+  among its task names (database time), or `max_poll_interval` (default 1 s);
+- scheduled tasks and retries become due with no notification, through the
+  next-`due_at` wait;
+- if the listening connection fails, the worker keeps polling and re-listens on
+  the next loop.
 
 ## Capacity and Operations
 
-Multiple workers scale the claim path without a central mutex, but PostgreSQL is
-still the coordination point. Important operational limits include:
+- **Connection pool:** each scheduler permanently holds one connection for
+  `LISTEN`. Claims, heartbeats, finalization, maintenance, and DB-contained
+  handlers take short-lived connections. Size the pool with headroom for
+  heartbeats that land together.
+- **Lease duration:** keep it well above pool wait plus database latency, and
+  above the longest DB-contained transaction. A database outage longer than the
+  lease lets another worker start the task.
+- **Timeouts:** configure `statement_timeout` and `lock_timeout` on pool
+  connections. Queue statements are short.
+- **Retry storms:** exponential backoff with jitter spreads correlated failures.
+  `crash_retry_delay` does the same for crash loops.
+- **Table health:** every claim, heartbeat, retry, and finalization updates the
+  task row. Monitor autovacuum, dead tuples, index bloat, and cleanup throughput.
+  Partitioning is a later, measured step.
+- **Backlogs:** the reaper and cleanup loop in bounded batches on a separate task,
+  so they never block claiming. Sustained input above capacity still grows
+  `queued`. Watch `store::queue_stats`.
 
-- **Connection pool:** handlers release connections while running, but claims,
-  heartbeats, recovery, materialization, and finalization all need short-lived
-  connections. Leave headroom beyond application traffic and account for many
-  handlers renewing at similar times.
-- **Lease duration:** choose a duration comfortably longer than normal pool and
-  database latency. An outage lasting longer than the lease can cause another
-  worker to start the same task.
-- **Database maintenance:** the hot queue row is updated on every claim,
-  heartbeat, retry, and terminal transition. Monitor dead tuples, autovacuum,
-  index growth, and transaction age.
-- **Retry storms:** retry backoff currently has no jitter. Large correlated
-  failures can make many tasks eligible together and should be controlled by
-  task-specific backoff and worker concurrency.
-- **Polling:** polling is the correctness mechanism. Notifications emitted by
-  enqueue are not required for correctness, and the current runtime's wake-up
-  latency is bounded by `poll_interval`.
-- **Backlogs:** materialization and recovery use bounded batches so one cycle
-  cannot monopolize the database. Sustained input above processing capacity will
-  still grow the pending table.
+## Failure Semantics (§22)
 
-The partial pending, running-expiry, and terminal-retention indexes keep common
-worker queries away from unrelated states. Retention should periodically remove
-terminal history according to the application's audit requirements.
-
-## Failure Semantics
-
-PostgreSQL statement atomicity prevents partially committed claims and state
-transitions. A lost client connection can make the result ambiguous to that
-client, but it does not corrupt queue state:
-
-- if a claim committed but its response was lost, the task remains leased and is
-  recovered after expiry;
-- if finalization committed but its response was lost, the terminal row prevents
-  another claim;
-- if a handler panics or is aborted, its unclosed attempt remains recoverable
-  after lease expiry.
-
-Graceful shutdown drains handlers until `shutdown_timeout` and then aborts the
-remaining handler futures. Their leases are left for normal recovery.
+| Failure | Result |
+| --- | --- |
+| Producer crashes before commit | Neither the task nor its domain changes are visible. |
+| Producer times out after commit | Retrying with the same `task_key` returns the existing task. |
+| Worker crashes before claim commit | The claim rolls back; the task stays `queued`. |
+| Worker crashes after claim | The lease expires; the reaper requeues the task or marks it `dead`. |
+| Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
+| Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
+| PostgreSQL unavailable | No transition happens; workers report `Degraded` and retry without inventing local state. |
+| Graceful shutdown with handlers still running | Handlers drain until `shutdown_timeout`, then are aborted; their leases are left for the reaper. |
 
 ## Validation Status
 
-The integration suite currently covers:
+The integration suite covers every §27 requirement. See the table in
+[Scheduler Design](SchedulerDesign.md#testing-contract-27). It also covers:
+heartbeats while a handler holds the row lock, replay followed by a reclaim,
+notification and next-due wakeups, and shutdown without detached work.
 
-- concurrent workers claiming disjoint tasks;
-- a stale finalizer blocked behind token rotation;
-- concurrent recovery of the same expired task;
-- token-guarded renewal and cancellation;
-- short-lease execution with heartbeat renewal;
-- retry exhaustion and terminal retention;
-- producer deduplication and transactional enqueue rollback;
-- partial-index use for the pending claim query.
+Not yet automated:
 
-Before relying on a particular production capacity, add workload-specific tests
-for many workers and large task sets. Fault tests should cover process death,
-database outages longer than a lease, pool exhaustion, renewal-versus-recovery
-races, slow or blocking handlers, and retry storms. Throughput and latency should
-be measured with the same PostgreSQL version, pool sizing, payload distribution,
-and retention policy used by the host application.
+- process-kill fault injection at random points around claim, effect,
+  completion, and heartbeat;
+- database outages longer than a lease;
+- pool exhaustion;
+- throughput and latency at production scale.
+
+Run these with the host's PostgreSQL version, pool sizing, payload sizes, and
+retention policy before relying on a capacity figure.
