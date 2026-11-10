@@ -6,8 +6,7 @@ use std::time::Duration;
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob};
 use pg_task_scheduler::{
-    CronExpression, JobLifecycle, JobName, LeaseDuration, MaxAttempts, RunId, RunState, Scheduler,
-    WorkerId,
+    CronExpression, JobLifecycle, MaxAttempts, Scheduler, TaskId, TaskName, TaskStatus, store,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -23,9 +22,8 @@ async fn runs_due_job_end_to_end() {
     let job = jobs::create(
         &mut conn,
         CreateJob::new(
-            JobName::try_from("counter").unwrap(),
+            TaskName::try_from("counter").unwrap(),
             CronExpression::parse("*/1 * * * *").unwrap(),
-            LeaseDuration::try_from(Duration::from_secs(60)).unwrap(),
             MaxAttempts::try_from(3u32).unwrap(),
             JobLifecycle::Active,
             serde_json::json!({"n": 1}),
@@ -48,8 +46,8 @@ async fn runs_due_job_end_to_end() {
     drop(conn);
 
     static COUNT: AtomicU32 = AtomicU32::new(0);
-    let scheduler = Scheduler::builder(db.pool.clone(), WorkerId::try_from("test").unwrap())
-        .poll_interval(Duration::from_millis(100))
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .max_poll_interval(Duration::from_millis(100))
         .reaper_interval(Duration::from_secs(5))
         .shutdown_timeout(Duration::from_secs(5))
         .register::<Args, _, _>("counter", |_ctx, a: Args| async move {
@@ -64,12 +62,12 @@ async fn runs_due_job_end_to_end() {
     let cancel = CancellationToken::new();
     let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
 
-    let run = RunId(
-        db.run_ids_eventually(job.id.0, Duration::from_secs(10))
+    let id = TaskId(
+        db.task_id_eventually(job.id.0, Duration::from_secs(10))
             .await,
     );
     let mut conn = db.pool.get().await.unwrap();
-    let completed = wait_completed(&db, &mut conn, run, Duration::from_secs(10)).await;
+    let completed = wait_done(&mut conn, id, Duration::from_secs(10)).await;
     assert!(completed);
     assert_eq!(COUNT.load(Ordering::SeqCst), 1);
 
@@ -78,17 +76,15 @@ async fn runs_due_job_end_to_end() {
     db.cleanup().await;
 }
 
-async fn wait_completed(
-    _db: &TestDb,
+async fn wait_done(
     conn: &mut diesel_async::AsyncPgConnection,
-    run: RunId,
+    id: TaskId,
     timeout: Duration,
 ) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if let Some(RunState::Completed { .. }) = pg_task_scheduler::store::run_state(conn, run)
-            .await
-            .unwrap()
+        if let Some(t) = store::task(conn, id).await.unwrap()
+            && t.status == TaskStatus::Done
         {
             return true;
         }

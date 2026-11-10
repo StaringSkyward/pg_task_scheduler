@@ -231,6 +231,7 @@ them:
 | `pg_task_scheduler_leases_lost_total` | counter | `task_name` |
 | `pg_task_scheduler_heartbeat_failures_total` | counter | `task_name` |
 | `pg_task_scheduler_leases_expired_total` | counter | (none; reaper) |
+| `pg_task_scheduler_tasks_materialized_total` | counter | (none; `cron` feature only) |
 | `pg_task_scheduler_cleanup_deleted_total` | counter | `kind` = `task` or `outbox` |
 | `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name` (claim time − `due_at`, database clock) |
 | `pg_task_scheduler_task_duration_seconds` | histogram | `task_name` |

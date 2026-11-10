@@ -14,33 +14,28 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
-use crate::ids::{JobId, JobName};
-use crate::models::{
-    Job, JobLifecycle, LeaseDuration, MaxAttempts, NewJob, RetryBackoff, SchedulerJob,
-};
+use crate::ids::{JobId, TaskName};
+use crate::models::{Job, JobLifecycle, MaxAttempts, NewJob, SchedulerJob};
 use crate::schema::scheduler_jobs::dsl as j;
 
 #[derive(Debug, Clone)]
 pub struct CreateJob {
-    name: JobName,
+    name: TaskName,
     cron: CronExpression,
     args: serde_json::Value,
-    lease_duration: LeaseDuration,
     max_attempts: MaxAttempts,
     lifecycle: JobLifecycle,
-    retry_backoff: RetryBackoff,
 }
 
 impl CreateJob {
-    /// The five leading parameters are distinct, non-`Serialize` types, so their
+    /// The four leading parameters are distinct, non-`Serialize` types, so their
     /// positional order is type-checked. `args` accepts any `Serialize` and is
     /// intentionally last (the one slot a transposition could reach). It is
     /// serialized here, so a raw `serde_json::Value` only crosses the boundary if
     /// the caller deliberately passes one.
     pub fn new(
-        name: JobName,
+        name: TaskName,
         cron: CronExpression,
-        lease_duration: LeaseDuration,
         max_attempts: MaxAttempts,
         lifecycle: JobLifecycle,
         args: impl serde::Serialize,
@@ -48,17 +43,10 @@ impl CreateJob {
         Ok(CreateJob {
             name,
             cron,
-            lease_duration,
             max_attempts,
             lifecycle,
-            retry_backoff: RetryBackoff::default(),
             args: serde_json::to_value(args)?, // SchedulerError::Serde on failure
         })
-    }
-
-    pub fn with_retry_backoff(mut self, retry_backoff: RetryBackoff) -> Self {
-        self.retry_backoff = retry_backoff;
-        self
     }
 }
 
@@ -106,10 +94,8 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
         cron_expression: spec.cron.as_str().to_owned(),
         job_args: spec.args.clone(),
         next_run_at: spec.cron.next_after(db_now)?,
-        lease_duration: spec.lease_duration.to_pg_interval(),
         max_attempts: spec.max_attempts.to_i32(),
         is_paused: spec.lifecycle.is_paused(),
-        retry_backoff: spec.retry_backoff.to_pg_interval(),
     })
 }
 
@@ -132,7 +118,7 @@ pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job
 
 /// Idempotent declarative registration. Inserts the job if its name is new (the
 /// cursor computed from `db_now`); on conflict reconciles config columns (cron,
-/// args, lease, max_attempts) but PRESERVES the existing `next_run_at` and
+/// args, max_attempts) but PRESERVES the existing `next_run_at` and
 /// `is_paused`. Because the cursor is never advanced here, ensure-on-startup can
 /// never skip a due occurrence, and a redeploy can never resurrect a job an
 /// operator paused. Use [`reschedule`] to move the cursor explicitly.
@@ -154,9 +140,7 @@ pub async fn ensure_job(
                 .set((
                     j::cron_expression.eq(&row.cron_expression),
                     j::job_args.eq(&row.job_args),
-                    j::lease_duration.eq(&row.lease_duration),
                     j::max_attempts.eq(row.max_attempts),
-                    j::retry_backoff.eq(&row.retry_backoff),
                     j::updated_at.eq(db_now),
                 ))
                 .returning(SchedulerJob::as_returning())

@@ -45,7 +45,8 @@ impl<P: SchedulerPool> Scheduler<P> {
             tokio::spawn(maintain(pool.clone(), config.clone(), cancel.child_token()));
 
         while !cancel.is_cancelled() {
-            // [cron] materialize due schedules here.
+            #[cfg(feature = "cron")]
+            let materialized = materialize(&pool).await;
             if listener.is_none() {
                 listener = listen(&pool).await;
             }
@@ -65,6 +66,9 @@ impl<P: SchedulerPool> Scheduler<P> {
                         want,
                     )
                     .await;
+                    // A failed materialization degrades health but never stops claiming.
+                    #[cfg(feature = "cron")]
+                    let cycle = materialized.and(cycle);
                     report(&health_tx, &mut failures, cycle.as_ref().err());
                     match cycle {
                         Ok(Some(wait)) => wait,
@@ -128,6 +132,17 @@ async fn timed<T>(operation: &'static str, query: impl Future<Output = T>) -> T 
 
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Turn due recurring schedules into queued tasks.
+#[cfg(feature = "cron")]
+async fn materialize<P: SchedulerPool>(pool: &P) -> Result<(), SchedulerError> {
+    let mut conn = acquire(pool).await?;
+    let n = timed("materialize", store::materialize_due_jobs(&mut conn))
+        .await
+        .inspect_err(|error| tracing::error!(%error, "materialize failed"))?;
+    metrics::counter!("pg_task_scheduler_tasks_materialized_total").increment(count(n));
+    Ok(())
 }
 
 /// A pooled connection listening on `queue_available`, or `None` on failure (the worker

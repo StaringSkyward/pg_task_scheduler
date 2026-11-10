@@ -8,11 +8,8 @@ use chrono::{DateTime, Utc};
 use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
 #[cfg(feature = "cron")]
 use {
-    crate::cron::CronExpression,
-    crate::error::SchedulerError,
-    crate::ids::{JobId, JobName},
-    crate::schema::scheduler_jobs,
-    diesel::prelude::*,
+    crate::cron::CronExpression, crate::error::SchedulerError, crate::ids::JobId,
+    crate::schema::scheduler_jobs, diesel::prelude::*,
 };
 
 /// Lifecycle state of a `queue_tasks` row (stored as TEXT).
@@ -367,7 +364,6 @@ mod max_attempts_tests {
     }
 }
 
-// Recurring-schedule rows; reworked by the cron-feature task.
 #[cfg(feature = "cron")]
 /// A job's lifecycle state. Used at both the creation and read boundaries; the
 /// stored `is_paused` boolean never escapes the row mapping.
@@ -397,16 +393,14 @@ impl JobLifecycle {
 #[cfg(feature = "cron")]
 /// Public domain projection of a `scheduler_jobs` row. Every field is a domain
 /// type; `job_args` is intentionally omitted (reading is untyped — the handler
-/// argument type is not recoverable from a runtime `JobName`). Not `Serialize`:
+/// argument type is not recoverable from a runtime `TaskName`). Not `Serialize`:
 /// it must not become an accidental wire contract.
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: JobId,
-    pub name: JobName,
+    pub name: TaskName,
     pub cron: CronExpression,
-    pub lease_duration: LeaseDuration,
     pub max_attempts: MaxAttempts,
-    pub retry_backoff: RetryBackoff,
     pub lifecycle: JobLifecycle,
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -419,12 +413,6 @@ impl TryFrom<SchedulerJob> for Job {
     fn try_from(row: SchedulerJob) -> Result<Self, SchedulerError> {
         let job_id = row.id;
         let cron = CronExpression::parse_stored(job_id, &row.cron_expression)?;
-        let lease_duration = LeaseDuration::from_pg_interval(row.lease_duration).map_err(|e| {
-            SchedulerError::CorruptJob {
-                job_id,
-                source: e.into(),
-            }
-        })?;
         let max_attempts =
             MaxAttempts::from_db_i32(row.max_attempts).map_err(|e| SchedulerError::CorruptJob {
                 job_id,
@@ -434,14 +422,7 @@ impl TryFrom<SchedulerJob> for Job {
             id: job_id,
             name: row.name,
             cron,
-            lease_duration,
             max_attempts,
-            retry_backoff: RetryBackoff::from_pg_interval(row.retry_backoff).map_err(|e| {
-                SchedulerError::CorruptJob {
-                    job_id,
-                    source: e.into(),
-                }
-            })?,
             lifecycle: JobLifecycle::from_paused(row.is_paused),
             next_run_at: row.next_run_at,
             created_at: row.created_at,
@@ -457,30 +438,26 @@ impl TryFrom<SchedulerJob> for Job {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct SchedulerJob {
     pub id: JobId,
-    pub name: JobName,
+    pub name: TaskName,
     pub cron_expression: String,
     pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
-    pub lease_duration: diesel::pg::data_types::PgInterval,
     pub max_attempts: i32,
     pub is_paused: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub retry_backoff: diesel::pg::data_types::PgInterval,
 }
 
 #[cfg(feature = "cron")]
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = scheduler_jobs)]
 pub struct NewJob {
-    pub name: JobName,
+    pub name: TaskName,
     pub cron_expression: String,
     pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
-    pub lease_duration: diesel::pg::data_types::PgInterval,
     pub max_attempts: i32,
     pub is_paused: bool,
-    pub retry_backoff: diesel::pg::data_types::PgInterval,
 }
 
 #[cfg(all(test, feature = "cron"))]

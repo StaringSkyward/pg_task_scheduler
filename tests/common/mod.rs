@@ -89,6 +89,12 @@ impl TestDb {
         let up = include_str!("../../migrations/0001_create_queue_tables/up.sql");
         let mut conn = pool.get().await.expect("conn");
         conn.batch_execute(up).await.expect("install schema");
+        #[cfg(feature = "cron")]
+        conn.batch_execute(include_str!(
+            "../../migrations/0002_create_schedule_tables/up.sql"
+        ))
+        .await
+        .expect("install schedule schema");
 
         TestDb { pool, schema }
     }
@@ -113,7 +119,7 @@ impl TestDb {
 
     /// Insert a job; returns its id. Cron validated by the DB only — pass valid cron.
     pub async fn insert_job(&self, name: &str, cron: &str, next_run_at: DateTime<Utc>) -> Uuid {
-        self.insert_job_full(name, cron, next_run_at, "5 minutes", 3, false)
+        self.insert_job_full(name, cron, next_run_at, 3, false)
             .await
     }
 
@@ -122,19 +128,17 @@ impl TestDb {
         name: &str,
         cron: &str,
         next_run_at: DateTime<Utc>,
-        lease_interval: &str,
         max_attempts: i32,
         is_paused: bool,
     ) -> Uuid {
         let mut conn = self.pool.get().await.unwrap();
         diesel::sql_query(
-            "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at, lease_duration, max_attempts, is_paused) \
-             VALUES ($1,$2,$3,$4::interval,$5,$6) RETURNING id",
+            "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at, max_attempts, is_paused) \
+             VALUES ($1,$2,$3,$4,$5) RETURNING id",
         )
         .bind::<diesel::sql_types::Text, _>(name)
         .bind::<diesel::sql_types::Text, _>(cron)
         .bind::<diesel::sql_types::Timestamptz, _>(next_run_at)
-        .bind::<diesel::sql_types::Text, _>(lease_interval)
         .bind::<diesel::sql_types::Integer, _>(max_attempts)
         .bind::<diesel::sql_types::Bool, _>(is_paused)
         .get_result::<IdRow>(&mut conn)
@@ -163,40 +167,28 @@ impl TestDb {
             .flag
     }
 
-    /// All run ids for a job, oldest first.
-    pub async fn run_ids(&self, job_id: Uuid) -> Vec<Uuid> {
+    /// Ids of the `queue_tasks` materialized for a job, oldest occurrence first.
+    pub async fn task_ids(&self, job_id: Uuid) -> Vec<i64> {
         let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query("SELECT id FROM scheduler_runs WHERE job_id = $1 ORDER BY scheduled_for")
-            .bind::<diesel::sql_types::Uuid, _>(job_id)
-            .get_results::<IdRow>(&mut conn)
+        diesel::sql_query("SELECT id AS n FROM queue_tasks WHERE task_key LIKE $1 ORDER BY due_at")
+            .bind::<diesel::sql_types::Text, _>(format!("schedule:{job_id}:%"))
+            .get_results::<CountRow>(&mut conn)
             .await
             .unwrap()
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.n)
             .collect()
     }
 
-    pub async fn force_lease_expired(&self, job_id: Uuid) {
-        let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query(
-            "UPDATE scheduler_runs SET lease_expires_at = started_at + interval '1 microsecond' \
-             WHERE job_id = $1 AND state = 'running'::scheduler_run_state",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(job_id)
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    }
-
-    /// Poll `run_ids` until at least one run has materialized for `job_id`, or
+    /// Poll `task_ids` until at least one task has materialized for `job_id`, or
     /// panic if none appears within `timeout`.
-    pub async fn run_ids_eventually(&self, job_id: Uuid, timeout: std::time::Duration) -> Uuid {
+    pub async fn task_id_eventually(&self, job_id: Uuid, timeout: std::time::Duration) -> i64 {
         let start = std::time::Instant::now();
         loop {
-            if let Some(id) = self.run_ids(job_id).await.into_iter().next() {
+            if let Some(id) = self.task_ids(job_id).await.into_iter().next() {
                 return id;
             }
-            assert!(start.elapsed() < timeout, "no run materialized in time");
+            assert!(start.elapsed() < timeout, "no task materialized in time");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
