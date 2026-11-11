@@ -79,7 +79,9 @@ pub fn with_basic_auth(router: Router, users: Vec<BasicUser>) -> Result<Router, 
         dummy,
         verifies,
     });
-    Ok(router.layer(middleware::from_fn_with_state(users, basic)))
+    Ok(router
+        .layer(middleware::from_fn_with_state(users, basic))
+        .layer(middleware::map_response(crate::no_framing)))
 }
 
 async fn basic(State(users): State<Arc<Users>>, mut req: Request, next: Next) -> Response {
@@ -151,7 +153,9 @@ fn challenge() -> Response {
 /// or repeated → 401. Only safe when nothing but the proxy can reach the server, and
 /// the proxy overwrites any value the client sent.
 pub fn with_trusted_header(router: Router, header: HeaderName) -> Router {
-    router.layer(middleware::from_fn_with_state(header, trusted))
+    router
+        .layer(middleware::from_fn_with_state(header, trusted))
+        .layer(middleware::map_response(crate::no_framing))
 }
 
 async fn trusted(State(header): State<HeaderName>, mut req: Request, next: Next) -> Response {

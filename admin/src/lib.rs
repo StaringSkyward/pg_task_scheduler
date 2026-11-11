@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::FromRequestParts;
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
 use axum::{Router, middleware};
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::store::OverviewParams;
@@ -106,9 +107,9 @@ struct AppState<P> {
 }
 
 /// The admin routes. Every route requires an [`Operator`] (401 without one) and every
-/// request other than GET, HEAD and OPTIONS passes the CSRF check (403). Add
-/// authentication with [`auth::with_basic_auth`], [`auth::with_trusted_header`], or any
-/// layer that inserts [`Operator`].
+/// request other than GET, HEAD and OPTIONS passes the CSRF check (403). Every response
+/// forbids framing. Add authentication with [`auth::with_basic_auth`],
+/// [`auth::with_trusted_header`], or any layer that inserts [`Operator`].
 pub fn router<P: SchedulerPool>(pool: P, config: AdminConfig) -> Router {
     let public_origin = config.public_origin.clone();
     let state = AppState {
@@ -123,6 +124,20 @@ pub fn router<P: SchedulerPool>(pool: P, config: AdminConfig) -> Router {
         .route_layer(middleware::from_fn_with_state(public_origin, csrf::guard))
         .route_layer(middleware::from_fn(require_operator))
         .with_state(state)
+        // `layer`, not `route_layer`: unmatched paths and every error response too.
+        .layer(middleware::map_response(no_framing))
+}
+
+/// Anti-clickjacking: no page may be shown in a frame. The auth layers add it too, so their
+/// own 401s carry it.
+pub(crate) async fn no_framing(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    res
 }
 
 async fn require_operator(

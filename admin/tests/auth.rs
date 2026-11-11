@@ -99,6 +99,47 @@ async fn every_route_401_without_operator() {
     db.cleanup().await;
 }
 
+/// Every response forbids framing (clickjacking): pages, and the 401s of the operator check
+/// and of the shipped auth layers.
+#[tokio::test]
+async fn responses_forbid_framing() {
+    let db = TestDb::new().await;
+    let bare = || router(db.pool.clone(), AdminConfig::default());
+    let page = send(
+        &bare().layer(Extension(Operator("ops".into()))),
+        Method::GET,
+        "/",
+        &[],
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let no_operator = send(&bare(), Method::GET, "/", &[]).await;
+    let basic = send(
+        &with_basic_auth(bare(), Vec::new()).unwrap(),
+        Method::GET,
+        "/",
+        &[],
+    )
+    .await;
+    let trusted = send(
+        &with_trusted_header(bare(), HeaderName::from_static("x-forwarded-user")),
+        Method::GET,
+        "/",
+        &[],
+    )
+    .await;
+    for resp in [page, no_operator, basic, trusted] {
+        let status = resp.status();
+        assert_eq!(resp.headers()["x-frame-options"], "DENY", "{status}");
+        assert_eq!(
+            resp.headers()["content-security-policy"],
+            "frame-ancestors 'none'",
+            "{status}"
+        );
+    }
+    db.cleanup().await;
+}
+
 const CHALLENGE: &str = r#"Basic realm="pg_task_scheduler admin", charset="UTF-8""#;
 
 fn basic(user: &str, password: &str) -> String {
