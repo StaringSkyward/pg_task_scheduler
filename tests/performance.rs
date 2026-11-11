@@ -444,3 +444,104 @@ async fn overview_no_handler_probe_is_a_limited_due_index_scan() {
     );
     db.cleanup().await;
 }
+
+/// A table shaped like production: mostly done history, a small live backlog spread over
+/// queues and names, and some dead rows. ANALYZEd, so the planner's choice is its real one,
+/// not an artefact of an empty table or `enable_seqscan = off`.
+async fn production_shaped_db() -> TestDb {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         SELECT 'x' || g, 'name' || (g % 50), 'done', now() - g * interval '1 second' \
+         FROM generate_series(1, 20000) g; \
+         INSERT INTO queue_tasks (task_key, task_name, queue) \
+         SELECT 'q' || g, 'name' || (g % 50), 'q' || (g % 5) FROM generate_series(1, 200) g; \
+         INSERT INTO queue_tasks (task_key, task_name, status, locked_by, locked_until) \
+         SELECT 'r' || g, 'name' || (g % 50), 'running', 'w', now() + interval '1 minute' \
+         FROM generate_series(1, 20) g; \
+         INSERT INTO queue_tasks (task_key, task_name, status, completed_at, last_error) \
+         SELECT 'z' || g, 'name' || (g % 50), 'dead', now() - g * interval '1 second', 'boom' \
+         FROM generate_series(1, 1000) g; \
+         ANALYZE queue_tasks",
+    )
+    .await
+    .unwrap();
+    db
+}
+
+/// The custom and the generic plan of the shipped `sql`, prepared and executed with `args`.
+/// A statement run repeatedly on one connection (a bulk loop, the cached prepared statements
+/// of diesel-async) can switch to its generic plan, so both must avoid a seq scan.
+async fn custom_and_generic_plans(db: &TestDb, sql: &str, args: &str) -> [String; 2] {
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(&format!("PREPARE probe AS {sql}"))
+        .await
+        .unwrap();
+    let mut plans = Vec::new();
+    for mode in ["force_custom_plan", "force_generic_plan"] {
+        conn.batch_execute(&format!("SET plan_cache_mode = {mode}"))
+            .await
+            .unwrap();
+        let rows = diesel::sql_query(format!("EXPLAIN EXECUTE probe({args})"))
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        plans.push(
+            rows.into_iter()
+                .map(|r| r.line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    conn.batch_execute("DEALLOCATE probe; RESET plan_cache_mode")
+        .await
+        .unwrap();
+    plans.try_into().unwrap()
+}
+
+/// Queued and running rows through their partial indexes, never the retained history.
+fn assert_live_rows_only(plans: [String; 2]) {
+    for plan in plans {
+        assert!(
+            plan.contains("queue_tasks_due_idx")
+                && plan.contains("queue_tasks_expired_lease_idx")
+                && !plan.contains("Seq Scan on queue_tasks"),
+            "unexpected query plan:\n{plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bulk_cancel_batch_reads_only_live_rows() {
+    let db = production_shaped_db().await;
+    // $1 task_name, $2 queue, $3 max_task_id, $4 action id, $5 batch size.
+    let plans =
+        custom_and_generic_plans(&db, store::CANCEL_BATCH, "'name1', NULL, 100000, 1, 500").await;
+    assert_live_rows_only(plans);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn count_cancellable_reads_only_live_rows() {
+    let db = production_shaped_db().await;
+    let plans =
+        custom_and_generic_plans(&db, store::COUNT_CANCELLABLE, "'name1', NULL, 10000").await;
+    assert_live_rows_only(plans);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn count_replayable_uses_failed_name_index() {
+    let db = production_shaped_db().await;
+    let plans =
+        custom_and_generic_plans(&db, store::COUNT_REPLAYABLE, "'name1', NULL, NULL, 10000").await;
+    for plan in plans {
+        assert!(
+            plan.contains("queue_tasks_failed_name_idx")
+                && !plan.contains("Seq Scan on queue_tasks"),
+            "unexpected query plan:\n{plan}"
+        );
+    }
+    db.cleanup().await;
+}

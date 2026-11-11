@@ -11,13 +11,13 @@ mod overview;
 mod transitions;
 mod workers;
 
-#[doc(hidden)]
-pub use admin::REPLAY_BATCH;
 pub use admin::{
     AdminAction, AdminActionKind, BULK_BATCH, BULK_BUDGET, BulkFilter, BulkOutcome, CancelOutcome,
     QueuePause, admin_actions, cancel, cancel_matching, count_cancellable, count_replayable,
     pause_queue, paused_queues, replay_matching, resume_queue, task_actions,
 };
+#[doc(hidden)]
+pub use admin::{CANCEL_BATCH, COUNT_CANCELLABLE, COUNT_REPLAYABLE, REPLAY_BATCH};
 #[doc(hidden)]
 pub use browse::{DONE, FAILED, FAILED_BY_NAME, QUEUED_DUE, QUEUED_FUTURE, RUNNING};
 pub use browse::{

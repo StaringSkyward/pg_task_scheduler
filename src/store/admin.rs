@@ -259,13 +259,19 @@ struct N {
 // count never drifts from what was applied. Same transition as `CANCEL`, including the
 // attempt upsert (only for rows that are running after the lock; a claim may have committed
 // between the snapshot and the lock).
-// ponytail: the queued-row scan by task_name has no index, because §3 forbids an index
-// enqueue must maintain; it scans the queue's queued rows. Add one only if enqueue can afford it.
-const CANCEL_BATCH: &str = r#"
+// The status test is `status = 'queued' OR status = 'running'`, never `IN (..)`: only the OR
+// form matches the partial indexes on queued and running rows (a BitmapOr over
+// queue_tasks_due_idx and queue_tasks_expired_lease_idx). `IN` plans as a seq scan over every
+// retained row (performance::bulk_cancel_batch_reads_only_live_rows).
+// ponytail: no index finds live rows by task_name, because §3 forbids an index enqueue must
+// maintain; this reads every queued and running row and filters by name. Add one only if
+// enqueue can afford it.
+#[doc(hidden)]
+pub const CANCEL_BATCH: &str = r#"
     WITH target AS (
         SELECT id, status, attempts, lock_token, locked_by FROM queue_tasks
         WHERE id <= $3 AND task_name = $1 AND ($2::text IS NULL OR queue = $2)
-          AND status IN ('queued', 'running')
+          AND (status = 'queued' OR status = 'running')
         LIMIT $5
         FOR UPDATE SKIP LOCKED
     ), closed AS (
@@ -444,23 +450,36 @@ pub async fn replay_matching(
     }
 }
 
+// Binds: $1 task_name, $2 queue (NULL = any), $3 cap. Same selection, and the same OR form
+// for the same reason, as `CANCEL_BATCH`.
+#[doc(hidden)]
+pub const COUNT_CANCELLABLE: &str = "\
+    SELECT count(*) AS n FROM (SELECT 1 FROM queue_tasks \
+    WHERE task_name = $1 AND ($2::text IS NULL OR queue = $2) \
+      AND (status = 'queued' OR status = 'running') LIMIT $3) s";
+
+// Binds: $1 task_name, $2 queue (NULL = any), $3 last_error (NULL = any), $4 cap. Same
+// selection as `REPLAY_BATCH`.
+#[doc(hidden)]
+pub const COUNT_REPLAYABLE: &str = "\
+    SELECT count(*) AS n FROM (SELECT 1 FROM queue_tasks \
+    WHERE task_name = $1 AND ($2::text IS NULL OR queue = $2) \
+      AND status IN ('dead', 'cancelled') AND ($3::text IS NULL OR last_error = $3) \
+    LIMIT $4) s";
+
 /// How many tasks `cancel_matching` would match, counting at most `cap`.
 pub async fn count_cancellable(
     conn: &mut AsyncPgConnection,
     filter: &BulkFilter,
     cap: i64,
 ) -> Result<i64, SchedulerError> {
-    Ok(diesel::sql_query(
-        "SELECT count(*) AS n FROM (SELECT 1 FROM queue_tasks \
-         WHERE task_name = $1 AND ($2::text IS NULL OR queue = $2) \
-           AND status IN ('queued', 'running') LIMIT $3) s",
-    )
-    .bind::<sql_types::Text, _>(&filter.task_name)
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
-    .bind::<sql_types::BigInt, _>(cap)
-    .get_result::<N>(conn)
-    .await?
-    .n)
+    Ok(diesel::sql_query(COUNT_CANCELLABLE)
+        .bind::<sql_types::Text, _>(&filter.task_name)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+        .bind::<sql_types::BigInt, _>(cap)
+        .get_result::<N>(conn)
+        .await?
+        .n)
 }
 
 /// How many tasks `replay_matching` would match, counting at most `cap`.
@@ -470,19 +489,14 @@ pub async fn count_replayable(
     last_error: Option<&str>,
     cap: i64,
 ) -> Result<i64, SchedulerError> {
-    Ok(diesel::sql_query(
-        "SELECT count(*) AS n FROM (SELECT 1 FROM queue_tasks \
-         WHERE task_name = $1 AND ($2::text IS NULL OR queue = $2) \
-           AND status IN ('dead', 'cancelled') AND ($3::text IS NULL OR last_error = $3) \
-         LIMIT $4) s",
-    )
-    .bind::<sql_types::Text, _>(&filter.task_name)
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(last_error)
-    .bind::<sql_types::BigInt, _>(cap)
-    .get_result::<N>(conn)
-    .await?
-    .n)
+    Ok(diesel::sql_query(COUNT_REPLAYABLE)
+        .bind::<sql_types::Text, _>(&filter.task_name)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(last_error)
+        .bind::<sql_types::BigInt, _>(cap)
+        .get_result::<N>(conn)
+        .await?
+        .n)
 }
 
 /// A paused queue.
