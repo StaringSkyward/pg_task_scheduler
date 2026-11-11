@@ -1,9 +1,10 @@
-#![cfg(feature = "axum")]
+#[path = "../../tests/common/mod.rs"]
 mod common;
-use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use axum::{Extension, Router};
 use common::TestDb;
+use pg_task_scheduler_admin::{AdminConfig, Operator, router};
 use tower::ServiceExt; // for `oneshot`
 
 struct AdminTask;
@@ -11,6 +12,11 @@ struct AdminTask;
 impl pg_task_scheduler::Task for AdminTask {
     const NAME: &'static str = "admin-task";
     type Args = serde_json::Value;
+}
+
+/// The admin router as an authenticated `ops@example` sees it.
+fn app(db: &TestDb) -> Router {
+    router(db.pool.clone(), AdminConfig::default()).layer(Extension(Operator("ops@example".into())))
 }
 
 /// Send one request through the router and return the response status. `oneshot`
@@ -29,10 +35,29 @@ async fn status_of(app: Router, method: Method, uri: String) -> StatusCode {
     .status()
 }
 
+#[cfg(feature = "cron")]
 #[tokio::test]
-async fn router_builds() {
+async fn list_jobs_returns_view() {
     let db = TestDb::new().await;
-    let _ = pg_task_scheduler::admin::router(db.pool.clone());
+    let id = db
+        .insert_job(
+            "j",
+            "*/5 * * * *",
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+    let (status, body) = send(app(&db), Method::GET, "/api/jobs".into(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!([{
+            "id": id.to_string(),
+            "name": "j",
+            "cron_expression": "*/5 * * * *",
+            "is_paused": false,
+        }])
+    );
     db.cleanup().await;
 }
 
@@ -47,16 +72,17 @@ async fn pause_existing_204_missing_404() {
             chrono::Utc::now() + chrono::Duration::hours(1),
         )
         .await;
-    let app = pg_task_scheduler::admin::router(db.pool.clone());
+    let app = app(&db);
     assert_eq!(
-        status_of(app.clone(), Method::POST, format!("/jobs/{id}/pause")).await,
+        status_of(app.clone(), Method::POST, format!("/api/jobs/{id}/pause")).await,
         StatusCode::NO_CONTENT
     );
+    assert!(db.is_paused(id).await);
     assert_eq!(
         status_of(
             app,
             Method::POST,
-            format!("/jobs/{}/pause", uuid::Uuid::new_v4())
+            format!("/api/jobs/{}/pause", uuid::Uuid::new_v4())
         )
         .await,
         StatusCode::NOT_FOUND
@@ -69,22 +95,25 @@ async fn pause_existing_204_missing_404() {
 async fn resume_existing_204_missing_404() {
     let db = TestDb::new().await;
     let id = db
-        .insert_job(
+        .insert_job_full(
             "j",
             "*/5 * * * *",
             chrono::Utc::now() + chrono::Duration::hours(1),
+            3,
+            true,
         )
         .await;
-    let app = pg_task_scheduler::admin::router(db.pool.clone());
+    let app = app(&db);
     assert_eq!(
-        status_of(app.clone(), Method::POST, format!("/jobs/{id}/resume")).await,
+        status_of(app.clone(), Method::POST, format!("/api/jobs/{id}/resume")).await,
         StatusCode::NO_CONTENT
     );
+    assert!(!db.is_paused(id).await);
     assert_eq!(
         status_of(
             app,
             Method::POST,
-            format!("/jobs/{}/resume", uuid::Uuid::new_v4())
+            format!("/api/jobs/{}/resume", uuid::Uuid::new_v4())
         )
         .await,
         StatusCode::NOT_FOUND
@@ -103,15 +132,15 @@ async fn delete_existing_204_then_404() {
             chrono::Utc::now() + chrono::Duration::hours(1),
         )
         .await;
-    let app = pg_task_scheduler::admin::router(db.pool.clone());
+    let app = app(&db);
     // First delete removes the row → 204.
     assert_eq!(
-        status_of(app.clone(), Method::DELETE, format!("/jobs/{id}")).await,
+        status_of(app.clone(), Method::DELETE, format!("/api/jobs/{id}")).await,
         StatusCode::NO_CONTENT
     );
     // Deleting again → 404: proves the first call actually deleted (not a no-op/pause).
     assert_eq!(
-        status_of(app, Method::DELETE, format!("/jobs/{id}")).await,
+        status_of(app, Method::DELETE, format!("/api/jobs/{id}")).await,
         StatusCode::NOT_FOUND
     );
     db.cleanup().await;
@@ -156,8 +185,14 @@ async fn send(
 async fn task_route_returns_view_and_404() {
     let db = TestDb::new().await;
     let id = enqueue_one(&db).await;
-    let app = pg_task_scheduler::admin::router(db.pool.clone());
-    let (status, body) = send(app.clone(), Method::GET, format!("/tasks/{}", id.0), None).await;
+    let app = app(&db);
+    let (status, body) = send(
+        app.clone(),
+        Method::GET,
+        format!("/api/tasks/{}", id.0),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["id"], id.0);
@@ -167,9 +202,15 @@ async fn task_route_returns_view_and_404() {
     assert_eq!(v["attempts"], 0);
     assert!(v["locked_by"].is_null() && v["last_error"].is_null() && v["completed_at"].is_null());
     assert!(v["task_key"].is_string() && v["due_at"].is_string() && v["max_attempts"].is_i64());
-    let (status, _) = send(app.clone(), Method::GET, "/tasks/999999".into(), None).await;
+    let (status, _) = send(app.clone(), Method::GET, "/api/tasks/999999".into(), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = send(app, Method::POST, format!("/tasks/{}/cancel", id.0), None).await;
+    let (status, _) = send(
+        app,
+        Method::POST,
+        format!("/api/tasks/{}/cancel", id.0),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     db.cleanup().await;
 }
@@ -178,18 +219,19 @@ async fn task_route_returns_view_and_404() {
 async fn replay_route_requeues_dead_task_and_409s_otherwise() {
     let db = TestDb::new().await;
     let id = enqueue_one(&db).await;
-    let app = pg_task_scheduler::admin::router(db.pool.clone());
-    let uri = format!("/tasks/{}/replay", id.0);
-    let req = serde_json::json!({"operator": "ops@example", "reason": "fixed config"});
+    let app = app(&db);
+    let uri = format!("/api/tasks/{}/replay", id.0);
+    // The body's `operator` is ignored: the audit records the authenticated identity.
+    let req = serde_json::json!({"operator": "mallory", "reason": "fixed config"});
     // Queued, not dead.
     let (status, body) = send(app.clone(), Method::POST, uri.clone(), Some(req.clone())).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body, b"task is not dead or does not exist");
+    assert_eq!(body, b"task is not dead or cancelled, or does not exist");
     // Missing.
     let (status, _) = send(
         app.clone(),
         Method::POST,
-        "/tasks/999999/replay".into(),
+        "/api/tasks/999999/replay".into(),
         Some(req.clone()),
     )
     .await;
@@ -223,8 +265,66 @@ async fn replay_route_requeues_dead_task_and_409s_otherwise() {
         .await;
     assert_eq!(n, 1);
     // Now queued again: second replay conflicts.
-    let again = serde_json::json!({"operator": "x", "reason": "y"});
+    let again = serde_json::json!({"reason": "y"});
     let (status, _) = send(app, Method::POST, uri, Some(again)).await;
     assert_eq!(status, StatusCode::CONFLICT);
+    db.cleanup().await;
+}
+
+#[derive(diesel::QueryableByName)]
+struct Setting {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    v: String,
+}
+
+const SHOW_TIMEOUT: &str = "SELECT current_setting('statement_timeout') AS v";
+
+#[tokio::test]
+async fn read_sets_statement_timeout_for_its_transaction_only() {
+    use std::time::Duration;
+    let db = TestDb::new().await;
+    // Inside: the timeout is in force.
+    let (inside, pid) =
+        pg_task_scheduler_admin::db::read(&db.pool, Duration::from_millis(1500), |c| {
+            Box::pin(async move {
+                let s = diesel_async::RunQueryDsl::get_result::<Setting>(
+                    diesel::sql_query(SHOW_TIMEOUT),
+                    &mut *c,
+                )
+                .await?;
+                Ok((s.v, common::backend_pid(c).await))
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(inside, "1500ms");
+    // Back on the same pooled connection, outside the transaction, it did not leak.
+    {
+        let mut conn = db.pool.get().await.unwrap();
+        assert_eq!(
+            common::backend_pid(&mut conn).await,
+            pid,
+            "not the same connection"
+        );
+        let after = diesel_async::RunQueryDsl::get_result::<Setting>(
+            diesel::sql_query(SHOW_TIMEOUT),
+            &mut conn,
+        )
+        .await
+        .unwrap()
+        .v;
+        assert_eq!(after, "0");
+    }
+    // A statement over the timeout is cancelled.
+    let slow = pg_task_scheduler_admin::db::read(&db.pool, Duration::from_millis(50), |c| {
+        Box::pin(async move {
+            diesel_async::RunQueryDsl::execute(diesel::sql_query("SELECT pg_sleep(2)"), c)
+                .await
+                .map_err(Into::into)
+        })
+    })
+    .await;
+    let err = slow.unwrap_err().to_string();
+    assert!(err.contains("statement timeout"), "{err}");
     db.cleanup().await;
 }

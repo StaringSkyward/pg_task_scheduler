@@ -394,7 +394,7 @@ pub enum JobLifecycle {
 #[cfg(feature = "cron")]
 impl JobLifecycle {
     /// Boundary helper for the `is_paused` column. `pub(crate)` because `jobs`
-    /// and `admin` (sibling modules) call it — a plain `fn` is private to `models`.
+    /// (a sibling module) calls it — a plain `fn` is private to `models`.
     pub(crate) fn is_paused(self) -> bool {
         matches!(self, JobLifecycle::Paused)
     }

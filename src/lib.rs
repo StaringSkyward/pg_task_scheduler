@@ -1,7 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-#[cfg(feature = "axum")]
-pub mod admin;
 #[cfg(feature = "cron")]
 mod cron;
 mod error;

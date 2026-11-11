@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "admin"]
+
 [package]
 name = "pg_task_scheduler"
 version = "0.1.0"
@@ -18,7 +21,6 @@ metrics = "0.24"
 thiserror = "2"
 tokio-util = "0.7"
 futures = "0.3"
-axum = { version = "0.7", optional = true }
 
 [features]
 default = ["deadpool"]
@@ -26,9 +28,7 @@ deadpool = ["diesel-async/deadpool"]
 bb8 = ["diesel-async/bb8"]
 mobc = ["diesel-async/mobc"]
 cron = ["dep:croner"]
-axum = ["dep:axum"]
 
 [dev-dependencies]
 dotenvy = "0.15.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-tower = { version = "0.5", features = ["util"] }
