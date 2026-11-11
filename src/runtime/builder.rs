@@ -13,6 +13,12 @@ use crate::runtime::registry::Registry;
 const SIXTEEN: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const HUNDRED: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
+/// Longest duration `build()` accepts for any setting: 5 years (5 × 365 days). Every
+/// duration becomes a PostgreSQL interval added to or subtracted from `now()`, and a far
+/// larger one (such as `Duration::MAX`) fails each such statement with
+/// "timestamp out of range".
+const MAX_DURATION: Duration = Duration::from_secs(5 * 365 * 86_400);
+
 pub(crate) struct Config {
     pub worker_id: WorkerId,
     pub max_concurrency: NonZeroUsize,
@@ -106,8 +112,26 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
 
     pub fn build(self) -> Result<Scheduler<P>, SchedulerError> {
         let c = &self.config;
+        let r = &c.retention;
+        let durations = [
+            c.lease_duration,
+            c.heartbeat_interval,
+            c.max_poll_interval,
+            c.base_retry_delay,
+            c.max_retry_delay,
+            c.retry_jitter,
+            c.reaper_interval,
+            c.crash_retry_delay,
+            c.shutdown_timeout,
+            r.done,
+            r.dead,
+            r.idempotency_horizon,
+            r.outbox_published,
+        ];
         let invalid = if self.registry.is_empty() {
             Some("at least one handler must be registered")
+        } else if durations.iter().any(|d| *d > MAX_DURATION) {
+            Some("every duration must be at most 5 years")
         } else if [
             c.lease_duration,
             c.heartbeat_interval,
@@ -284,6 +308,60 @@ mod tests {
                 .base_retry_delay(secs(10))
                 .max_retry_delay(secs(5))
         ));
+    }
+
+    #[test]
+    fn build_rejects_durations_over_5_years() {
+        assert_eq!(MAX_DURATION, secs(157_680_000));
+        let over = MAX_DURATION + secs(1);
+        let r = Retention::default();
+        let horizon = |d| Retention {
+            done: d,
+            dead: d,
+            idempotency_horizon: d,
+            ..r
+        };
+        // Each setting, with any companion value its other rules need. heartbeat_interval is
+        // absent: at most lease / 3, it can never reach the cap without the lease passing it.
+        type Set = fn(SchedulerBuilder<FakePool>, Duration) -> SchedulerBuilder<FakePool>;
+        let settings: [Set; 11] = [
+            |b, d| b.lease_duration(d),
+            |b, d| b.max_poll_interval(d),
+            |b, d| b.base_retry_delay(d).max_retry_delay(d),
+            |b, d| b.max_retry_delay(d),
+            |b, d| b.retry_jitter(d),
+            |b, d| b.reaper_interval(d),
+            |b, d| b.crash_retry_delay(d),
+            |b, d| b.shutdown_timeout(d),
+            |b, d| {
+                b.retention(Retention {
+                    done: d,
+                    ..Retention::default()
+                })
+            },
+            |b, d| {
+                b.retention(Retention {
+                    dead: d,
+                    ..Retention::default()
+                })
+            },
+            |b, d| {
+                b.retention(Retention {
+                    outbox_published: d,
+                    ..Retention::default()
+                })
+            },
+        ];
+        for (i, set) in settings.into_iter().enumerate() {
+            assert!(
+                set(builder(), MAX_DURATION).build().is_ok(),
+                "setting {i} at the cap"
+            );
+            assert!(rejected(set(builder(), over)), "setting {i} over the cap");
+        }
+        assert!(rejected(builder().retention(horizon(over))));
+        assert!(builder().retention(horizon(MAX_DURATION)).build().is_ok());
+        assert!(rejected(builder().max_retry_delay(Duration::MAX)));
     }
 
     #[test]
