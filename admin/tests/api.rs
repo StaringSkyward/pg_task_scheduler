@@ -278,13 +278,15 @@ struct Setting {
 }
 
 const SHOW_TIMEOUT: &str = "SELECT current_setting('statement_timeout') AS v";
+const SHOW_IDLE: &str = "SELECT current_setting('idle_in_transaction_session_timeout') AS v";
 
 #[tokio::test]
 async fn read_sets_statement_timeout_for_its_transaction_only() {
     use std::time::Duration;
     let db = TestDb::new().await;
-    // Inside: the timeout is in force.
-    let (inside, pid) =
+    // Inside: the timeout is in force, and so is the same idle-in-transaction timeout, which
+    // ends a transaction left open by a read whose future was dropped (client gone).
+    let (inside, idle, pid) =
         pg_task_scheduler_admin::db::read(&db.pool, Duration::from_millis(1500), |c| {
             Box::pin(async move {
                 let s = diesel_async::RunQueryDsl::get_result::<Setting>(
@@ -292,12 +294,17 @@ async fn read_sets_statement_timeout_for_its_transaction_only() {
                     &mut *c,
                 )
                 .await?;
-                Ok((s.v, common::backend_pid(c).await))
+                let i = diesel_async::RunQueryDsl::get_result::<Setting>(
+                    diesel::sql_query(SHOW_IDLE),
+                    &mut *c,
+                )
+                .await?;
+                Ok((s.v, i.v, common::backend_pid(c).await))
             })
         })
         .await
         .unwrap();
-    assert_eq!(inside, "1500ms");
+    assert_eq!((inside.as_str(), idle.as_str()), ("1500ms", "1500ms"));
     // Back on the same pooled connection, outside the transaction, it did not leak.
     {
         let mut conn = db.pool.get().await.unwrap();
@@ -314,6 +321,14 @@ async fn read_sets_statement_timeout_for_its_transaction_only() {
         .unwrap()
         .v;
         assert_eq!(after, "0");
+        let idle_after = diesel_async::RunQueryDsl::get_result::<Setting>(
+            diesel::sql_query(SHOW_IDLE),
+            &mut conn,
+        )
+        .await
+        .unwrap()
+        .v;
+        assert_eq!(idle_after, "0");
     }
     // A statement over the timeout is cancelled.
     let slow = pg_task_scheduler_admin::db::read(&db.pool, Duration::from_millis(50), |c| {

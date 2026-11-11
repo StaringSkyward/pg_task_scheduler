@@ -40,6 +40,9 @@ const NOTIFY: &str = "SELECT pg_notify('queue_available', '')";
 const ADVANCE: &str =
     "UPDATE scheduler_jobs SET next_run_at = $1, updated_at = now() WHERE id = $2";
 const PAUSE: &str = "UPDATE scheduler_jobs SET is_paused = true, updated_at = now() WHERE id = $1";
+/// A transaction cut off mid-way (shutdown drops the future) stays open on its pooled
+/// connection, holding the job's row lock; the server ends that session after 30 s idle.
+const IDLE_GUARD: &str = "SELECT set_config('idle_in_transaction_session_timeout', '30s', true)";
 
 /// The idempotency key of one occurrence of a schedule: re-materializing the same
 /// `(job, scheduled_for)` hits `queue_tasks.task_key` and inserts nothing.
@@ -81,6 +84,7 @@ pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize,
 /// Process the earliest due job: `None` when none is due, else the tasks inserted (0 or 1).
 async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
+        diesel::sql_query(IDLE_GUARD).execute(c).await?;
         let Some(job) = diesel::sql_query(SELECT_DUE)
             .get_results::<DueJob>(c)
             .await?
