@@ -74,6 +74,11 @@ Worker groups with different registrations can share one queue.
 | Two reapers select one expired task | One locks it; the other skips it. |
 | Stale worker emits an outbox command | The outbox insert depends on the guarded completion CTE; no completed row means no outbox row. |
 | Replay while a very late worker is still running | Replay bumps `lock_token`, so the late worker's token is fenced. |
+| Operator cancels a running task | The cancel clears the lease; the worker's next heartbeat or transition matches zero rows. See [Admin Actions](#admin-actions). |
+| Cancel races a claim of the same task | The cancel skips the row the claim holds, then retries and cancels the now running task. |
+| Cancel races a DB-contained transaction | The cancel skips the `lock_owned` row and returns `Busy` after 2 s, or `NotCancellable` once the handler has committed `done`. |
+| Pause races a claim already in flight | A claim whose snapshot predates the pause may still take tasks; every later claim skips the queue. |
+| Two bulk actions on one task name | Each batch skips the other's locked rows, so they split the work and no task is counted twice. |
 
 ## Leases and Heartbeats
 
@@ -96,7 +101,10 @@ The local deadline only makes the worker give up early. It never extends
 ownership, and host clocks never decide validity.
 
 `ctx.cancellation` is cancelled when worker shutdown begins, when the lease
-keeper gives up, or when the dispatch ends. A handler that stops early because
+keeper gives up, or when the dispatch ends. When the lease keeper gives up, the
+handler future is dropped first and the token fires after, so the handler never
+observes it; only work it spawned with a clone of the token does. A handler that
+stops early because
 shutdown began should return `TaskError::interrupted()`; its task is then
 released without counting the attempt. Shutdown drops handlers still running at
 `shutdown_timeout` and releases their tasks the same way. A release does not
@@ -113,6 +121,63 @@ Because the lease keeper is a separate future, the handler keeps being polled an
 commits, and the heartbeat then sees a `done` row. The lease must still outlast
 the database transaction. An expired lease makes the final guarded update match
 zero rows, and the transaction rolls back.
+
+## Admin Actions
+
+Cancel, bulk actions and pause are admin operations. They never take ownership
+of a task, and nothing in the worker trusts them beyond what the ownership
+predicate already enforces.
+
+**Cancel against a running handler.** `store::cancel` moves the row to
+`cancelled`, clears `locked_by` and `locked_until`, and closes the open attempt
+as `cancelled`, in one statement. The worker learns of it through the fence:
+
+1. The lease keeper's next heartbeat, within `heartbeat_interval`, matches zero
+   rows. The handler future is dropped and `ctx.cancellation` fires.
+2. The worker reads the task's status under its own `lock_token`. `cancelled`
+   means an operator cancelled it: the worker logs at info and counts
+   `tasks_cancelled_total`, not `leases_lost_total`. Any other answer is a lost
+   lease, as before.
+3. A handler that returns before that heartbeat gets `LostOwnership` from its
+   completion, retry or failure, and the same check counts a cancellation.
+
+Anything the handler already did stays done. A cancel followed by a replay
+before the old worker's next heartbeat bumps `lock_token`, so that worker sees a
+different generation and reports a lost lease.
+
+**Cancel against a claim.** The cancel locks the row with `SKIP LOCKED`, so it
+never waits. If a claim (or a DB-contained handler inside `lock_owned`) holds the
+row, the statement changes nothing, and a lock-free read in the same statement
+sees the task still `queued` or `running`. `store::cancel` then retries every
+100 ms, for up to 2 s, before returning `Busy`. A claim is one short statement,
+so a retry normally finds the task `running` and cancels it. If the claim
+committed after the cancel's snapshot but before its lock, the cancel's row lock
+sees the claimed version, but the snapshot cannot see the new attempt row. The
+attempt is therefore closed with `INSERT … ON CONFLICT (task_id, lock_token) DO
+UPDATE`, which finds the committed row anyway. A `lock_owned` transaction that
+outlasts the 2 s gives `Busy`, and one that commits `done` first gives
+`NotCancellable`.
+
+**Pause against an in-flight claim.** A claim checks for a `queue_pauses` row
+with `NOT EXISTS` inside its own statement. A claim whose snapshot was taken
+before the pause committed can still take tasks from the queue; every claim
+after that skips it, and `next_due_in` stops waking idle workers for its due
+tasks. Running tasks, the reaper and releases are unaffected: a task that fails
+or is reaped goes back to `queued` and waits. Resume deletes the row and sends
+`NOTIFY queue_available`, so idle workers claim again at once.
+
+**Bulk actions: the id bound and skipped rows.** `cancel_matching` and
+`replay_matching` first insert their audit row with `max_task_id`, the highest
+committed task id at that moment. Every batch takes only rows with
+`id ≤ max_task_id`, so a producer that keeps enqueuing the same name cannot keep
+the action running forever; pause the queue or fix the producer to stop new
+arrivals. A row with a lower id that commits later (a producer transaction that
+was still open) can still be included. Each batch locks its rows
+`FOR UPDATE SKIP LOCKED`, so two bulk actions on the same name split the work,
+and a row locked by a handler or a claim is skipped. A batch can also come back
+short when a row it found changed before it locked it. A short batch ends the
+call with `more_remain = false`, so `more_remain = false` does not prove that no
+matching task is left: count again.
 
 ## Crash Recovery
 
@@ -255,7 +320,15 @@ The integration suite covers every §27 requirement. See the table in
 heartbeats while a handler holds the row lock, replay followed by a reclaim,
 notification and next-due wakeups, shutdown without detached work, and shutdown
 release: an interrupted handler, a handler still running at `shutdown_timeout`,
-and a release blocked behind a dropped transaction's row lock.
+and a release blocked behind a dropped transaction's row lock. For admin
+actions it covers a cancel against a running worker
+(`cancel::worker_drops_cancelled_handler_and_counts_cancellation`) and a held row
+lock (`cancel::cancel_locked_row_is_busy`), bulk actions racing producers and
+each other (`bulk::cancel_matching_ignores_tasks_enqueued_after_it_started`,
+`bulk::concurrent_bulk_cancels_split_the_work`), and pause against claims,
+retries and wakeups (`tests/pause.rs`). The race between a cancel's snapshot and
+a claim's commit is argued above, not tested: it cannot be forced
+deterministically.
 
 Not yet automated:
 

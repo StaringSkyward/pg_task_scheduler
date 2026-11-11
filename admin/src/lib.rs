@@ -1,8 +1,4 @@
-//! Admin UI and JSON API for `pg_task_scheduler`.
-//!
-//! [`router`] serves every route behind two checks: a request without an [`Operator`]
-//! extension gets 401 (GET included), and a cross-site POST gets 403 (see `csrf`).
-//! Authentication is any tower layer that inserts [`Operator`]; [`auth`] ships two.
+#![doc = include_str!("../README.md")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,8 +106,9 @@ struct AppState<P> {
 }
 
 /// The admin routes. Every route requires an [`Operator`] (401 without one) and every
-/// POST passes the CSRF check (403). Add authentication with [`auth::with_basic_auth`],
-/// [`auth::with_trusted_header`], or any layer that inserts [`Operator`].
+/// request other than GET, HEAD and OPTIONS passes the CSRF check (403). Add
+/// authentication with [`auth::with_basic_auth`], [`auth::with_trusted_header`], or any
+/// layer that inserts [`Operator`].
 pub fn router<P: SchedulerPool>(pool: P, config: AdminConfig) -> Router {
     let public_origin = config.public_origin.clone();
     let state = AppState {
