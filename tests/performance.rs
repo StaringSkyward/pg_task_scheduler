@@ -61,8 +61,20 @@ async fn next_due_in_uses_due_index() {
     .map(|row| row.line)
     .collect::<Vec<_>>()
     .join("\n");
+    // Each queue's probe is a Limit over an index scan whose Index Cond fixes `queue`;
+    // `queue` as a mere Filter (or `= ANY`) would scan every queued row of the queues.
+    let lines: Vec<&str> = plan.lines().collect();
+    let scan = lines
+        .iter()
+        .position(|l| l.contains("Index Scan using queue_tasks_due_idx"));
     assert!(
-        plan.contains("Index Scan using queue_tasks_due_idx") && !plan.contains("Seq Scan"),
+        !plan.contains("Seq Scan")
+            && scan.is_some_and(|i| {
+                i > 0
+                    && lines[i - 1].contains("Limit")
+                    && lines[i + 1].contains("Index Cond:")
+                    && lines[i + 1].contains("(queue = ")
+            }),
         "unexpected query plan:\n{plan}"
     );
     db.cleanup().await;
