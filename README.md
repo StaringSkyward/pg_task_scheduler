@@ -213,6 +213,26 @@ Set the orchestrator's grace period (for example Kubernetes
 starts again from the beginning, so make long tasks resumable: keep their
 progress keyed by `task_key`.
 
+### Worker registry
+
+Each worker keeps a row in `queue_workers`, for display only: claims, ownership
+and health never read it. The row holds its label, status (`starting`,
+`healthy`, `degraded` or `stopping`), last error, task names, and per queue the
+limit, handlers in use, whether the queue is paused, and when one of its
+dispatches there last ended. The worker writes it at start and every
+`registry_interval` (default 15 s), marks it `stopping` when shutdown begins,
+and deletes it once the drain ends. A stalled database adds at most 1 s to
+shutdown for these writes. `store::workers` lists the rows, live workers
+first. A row not written for 3 × `registry_interval` reads as `lost` (for
+example, the process was killed), and maintenance deletes rows not written for
+24 h. A failed registry write is logged and counted in
+`pg_task_scheduler_registry_failures_total`; it never affects claiming or
+health.
+
+`.label("eu-1")` names the worker in the registry. It defaults to the
+`HOSTNAME` environment variable when that is set and non-empty, and otherwise
+the worker id is shown.
+
 ### PostgreSQL-contained work
 
 When a task's whole effect is database writes, do the writes and the completion
@@ -445,6 +465,7 @@ them:
 | `pg_task_scheduler_leases_expired_total` | counter | (none; reaper) |
 | `pg_task_scheduler_tasks_materialized_total` | counter | (none; `cron` feature only) |
 | `pg_task_scheduler_cleanup_deleted_total` | counter | `kind` = `task` or `outbox` |
+| `pg_task_scheduler_registry_failures_total` | counter | (none; a failed worker registry write or prune) |
 | `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name`, `queue` (claim time − `due_at`, database clock) |
 | `pg_task_scheduler_task_duration_seconds` | histogram | `task_name` |
 | `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `release`, `reap`, `cleanup` or `materialize` (`materialize` is `cron` only) |

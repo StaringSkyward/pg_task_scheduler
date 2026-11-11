@@ -7,6 +7,7 @@ mod maintenance;
 #[cfg(feature = "cron")]
 mod materialize;
 mod transitions;
+mod workers;
 
 #[doc(hidden)]
 pub use admin::REPLAY_BATCH;
@@ -25,4 +26,8 @@ pub use materialize::materialize_due_jobs;
 pub use transitions::{
     complete, complete_with_outbox, completed_by, fail_permanently, heartbeat, lease_status,
     lock_owned, release, retry,
+};
+pub use workers::{
+    QueueSlots, WorkerQueueView, WorkerRegistration, WorkerStatus, WorkerView, prune_workers,
+    remove_worker, upsert_worker, workers,
 };

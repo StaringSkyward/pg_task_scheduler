@@ -58,3 +58,18 @@ CREATE TABLE queue_pauses (
     reason    TEXT NOT NULL,
     paused_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 5. worker registry: display-only, never read by claims or ownership. Each worker upserts its
+-- row every registry_interval and deletes it after a clean shutdown. lost_after is
+-- now() + 3 × registry_interval at each write, so readers need no worker config.
+CREATE TABLE queue_workers (
+    worker_id    TEXT PRIMARY KEY,
+    label        TEXT,
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lost_after   TIMESTAMPTZ NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('starting', 'healthy', 'degraded', 'stopping')),
+    last_error   TEXT,
+    queues       JSONB NOT NULL,
+    task_names   TEXT[] NOT NULL
+);

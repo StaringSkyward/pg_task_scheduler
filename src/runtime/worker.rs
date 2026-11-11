@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -29,6 +29,10 @@ const MIN_WAIT: Duration = Duration::from_millis(10);
 /// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on each shutdown-time registry write (`stopping`, then the delete), so a stalled
+/// database adds at most 1 s to shutdown.
+const REGISTRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// The shutdown phases every dispatch watches.
 #[derive(Clone)]
 struct Shutdown {
@@ -39,9 +43,12 @@ struct Shutdown {
 }
 
 /// A served queue and the permits that limit its running handlers.
+#[derive(Clone)]
 struct WorkerQueue {
     name: QueueName,
     permits: Arc<Semaphore>,
+    /// When one of its dispatches last ended, for the registry.
+    last_finished: Arc<Mutex<Option<Instant>>>,
 }
 
 impl<P: SchedulerPool> Scheduler<P> {
@@ -65,6 +72,7 @@ impl<P: SchedulerPool> Scheduler<P> {
             .map(|(name, limit)| WorkerQueue {
                 name: name.clone(),
                 permits: Arc::new(Semaphore::new(limit.get())),
+                last_finished: Arc::default(),
             })
             .collect();
         let mut in_flight = JoinSet::new();
@@ -79,10 +87,19 @@ impl<P: SchedulerPool> Scheduler<P> {
         };
         let mut failures = 0u64;
         // A child token: cancelled together with `cancel`, or by the guard if this future is
-        // dropped (aborted, or a failed `try_join!` sibling) so maintenance never outlives it.
-        let maintenance_token = cancel.child_token();
-        let _stop_maintenance = maintenance_token.clone().drop_guard();
-        let maintenance = tokio::spawn(maintain(pool.clone(), config.clone(), maintenance_token));
+        // dropped (aborted, or a failed `try_join!` sibling) so maintenance and the registry
+        // never outlive it.
+        let background = cancel.child_token();
+        let _stop_background = background.clone().drop_guard();
+        let maintenance = tokio::spawn(maintain(pool.clone(), config.clone(), background.clone()));
+        let registration = tokio::spawn(keep_registered(
+            pool.clone(),
+            config.clone(),
+            names.clone(),
+            queues.clone(),
+            health.0.subscribe(),
+            background,
+        ));
         #[cfg(feature = "cron")]
         let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
@@ -181,6 +198,16 @@ impl<P: SchedulerPool> Scheduler<P> {
             }
         }
         in_flight.shutdown().await;
+        // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`, so its `stopping` write cannot
+        // land after the delete below.
+        if let Err(error) = registration.await {
+            tracing::error!(%error, "registry task panicked");
+        }
+        registry_bounded(async {
+            let mut conn = acquire(&pool).await?;
+            store::remove_worker(&mut conn, &config.worker_id).await
+        })
+        .await;
         Ok(()) // `health` reports Stopped as it drops
     }
 }
@@ -336,7 +363,7 @@ async fn claim_cycle<P: SchedulerPool>(
                 .get(&task.task_name)
                 .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
             let deadline = sent + config.lease_duration;
-            in_flight.spawn(dispatch(
+            let run = dispatch(
                 pool.clone(),
                 config.clone(),
                 handler,
@@ -344,7 +371,13 @@ async fn claim_cycle<P: SchedulerPool>(
                 deadline,
                 permit,
                 shutdown.clone(),
-            ));
+            );
+            let last_finished = queue.last_finished.clone();
+            in_flight.spawn(async move {
+                run.await;
+                *last_finished.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Instant::now());
+            });
         }
         // A full batch only means "loop now" if this queue can still take more.
         full |= full_batch && queue.permits.available_permits() > 0;
@@ -677,6 +710,9 @@ async fn maintenance_pass<P: SchedulerPool>(
     config: &Config,
 ) -> Result<(), SchedulerError> {
     let mut conn = acquire(pool).await?;
+    if let Err(error) = store::prune_workers(&mut conn).await {
+        registry_failed(&error);
+    }
     let batch = config.retention.batch_size.get();
     let mut cleaning = true;
     loop {
@@ -703,6 +739,83 @@ async fn maintenance_pass<P: SchedulerPool>(
             return Ok(());
         }
     }
+}
+
+/// Keep this worker's display-only registry row (§5.2): upsert at once and every
+/// `registry_interval`. When `cancel` fires, write `stopping` once, within
+/// `REGISTRY_SHUTDOWN_TIMEOUT`, and return. Every other await races `cancel`, so a stalled
+/// pool never holds shutdown.
+async fn keep_registered<P: SchedulerPool>(
+    pool: P,
+    config: Arc<Config>,
+    task_names: Vec<String>,
+    queues: Vec<WorkerQueue>,
+    health: watch::Receiver<WorkerHealth>,
+    cancel: CancellationToken,
+) {
+    let registration = |stopping: bool| {
+        let health = health.borrow();
+        let status = match (stopping, health.status) {
+            (true, _) | (_, HealthStatus::Stopped) => store::WorkerStatus::Stopping,
+            (_, HealthStatus::Starting) => store::WorkerStatus::Starting,
+            (_, HealthStatus::Healthy) => store::WorkerStatus::Healthy,
+            (_, HealthStatus::Degraded) => store::WorkerStatus::Degraded,
+        };
+        let now = Instant::now();
+        store::WorkerRegistration {
+            worker_id: config.worker_id.clone(),
+            label: config.label.clone(),
+            status,
+            last_error: health.last_error.clone(),
+            queues: config
+                .queues
+                .iter()
+                .zip(&queues)
+                .map(|((_, limit), q)| store::QueueSlots {
+                    name: q.name.clone(),
+                    limit: limit.get(),
+                    in_use: limit.get().saturating_sub(q.permits.available_permits()),
+                    finished_ago: q
+                        .last_finished
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .map(|at| now.saturating_duration_since(at)),
+                })
+                .collect(),
+            task_names: task_names.clone(),
+            lost_after: config.registry_interval.saturating_mul(3),
+        }
+    };
+    let upsert = async |reg: store::WorkerRegistration| {
+        let mut conn = acquire(&pool).await?;
+        store::upsert_worker(&mut conn, &reg).await
+    };
+    let mut tick = tokio::time::interval(config.registry_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    while cancel.run_until_cancelled(tick.tick()).await.is_some() {
+        if let Some(Err(error)) = cancel
+            .run_until_cancelled(upsert(registration(false)))
+            .await
+        {
+            registry_failed(&error);
+        }
+    }
+    registry_bounded(upsert(registration(true))).await;
+}
+
+/// A shutdown-time registry write, bounded by `REGISTRY_SHUTDOWN_TIMEOUT`.
+async fn registry_bounded(write: impl Future<Output = Result<(), SchedulerError>>) {
+    match tokio::time::timeout(REGISTRY_SHUTDOWN_TIMEOUT, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => registry_failed(&error),
+        Err(elapsed) => registry_failed(&elapsed),
+    }
+}
+
+/// Registry failures are logged and counted; they never touch health or claiming.
+fn registry_failed(error: &dyn std::fmt::Display) {
+    metrics::counter!("pg_task_scheduler_registry_failures_total").increment(1);
+    tracing::warn!(%error, "worker registry write failed");
 }
 
 /// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)` (§11.2). Saturates
