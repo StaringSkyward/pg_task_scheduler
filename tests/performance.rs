@@ -39,15 +39,20 @@ async fn claim_uses_claim_index() {
 
 #[tokio::test]
 async fn next_due_in_uses_due_index() {
+    // The query below mirrors `next_due_in` in src/store/claim.rs; keep them in step.
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     conn.batch_execute("SET enable_seqscan = off")
         .await
         .unwrap();
     let plan = diesel::sql_query(
-        "EXPLAIN SELECT min(due_at) - now() AS wait FROM queue_tasks \
-         WHERE status = 'queued' AND queue = 'default' \
-           AND attempts < max_attempts AND task_name = ANY('{email}')",
+        "EXPLAIN SELECT min(next.due_at) - now() AS wait \
+         FROM unnest('{default,bulk}'::text[]) AS q(queue) \
+         CROSS JOIN LATERAL ( \
+             SELECT min(due_at) AS due_at FROM queue_tasks \
+             WHERE status = 'queued' AND queue = q.queue \
+               AND attempts < max_attempts AND task_name = ANY('{email}') \
+         ) AS next",
     )
     .get_results::<PlanLine>(&mut conn)
     .await
@@ -57,7 +62,7 @@ async fn next_due_in_uses_due_index() {
     .collect::<Vec<_>>()
     .join("\n");
     assert!(
-        plan.contains("queue_tasks_due_idx") || plan.contains("queue_tasks_claim_idx"),
+        plan.contains("Index Scan using queue_tasks_due_idx") && !plan.contains("Seq Scan"),
         "unexpected query plan:\n{plan}"
     );
     db.cleanup().await;
