@@ -36,7 +36,8 @@ pub use overview::{
 };
 #[doc(hidden)]
 pub use overview::{
-    OVERVIEW_COUNTS, OVERVIEW_DEAD, OVERVIEW_DONE, OVERVIEW_FAILED_ATTEMPTS, OVERVIEW_QUEUES,
+    DEAD_GROUPS, NO_HANDLER, OVERVIEW_COUNTS, OVERVIEW_DEAD, OVERVIEW_DONE,
+    OVERVIEW_FAILED_ATTEMPTS, OVERVIEW_QUEUES, OVERVIEW_RUNNING,
 };
 pub use transitions::{
     complete, complete_with_outbox, completed_by, fail_permanently, heartbeat, lease_status,

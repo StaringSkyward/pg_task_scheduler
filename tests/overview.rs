@@ -190,3 +190,20 @@ async fn overview_lists_paused_and_registered_queues_without_tasks() {
     assert_eq!((o.paused.len(), o.workers.len()), (1, 1));
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn overview_queue_set_covers_every_queued_queue() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, priority) \
+         SELECT q || g, 'a', q, g FROM unnest(array['b-q', 'a-q', 'd-q', 'c-q']) q, \
+                generate_series(1, 4) g",
+    )
+    .await;
+    let o = overview(&db, &OverviewParams::default()).await;
+    let names: Vec<_> = o.queues.iter().map(|q| q.queue.as_str()).collect();
+    assert_eq!(names, ["a-q", "b-q", "c-q", "d-q"]);
+    assert!(o.queues.iter().all(|q| q.queued == c(4, false)));
+    db.cleanup().await;
+}

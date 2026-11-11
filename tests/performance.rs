@@ -340,7 +340,7 @@ async fn overview_plan(
 }
 
 #[tokio::test]
-async fn overview_distinct_queues_skip_scan_uses_claim_index() {
+async fn overview_distinct_queues_skip_scan_uses_due_index() {
     // The planner prefers the smaller queued-by-(queue, due_at) index to the claim index; both
     // lead with `queue` among queued rows. EXPLAIN omits the recursive step's subplan, so
     // only the anchor scan is asserted here.
@@ -396,4 +396,51 @@ async fn overview_failed_attempts_uses_failed_attempts_index() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn overview_running_uses_lease_index() {
+    overview_plan(
+        store::OVERVIEW_RUNNING,
+        "queue_tasks_expired_lease_idx",
+        |q| q,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn overview_dead_groups_use_failed_index() {
+    use diesel::pg::data_types::PgInterval;
+    use diesel::sql_types::{BigInt, Interval};
+    overview_plan(store::DEAD_GROUPS, "queue_tasks_failed_idx", |q| {
+        q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
+            .bind::<BigInt, _>(10_000_i64)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn overview_no_handler_probe_is_a_limited_due_index_scan() {
+    use diesel::sql_types::{Array, BigInt, Text};
+    let db = TestDb::new().await;
+    let mut conn = seqscan_off_conn(&db).await;
+    let rows = diesel::sql_query(format!("EXPLAIN {}", store::NO_HANDLER))
+        .bind::<Array<Text>, _>(vec!["default"])
+        .bind::<BigInt, _>(100_i64)
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    let plan = browse_plan(rows, "queue_tasks_due_idx");
+    // The Limit sits directly on the index scan: no Sort over the queue's due rows. (Sorting
+    // the at most `probe` limited rows to de-duplicate names is fine, so look at the child.)
+    let lines: Vec<&str> = plan.lines().collect();
+    let limit = lines
+        .iter()
+        .position(|l| l.contains("Limit"))
+        .expect("Limit");
+    assert!(
+        lines[limit + 1].contains("Index"),
+        "Limit not directly over the index scan:\n{plan}"
+    );
+    db.cleanup().await;
 }

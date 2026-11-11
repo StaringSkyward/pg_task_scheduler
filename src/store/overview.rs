@@ -116,7 +116,8 @@ pub const OVERVIEW_COUNTS: &str = "\
     CROSS JOIN LATERAL (SELECT min(due_at) AS due_at FROM queue_tasks \
         WHERE status = 'queued' AND queue = u.queue) AS m";
 
-const OVERVIEW_RUNNING: &str =
+#[doc(hidden)]
+pub const OVERVIEW_RUNNING: &str =
     "SELECT queue, count(*) AS n FROM queue_tasks WHERE status = 'running' GROUP BY queue";
 
 // Newest `count_cap` finished rows in the window, by queue. Binds: $1 window, $2 count_cap.
@@ -138,7 +139,8 @@ pub const OVERVIEW_DONE: &str = window_scan!("done");
 pub const OVERVIEW_DEAD: &str = window_scan!("dead");
 
 // Binds: $1 window, $2 count_cap.
-const DEAD_GROUPS: &str = "\
+#[doc(hidden)]
+pub const DEAD_GROUPS: &str = "\
     SELECT task_name, coalesce(last_error, '') AS error, count(*) AS n FROM (\
         SELECT task_name, last_error FROM queue_tasks \
         WHERE status = 'dead' AND completed_at > now() - $1 \
@@ -153,7 +155,8 @@ pub const OVERVIEW_FAILED_ATTEMPTS: &str = "\
     JOIN queue_tasks t ON t.id = a.task_id GROUP BY 1, 2";
 
 // Binds: $1 queue names, $2 probe size: the oldest due rows of each.
-const NO_HANDLER: &str = "\
+#[doc(hidden)]
+pub const NO_HANDLER: &str = "\
     SELECT u.queue, s.task_name FROM unnest($1::text[]) AS u(queue) \
     CROSS JOIN LATERAL (SELECT DISTINCT task_name FROM (SELECT task_name FROM queue_tasks \
         WHERE status = 'queued' AND queue = u.queue AND due_at <= now() \
@@ -337,13 +340,10 @@ async fn no_handler(
             .map(|r| r.task_name.clone())
             .collect();
         task_names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        if let Some(r) = rows.iter().find(|r| r.queue.as_str() == queue)
-            && !task_names.is_empty()
-        {
-            out.push(NoHandler {
-                queue: r.queue.clone(),
-                task_names,
-            });
+        if !task_names.is_empty() {
+            let queue = QueueName::try_from(queue.as_str())
+                .map_err(|_| SchedulerError::Invariant("invalid queue name"))?;
+            out.push(NoHandler { queue, task_names });
         }
     }
     Ok(out)
