@@ -41,6 +41,8 @@ pub struct SchedulerBuilder<P: SchedulerPool> {
     pool: P,
     registry: Registry,
     config: Config,
+    /// `(T::NAME, T::QUEUE)` of typed registrations, for the unserved-queue warning.
+    typed_queues: Vec<(&'static str, QueueName)>,
 }
 
 macro_rules! setters {
@@ -118,18 +120,30 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
     }
 
     /// Register a handler for `T::NAME` taking `T::Args`.
-    pub fn register_task<T, F, Fut>(self, handler: F) -> Result<Self, RegisterError>
+    pub fn register_task<T, F, Fut>(mut self, handler: F) -> Result<Self, RegisterError>
     where
         T: Task,
         F: Fn(TaskContext, T::Args) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
-        self.register::<T::Args, _, _>(T::NAME, handler)
+        let queue = QueueName::try_from(T::QUEUE)?;
+        self = self.register::<T::Args, _, _>(T::NAME, handler)?;
+        self.typed_queues.push((T::NAME, queue));
+        Ok(self)
     }
 
     pub fn build(mut self) -> Result<Scheduler<P>, SchedulerError> {
         if self.config.queues.is_empty() {
             self.config.queues.push((QueueName::default(), SIXTEEN));
+        }
+        for (task_name, queue) in &self.typed_queues {
+            if !self.config.queues.iter().any(|(q, _)| q == queue) {
+                tracing::warn!(
+                    task_name,
+                    queue = queue.as_str(),
+                    "task's default queue is not served by this worker; tasks enqueued with the default queue will not run here"
+                );
+            }
         }
         let c = &self.config;
         let r = &c.retention;
@@ -198,6 +212,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         SchedulerBuilder {
             pool,
             registry: Registry::new(),
+            typed_queues: Vec::new(),
             config: Config {
                 worker_id: WorkerId::generate(),
                 queues: Vec::new(),
@@ -312,6 +327,24 @@ mod tests {
     fn builder_rejects_invalid_name() {
         let err = Scheduler::builder(FakePool)
             .register::<serde_json::Value, _, _>("", |_c, _a| async { Ok(()) })
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, RegisterError::Name(IdentifierError::Empty)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn register_task_rejects_invalid_task_queue() {
+        struct BadQueue;
+        impl Task for BadQueue {
+            const NAME: &'static str = "bad_queue";
+            const QUEUE: &'static str = "";
+            type Args = serde_json::Value;
+        }
+        let err = Scheduler::builder(FakePool)
+            .register_task::<BadQueue, _, _>(|_c, _a| async { Ok(()) })
             .err()
             .unwrap();
         assert!(
