@@ -315,15 +315,17 @@ async fn replay_requeues_dead_task_and_audits() {
     assert_eq!(t.completed_at, None);
     let n = db
         .scalar(&format!(
-            "SELECT count(*) AS n FROM queue_task_replays WHERE task_id = {} \
-             AND operator = 'ops@example' AND reason = 'fixed config' AND lock_token = {} \
-             AND task_key = 'k'",
-            c.lease.task_id.0, t.lock_token.0
+            "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' AND task_id = {} \
+             AND operator = 'ops@example' AND reason = 'fixed config' AND affected = 1 \
+             AND task_name = 'email' AND queue = 'default' \
+             AND id = {}",
+            c.lease.task_id.0,
+            t.admin_action_id.unwrap()
         ))
         .await;
     assert_eq!(n, 1);
     assert_eq!(
-        db.scalar("SELECT count(*) AS n FROM queue_task_replays")
+        db.scalar("SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay'")
             .await,
         1
     );
@@ -343,7 +345,7 @@ async fn replay_refuses_non_dead_task() {
             .unwrap()
     );
     assert_eq!(
-        db.scalar("SELECT count(*) AS n FROM queue_task_replays")
+        db.scalar("SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay'")
             .await,
         0
     );

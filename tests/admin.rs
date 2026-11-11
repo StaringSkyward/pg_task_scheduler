@@ -216,7 +216,7 @@ async fn replay_route_requeues_dead_task_and_409s_otherwise() {
     assert_eq!(t.attempts, 0);
     let n = db
         .scalar(&format!(
-            "SELECT count(*) AS n FROM queue_task_replays WHERE task_id = {} \
+            "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' AND task_id = {} \
              AND operator = 'ops@example' AND reason = 'fixed config'",
             id.0
         ))

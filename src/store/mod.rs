@@ -1,5 +1,6 @@
 //! Store operations on the queue tables (added task by task).
 
+mod admin;
 mod claim;
 mod inspect;
 mod maintenance;
@@ -7,6 +8,7 @@ mod maintenance;
 mod materialize;
 mod transitions;
 
+pub use admin::{AdminAction, AdminActionKind, admin_actions, task_actions};
 pub use claim::{claim, next_due_in};
 pub use inspect::{attempts, queue_stats, task};
 #[doc(hidden)]

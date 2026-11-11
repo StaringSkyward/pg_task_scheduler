@@ -37,8 +37,8 @@ pub enum AttemptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {kind}: {value:?}")]
 pub struct ParseEnumError {
-    kind: &'static str,
-    value: String,
+    pub(crate) kind: &'static str,
+    pub(crate) value: String,
 }
 
 macro_rules! text_enum {
@@ -60,6 +60,7 @@ macro_rules! text_enum {
         }
     };
 }
+pub(crate) use text_enum;
 
 text_enum!(TaskStatus, "task status", {
     Queued => "queued", Running => "running", Done => "done", Dead => "dead",
@@ -122,6 +123,8 @@ pub struct TaskView {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// The admin action that last cancelled or replayed this task.
+    pub admin_action_id: Option<i64>,
 }
 
 /// One `queue_task_attempts` row.

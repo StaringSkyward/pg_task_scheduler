@@ -39,9 +39,9 @@ Include it in the host application's migrations before starting workers:
 
 | File | Contents |
 | --- | --- |
-| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox`, `queue_task_replays` |
+| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
-| `migrations/0003_admin/up.sql` | `cancelled` task status and its retention index; later admin tables |
+| `migrations/0003_admin/up.sql` | `cancelled` task status and its retention index; `queue_admin_actions` (replaces `queue_task_replays`); later admin tables |
 
 ## Enqueue
 
@@ -362,8 +362,8 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
   batches. Attempt history is deleted with its task. Each round reaps one batch
   before it deletes one, so a retention backlog never delays lease recovery.
 - **Replay:** `queue::replay(conn, task_id, operator, reason)` moves a `dead`
-  task back to `queued` with the same `task_key`, resets `attempts`, and bumps
-  `lock_token`. Each replay is recorded in `queue_task_replays`. Enqueue a new
+  or `cancelled` task back to `queued` with the same `task_key`, resets `attempts`, and bumps
+  `lock_token`. Each replay is recorded in `queue_admin_actions` and linked from the task's `admin_action_id`. Enqueue a new
   `task_key` instead if you want a new external effect.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
   (counts by status, due count, oldest due age, depth by queue, name and

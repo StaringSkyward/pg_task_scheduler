@@ -46,6 +46,23 @@ pub struct TestDb {
 
 impl TestDb {
     pub async fn new() -> Self {
+        let db = Self::bare().await;
+        db.install(include_str!(
+            "../../migrations/0001_create_queue_tables/up.sql"
+        ))
+        .await;
+        db.install(include_str!("../../migrations/0003_admin/up.sql"))
+            .await;
+        #[cfg(feature = "cron")]
+        db.install(include_str!(
+            "../../migrations/0002_create_schedule_tables/up.sql"
+        ))
+        .await;
+        db
+    }
+
+    /// A schema with nothing installed; pair with [`TestDb::install`].
+    pub async fn bare() -> Self {
         let url = database_url();
         let schema = unique_schema();
 
@@ -85,21 +102,13 @@ impl TestDb {
             AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
         let pool = Pool::builder(manager).build().expect("pool");
 
-        // Install the complete schema into this test's isolated namespace.
-        let up = include_str!("../../migrations/0001_create_queue_tables/up.sql");
-        let mut conn = pool.get().await.expect("conn");
-        conn.batch_execute(up).await.expect("install schema");
-        conn.batch_execute(include_str!("../../migrations/0003_admin/up.sql"))
-            .await
-            .expect("install admin schema");
-        #[cfg(feature = "cron")]
-        conn.batch_execute(include_str!(
-            "../../migrations/0002_create_schedule_tables/up.sql"
-        ))
-        .await
-        .expect("install schedule schema");
-
         TestDb { pool, schema }
+    }
+
+    /// Run one migration's SQL in the test schema.
+    pub async fn install(&self, sql: &str) {
+        let mut conn = self.pool.get().await.expect("conn");
+        conn.batch_execute(sql).await.expect("install migration");
     }
 
     pub async fn cleanup(&self) {

@@ -201,22 +201,29 @@ pub async fn enqueue<T: Task>(
     .into_enqueued(false)
 }
 
-// §18 replay; the audit row carries the new token. No FK, so it outlives retention.
-const REPLAY: &str = r#"
-    WITH replayed AS (
-        UPDATE queue_tasks
-        SET status = 'queued', attempts = 0, due_at = now(), locked_by = NULL,
-            lock_token = lock_token + 1, locked_until = NULL, last_error = NULL,
-            completed_at = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'dead'
-        RETURNING id, task_key, lock_token
+// §18 replay; the audit row is linked from the task. No FK, so it outlives retention.
+#[doc(hidden)]
+pub const REPLAY: &str = r#"
+    WITH target AS (
+        SELECT id, task_name, queue FROM queue_tasks
+        WHERE id = $1 AND status IN ('dead', 'cancelled')
+        FOR UPDATE
+    ), act AS (
+        INSERT INTO queue_admin_actions
+            (action, task_id, task_name, queue, affected, operator, reason)
+        SELECT 'replay', id, task_name, queue, 1, $2, $3 FROM target
+        RETURNING id
     )
-    INSERT INTO queue_task_replays (task_id, task_key, lock_token, operator, reason)
-    SELECT id, task_key, lock_token, $2, $3 FROM replayed
+    UPDATE queue_tasks t
+    SET status = 'queued', attempts = 0, due_at = now(), locked_by = NULL,
+        lock_token = lock_token + 1, locked_until = NULL, last_error = NULL,
+        completed_at = NULL, updated_at = now(), admin_action_id = act.id
+    FROM target, act
+    WHERE t.id = target.id
 "#;
 
-/// Requeue a dead task with a fresh attempt budget and audit it. `false` if the task is missing
-/// or not dead. Keeps the same `task_key`; use a new key for a genuinely new effect (§18).
+/// Requeue a dead or cancelled task with a fresh attempt budget and audit it. `false` if the task
+/// is missing or neither. Keeps the same `task_key`; use a new key for a genuinely new effect (§18).
 pub async fn replay(
     conn: &mut AsyncPgConnection,
     id: TaskId,

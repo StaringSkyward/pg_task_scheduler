@@ -19,3 +19,28 @@ DROP INDEX queue_tasks_terminal_cleanup_idx;
 CREATE INDEX queue_tasks_terminal_cleanup_idx
     ON queue_tasks (completed_at ASC, id ASC)
     WHERE status IN ('done', 'dead', 'cancelled');
+
+-- 2. admin action audit: one row per operator action; replaces queue_task_replays.
+-- No FKs: the audit outlives task retention.
+CREATE TABLE queue_admin_actions (
+    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    action            TEXT NOT NULL CHECK (action IN ('replay', 'cancel', 'pause', 'resume')),
+    task_id           BIGINT,
+    task_name         TEXT,
+    queue             TEXT,
+    last_error_filter TEXT,
+    max_task_id       BIGINT,
+    affected          BIGINT NOT NULL DEFAULT 0,
+    operator          TEXT NOT NULL,
+    reason            TEXT NOT NULL,
+    at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX queue_admin_actions_task_idx
+    ON queue_admin_actions (task_id) WHERE task_id IS NOT NULL;
+
+ALTER TABLE queue_tasks ADD COLUMN admin_action_id BIGINT;
+
+INSERT INTO queue_admin_actions (action, task_id, affected, operator, reason, at)
+SELECT 'replay', task_id, 1, operator, reason, replayed_at
+FROM queue_task_replays ORDER BY id;
+DROP TABLE queue_task_replays;
