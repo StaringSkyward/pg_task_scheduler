@@ -80,7 +80,9 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         crash_retry_delay: Duration;
         /// Retention of terminal rows (default [`Retention::default`]).
         retention: Retention;
-        /// How long shutdown waits for running handlers before aborting them (default 25 s).
+        /// Shutdown cancels every handler's `ctx.cancellation`, then waits this long for handlers
+        /// to return; those still running are released, for up to 5 s more, then aborted
+        /// (default 25 s).
         shutdown_timeout: Duration;
     }
 
