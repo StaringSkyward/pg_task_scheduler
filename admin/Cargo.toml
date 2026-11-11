@@ -11,9 +11,10 @@ cron = ["pg_task_scheduler/cron"]
 [dependencies]
 pg_task_scheduler = { path = "..", version = "0.1.0", default-features = false }
 argon2 = "=0.6.0"
+askama = "=0.12.1"
 axum = "0.7"
 base64 = "=0.22.1"
-chrono = { version = "0.4", default-features = false, features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 diesel = { version = "2.3", default-features = false, features = ["postgres_backend"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
 serde = { version = "1", features = ["derive"] }

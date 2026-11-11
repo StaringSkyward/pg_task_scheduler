@@ -10,15 +10,17 @@ use std::time::Duration;
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::routing::get;
 use axum::{Router, middleware};
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::store::OverviewParams;
 
 mod api;
 pub mod auth;
+mod cache;
 mod csrf;
 pub mod db;
+pub mod health;
+mod pages;
 
 /// The authenticated identity, inserted as a request extension by the auth layer.
 /// Audited actions record it as their operator.
@@ -102,6 +104,7 @@ impl Default for AdminConfig {
 struct AppState<P> {
     pool: P,
     config: Arc<AdminConfig>,
+    cache: Arc<cache::OverviewCache>,
 }
 
 /// The admin routes. Every route requires an [`Operator`] (401 without one) and every
@@ -111,11 +114,11 @@ pub fn router<P: SchedulerPool>(pool: P, config: AdminConfig) -> Router {
     let public_origin = config.public_origin.clone();
     let state = AppState {
         pool,
+        cache: Arc::new(cache::OverviewCache::new(config.overview_cache)),
         config: Arc::new(config),
     };
-    // Placeholder until the overview page lands.
     Router::new()
-        .route("/", get(|| async { "ok" }))
+        .merge(pages::routes())
         .merge(api::routes())
         // The last layer added runs first: the operator check, then CSRF.
         .route_layer(middleware::from_fn_with_state(public_origin, csrf::guard))
