@@ -57,9 +57,11 @@ Indexes follow §4.2, with `queue` as the leading column of the claim and due in
 | `queue_tasks_failed_name_idx (task_name, status, completed_at DESC, id DESC) WHERE dead/cancelled` | bulk replay; Failed and Cancelled lists filtered by name |
 
 The last two are partial on `dead`/`cancelled`, so enqueue, claim and completion
-never maintain them. `queue_task_attempts_failed_idx (finished_at) WHERE outcome
-IN (retry, dead, lease_expired)` serves the overview's failed-attempt groups and
-is written only when an attempt fails.
+never maintain them. `queue_task_attempts` gets no new index: closing an attempt
+sets `finished_at`, `outcome` and `error`, and an index on any of them would make
+every close a non-HOT update that writes all of the table's indexes
+(`performance::attempt_close_stays_hot_eligible`). The overview's failed-attempt
+groups read the newest attempts through `queue_task_attempts_started_idx`.
 
 ### `queue_task_attempts` (§4.3)
 
@@ -297,8 +299,10 @@ set per task at enqueue (default 3).
   has an EXPLAIN test in `tests/performance.rs`.
 - A pause adds one primary-key probe of `queue_pauses` to every claim; the
   registry adds one upsert per worker every `registry_interval`. Bulk cancel by
-  name scans the queue's queued rows, because an index on `task_name` there
-  would tax every enqueue.
+  name reads every queued and running row through their partial indexes (its
+  status test is written as `OR`, which matches them; `IN` would scan every
+  retained row) and filters by name, because an index on `task_name` there would
+  tax every enqueue.
 - The claim index is the spec's default with `queue` as its leading column. Benchmark it against realistic
   scheduled-task and priority distributions before tuning (§4.2).
 

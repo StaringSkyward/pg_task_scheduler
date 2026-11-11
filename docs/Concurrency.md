@@ -233,7 +233,10 @@ retention configuration that would.
 With the `cron` feature, every scheduler also materializes due schedules, at
 most once per `max_poll_interval`. It locks one schedule row with `SKIP LOCKED`,
 inserts the occurrence with a deterministic `task_key`, and advances the cursor
-in one transaction.
+in one transaction. That transaction sets `idle_in_transaction_session_timeout`
+to 30 s, so one cut off by shutdown and left open on a pooled connection is
+ended by the server instead of holding the schedule row, which other schedulers
+skip, until the connection is recycled.
 
 ## Ordering and Fairness
 

@@ -99,7 +99,9 @@ of the design spec; a bare "§N.M" is an entry in this document.
   the field ignored; the audit row records the authenticated name
   (`api::replay_route_requeues_dead_task_and_409s_otherwise`,
   `auth::trusted_header_sets_operator`). Replay returns 204, or 409 with
-  `task is not dead or cancelled, or does not exist`.
+  `task is not dead or cancelled, or does not exist`. Like the forms, it trims
+  the reason and answers 400 `a reason is required` when it is blank
+  (`api::replay_route_requires_reason`).
 
 ### 1.5 `queue_admin_actions` replaces `queue_task_replays`
 
@@ -328,6 +330,22 @@ of the design spec; a bare "§N.M" is an entry in this document.
   proxy in front. With `bind = "0.0.0.0:…"` and basic auth, the warning appears
   at startup.
 
+### 2.11 No page can be framed
+
+- **Source:** **Ledger ruling (final review, minor 6)**.
+- **Decision:** One `map_response` layer sets `X-Frame-Options: DENY` and
+  `Content-Security-Policy: frame-ancestors 'none'`. `router(..)` applies it
+  with `layer`, not `route_layer`, so unmatched paths and every error response
+  carry it; `with_basic_auth` and `with_trusted_header` apply it outside their
+  own check, so their 401s carry it too.
+- **Why:** A hostile page could otherwise load the admin UI in an invisible
+  frame and trick a signed-in operator into clicking Cancel or Pause
+  (clickjacking), which the CSRF check (§2.8) does not stop: the click comes
+  from the admin page itself.
+- **Expected behaviour:** A page, the router's own 401, and the 401s of both
+  shipped auth layers carry both headers (`auth::responses_forbid_framing`). A
+  host's own auth layer answers its rejections itself, without them.
+
 ## 3. Database cost and counts
 
 ### 3.1 Every UI query is bounded
@@ -347,26 +365,33 @@ of the design spec; a bare "§N.M" is an entry in this document.
   `overview_distinct_queues_skip_scan_uses_due_index`,
   `overview_due_count_uses_due_index`, `overview_done_window_uses_terminal_index`,
   `overview_dead_window_uses_failed_index`,
-  `overview_failed_attempts_uses_failed_attempts_index`,
+  `overview_failed_attempts_use_started_index`,
   `overview_running_uses_lease_index`, `overview_dead_groups_use_failed_index`,
   `overview_no_handler_probe_is_a_limited_due_index_scan`,
-  `replay_matching_uses_failed_name_index`. Without an EXPLAIN test: primary-key
-  reads (task detail, recent actions), the small registry and pause tables
-  (`store::workers`, `store::paused_queues`), and the bulk confirm counts
-  (§3.2). The UI never calls `store::queue_stats`, which scans every retained
-  row.
+  `replay_matching_uses_failed_name_index`,
+  `bulk_cancel_batch_reads_only_live_rows`,
+  `count_cancellable_reads_only_live_rows`,
+  `count_replayable_uses_failed_name_index`. The last three run on an
+  `ANALYZE`d table of 20,000 done rows and a small live backlog, and check both
+  the custom and the generic plan. Without an EXPLAIN test: primary-key reads
+  (task detail, recent actions) and the small registry and pause tables
+  (`store::workers`, `store::paused_queues`). The UI never calls
+  `store::queue_stats`, which scans every retained row.
 
-### 3.2 Bulk cancel by name scans queued rows
+### 3.2 Bulk cancel by name reads every live row
 
 - **Source:** Plan ruling (Task 4, `ponytail:` comment); global constraints
   (the one accepted exception).
-- **Decision:** `cancel_matching` and `count_cancellable` filter queued rows by
-  `task_name` with no index. Dead and cancelled rows have
+- **Decision:** `cancel_matching` and `count_cancellable` find queued and
+  running rows through their partial indexes (§3.11) and filter them by
+  `task_name`, which has no index there. Dead and cancelled rows have
   `queue_tasks_failed_name_idx`, so bulk replay and its count use an index.
 - **Why:** An index on `task_name` over queued rows would be maintained by every
   enqueue and claim, which the hot-path rules forbid.
-- **Expected behaviour:** A bulk cancel, and its confirm-page count, read the
-  queued rows of the queue (or of all queues when none is given). With a large
+- **Expected behaviour:** A bulk cancel, and its confirm-page count, read every
+  queued and running row, of every queue (a custom plan narrows the queued part
+  to the given queue; the generic plan a repeated batch may switch to does
+  not), and never the retained done, dead and cancelled rows. With a large
   backlog this takes noticeable time; it is an operator action, not a page
   refresh. Add an index only if enqueue can afford it.
 
@@ -389,7 +414,8 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Decision:** "Done" and "Dead" per queue count the last `window` (default
   1 h), from one scan per status of the newest `count_cap` rows. If that scan
   hits the cap, every queue's count is marked capped, and the column header
-  shows the span actually covered. The failure groups use the same window.
+  shows the span actually covered. The failure groups use the same window
+  (their failed-attempt count has its own scan and covered span, §3.12).
 - **Why:** All-time totals would scan every retained row. A count cut short by
   another queue's volume is a lower bound and must be shown as one.
 - **Expected behaviour:** Headers read `Done (1h)` and `Dead (1h)`, or for
@@ -429,18 +455,20 @@ of the design spec; a bare "§N.M" is an entry in this document.
 
 - **Source:** spec §6.1 (call: about 5 s).
 - **Decision:** Every page read runs in a transaction whose first statement sets
-  `statement_timeout` (default 5 s, via `set_config(…, true)`), which ends with
-  the transaction. Actions (cancel, replay, pause, bulk) run on a plain
-  connection as their own statements.
-- **Why:** No page can hold a connection, or keep a query running, longer than
-  the timeout. Actions have their own bounds (§5).
-- **Expected behaviour:** The timeout applies inside the read and is gone after
+  `statement_timeout` (default 5 s, via `set_config(…, true)`), and the same
+  idle-in-transaction timeout (§3.13); both end with the transaction. Actions
+  (cancel, replay, pause, bulk) run on a plain connection as their own
+  statements.
+- **Why:** No page query runs longer than the timeout, and no read cut off
+  mid-transaction holds its connection's locks longer than that (§3.13).
+  Actions have their own bounds (§5).
+- **Expected behaviour:** Both timeouts apply inside the read and are gone after
   it (`api::read_sets_statement_timeout_for_its_transaction_only`). A page whose
   read exceeds it is a 503 error page; the JSON API answers 500 (503 only when
   no connection is available). **Divergence:** the bulk confirm page's
   count also runs outside the read transaction, so a slow `count_cancellable`
-  scan (§3.2) is not cut off at 5 s; it is still capped at `count_cap` matching
-  rows.
+  over a large live backlog (§3.2) is not cut off at 5 s; it is still capped at
+  `count_cap` matching rows.
 
 ### 3.8 Small pages, keyset paging, next links only
 
@@ -467,14 +495,94 @@ of the design spec; a bare "§N.M" is an entry in this document.
 
 - **Source:** spec §3, §5.1.7 (call: exact set left to the builder).
 - **Decision:** `0003` adds `queue_tasks_failed_idx` and
-  `queue_tasks_failed_name_idx` (partial on `dead`/`cancelled`),
-  `queue_task_attempts_failed_idx` (partial on failed outcomes), and
+  `queue_tasks_failed_name_idx` (partial on `dead`/`cancelled`) and
   `queue_admin_actions_task_idx`. It widens `queue_tasks_terminal_cleanup_idx` to
-  include `cancelled`. Nothing on queued or running rows.
+  include `cancelled`. Nothing on queued or running rows, and nothing on
+  `queue_task_attempts` (§3.12).
 - **Why:** Enqueue, claim and running→done must not maintain a new index.
 - **Expected behaviour:** Enqueue, claim and completion write exactly the
-  indexes they wrote before `0003`. The one extra hot-path work is the pause
-  check in claims (§5.15).
+  indexes they wrote before `0003`, and closing an attempt can stay a HOT update
+  (`performance::attempt_close_stays_hot_eligible`). The one extra hot-path work
+  is the pause check in claims (§5.15).
+
+### 3.11 Bulk cancel writes its status test as `OR`
+
+- **Source:** **Ledger ruling (final review)**, fixing its Critical 1.
+- **Decision:** The bulk-cancel batch (`CANCEL_BATCH`) and `count_cancellable`
+  test `(status = 'queued' OR status = 'running')`, never
+  `status IN ('queued', 'running')`.
+- **Why:** PostgreSQL cannot match an `IN` list (a ScalarArrayOp) to the
+  partial indexes on `status = 'queued'` and `status = 'running'`, so the `IN`
+  form planned as a seq scan over every retained row: on PostgreSQL 13 with
+  300,000 done rows, a (parallel) Seq Scan of `queue_tasks`. The `OR` form plans
+  as a BitmapOr over `queue_tasks_due_idx` and `queue_tasks_expired_lease_idx`,
+  for custom plans and for the generic plan alike.
+- **Expected behaviour:** On an `ANALYZE`d table with 20,000 done rows, both
+  statements use both partial indexes and no `Seq Scan on queue_tasks`, under
+  `force_custom_plan` and `force_generic_plan`
+  (`performance::bulk_cancel_batch_reads_only_live_rows`,
+  `performance::count_cancellable_reads_only_live_rows`). With the `IN` form
+  both tests fail with a seq scan. Write any new status test on live rows the
+  same way.
+
+### 3.12 Failed attempts come from the newest attempts, not their own index
+
+- **Source:** **Ledger ruling (final review)**, replacing the plan's
+  `queue_task_attempts_failed_idx`.
+- **Decision:** `0003` adds no index on `queue_task_attempts`. The overview's
+  failed-attempt groups scan the newest `count_cap` attempts with
+  `started_at >= now() - window`, newest first, through the existing
+  `queue_task_attempts_started_idx`, and count those with outcome `retry` or
+  `lease_expired` by task name and error (joining tasks by primary key). If the
+  scan read `count_cap` attempts, each group's count is capped (a lower bound)
+  and `Overview::attempts_covered` is `generated_at` minus the oldest scanned
+  start; otherwise it is the window, like `done_covered` and `dead_covered`.
+  The "Failed attempts" header shows that span (§3.4).
+- **Why:** The partial index on failed attempts blocked HOT on every attempt
+  close, because both its key (`finished_at`) and its predicate (`outcome`)
+  change then: 0 of 5,000 closes were HOT with it, 4,953 without. Every
+  completion then wrote all of the attempts indexes, against spec §3. Spec §3's
+  intent and the anti-goal "measurably slows completions" outrank an exact
+  failed-attempt window. `0003` was unreleased, so it was edited in place.
+- **Expected behaviour:** The statement plans as a limited index scan of
+  `queue_task_attempts_started_idx` with no seq scan
+  (`performance::overview_failed_attempts_use_started_index`). With
+  `count_cap = 5` and eight attempts a minute apart (one done, seven retries),
+  the group counts `4+` and `attempts_covered` is about 5 minutes; with the
+  default cap it counts 7 over the whole window
+  (`overview::overview_caps_failed_attempts`); the page header then reads, for
+  example, `Failed attempts (last 2m)`
+  (`pages::failed_attempts_header_shows_covered_span`). Any index on
+  `queue_task_attempts` that names `finished_at`, `outcome` or `error` in its
+  key, INCLUDE list or predicate fails
+  `performance::attempt_close_stays_hot_eligible`. Cost: on a busy system the
+  attempt counts cover a shorter span than the window (stated on the page), an
+  attempt that started before the window is not counted even if it failed
+  inside it, and in-flight and successful attempts use up the cap. Dead counts
+  stay window-wide.
+
+### 3.13 Transactions left idle are ended by the server
+
+- **Source:** **Ledger ruling (final review)**.
+- **Decision:** `db::read` also sets `idle_in_transaction_session_timeout` to
+  the statement timeout, and the core cron materializer's per-job transaction
+  (`store::materialize_due_jobs`) sets it to 30 s, both with
+  `set_config(…, true)` inside the transaction.
+- **Why:** When a future holding a transaction is dropped (a client disconnects
+  mid-read, or shutdown cuts off the materializer), diesel-async leaves the
+  transaction open on the pooled connection, and deadpool only discards it at
+  the next checkout. Until then it sits idle in transaction, holding its locks:
+  a read's AccessShareLocks, which block DDL such as a migration, or the
+  materializer's lock on its schedule row, which other workers then skip. The
+  materializer case predates the admin UI.
+- **Expected behaviour:** Inside a read both settings are in force and both are
+  gone afterwards on the same connection
+  (`api::read_sets_statement_timeout_for_its_transaction_only`); inside the
+  materializer's transaction the idle timeout is `30s`, and `0` after it
+  (`materialize::materializer_transaction_ends_itself_when_left_idle`, `cron`
+  feature). A transaction left idle that long ends with its session, releasing
+  its locks; the pool discards the closed connection. Cost: a legitimately idle
+  transaction over the limit would be ended too; neither path has one.
 
 ## 4. Health rules
 
@@ -571,8 +679,9 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Source:** spec §6.4 item 4 (call).
 - **Decision:** Failures in the window grouped by task name and error, with two
   counts: dead tasks with that `last_error`, and failed attempts (outcome
-  `retry` or `lease_expired`) with that error. Groups are sorted by the sum,
-  and the top 20 are shown.
+  `retry` or `lease_expired`) with that error, among the newest `count_cap`
+  attempts started in the window (§3.12). Groups are sorted by the sum, and
+  the top 20 are shown.
 - **Why:** An operator needs "what is failing and how often" in one line, and a
   retrying task is not yet dead. Counting tasks waiting to retry would need
   another index on `queue_tasks`.
@@ -1112,14 +1221,17 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Source:** spec §6.5 (call: the toggle).
 - **Decision:** Every page reloads every `refresh_seconds` (default 10; 0 turns
   it off). The reload is skipped while a form field or button has focus, and on
-  the bulk confirm and result pages. An Auto-refresh checkbox, stored in
-  `localStorage`, turns it off for that browser.
+  the bulk confirm and result pages. A failed action's error page renders with
+  refresh 0 (**Ledger ruling (final review, minor 5)**). An Auto-refresh
+  checkbox, stored in `localStorage`, turns it off for that browser.
 - **Why:** A wall display stays current, and an operator typing a reason doesn't
-  lose it.
+  lose it. An action's error page is the result of a POST; reloading it would
+  ask to resubmit, and resubmitting could run the action again.
 - **Expected behaviour:** With the cursor in a reason field the page does not
   reload. A half-typed reason in a field that has lost focus is lost on the next
   reload. Unchecking Auto-refresh persists across pages. Storage errors (private
-  mode) are ignored.
+  mode) are ignored. A failed action's page carries `data-refresh="0"`
+  (`actions::failed_action_page_does_not_auto_refresh`).
 
 ## 8. Standalone server
 
@@ -1278,3 +1390,7 @@ Found in review and deliberately left; none affects correctness of the queue.
   links but no filter form.
 - The queued list does not hide tasks that have used all their attempts (they
   practically never exist in `queued`).
+- With the `cron` feature, a materializer transaction cut off at shutdown is
+  ended by the server after 30 s idle (§3.13). Until then, if the host keeps its
+  pool alive after `run_until_shutdown` returns, it holds its schedule row lock
+  and other workers skip that schedule.

@@ -205,6 +205,12 @@ Behind a proxy that rewrites `Host`, set `public_origin` to the address browsers
 use (for example `https://admin.example.com`, with no trailing slash), so that
 browsers that send `Origin` but not `Sec-Fetch-Site` can still post.
 
+Every response, errors and 401s included, carries `X-Frame-Options: DENY` and
+`Content-Security-Policy: frame-ancestors 'none'`, so no other site can show the
+pages in a frame and trick an operator into clicking a button (clickjacking).
+The router sets them, and the shipped auth layers add them to their own 401s;
+a custom auth layer's rejections are its own.
+
 ## TLS
 
 Neither mode terminates TLS. Put a TLS-terminating proxy or load balancer in
@@ -235,12 +241,16 @@ GRANT SELECT, UPDATE, DELETE ON scheduler_jobs TO pg_task_admin;
 These grants were checked by running every page query and action as such a role.
 A role with only the `SELECT` grants can view the pages but not act.
 
-Page reads run in a transaction that sets `statement_timeout` (5 s by default),
-so no page can hold a connection longer than that. Actions, and the bulk confirm
-page's count, run outside that transaction, as their own statements. A single
-cancel never waits on a row lock (it retries for up to 2 s, then reports the
-task busy); a single replay locks a dead or cancelled row, which nothing else
-normally holds; a bulk run lasts up to its 10 s budget plus one batch.
+Page reads run in a transaction that sets `statement_timeout` (5 s by default)
+and `idle_in_transaction_session_timeout` to the same value, so no page statement
+runs longer than that. If a client disconnects mid-read, the transaction stays
+open on its pooled connection until the next checkout; the idle timeout makes
+the server end that session after the same 5 s, releasing its locks. Actions,
+and the bulk confirm page's count, run outside that transaction, as their own
+statements. A single cancel never waits on a row lock (it retries for up to 2 s,
+then reports the task busy); a single replay locks a dead or cancelled row,
+which nothing else normally holds; a bulk run lasts up to its 10 s budget plus
+one batch.
 
 ## Configuration reference
 
@@ -254,7 +264,7 @@ keys, which map onto it. Unknown TOML keys are an error.
 | `refresh_seconds` | `refresh_seconds` | 10 | Page auto-refresh; 0 turns it off. |
 | `overview_cache` | `overview_cache_seconds` | 5 s | The overview is computed at most once per this, shared by every viewer. |
 | `page_size` | (none) | 50 | Rows per list page. |
-| `statement_timeout` | `statement_timeout_seconds` | 5 s | Limit on each page-read statement. |
+| `statement_timeout` | `statement_timeout_seconds` | 5 s | Limit on each page-read statement, and on idle time inside a page read's transaction. |
 | `overview.window` | `window_seconds` | 1 h | How far back the Done and Dead columns and the failure groups look. |
 | `overview.count_cap` | `count_cap` | 10,000 | Most rows any count reads; larger counts show as `10,000+`. Also caps the bulk confirm count. |
 | `overview.no_handler_probe` | (none) | 100 | Oldest due tasks per queue checked for task names no live worker handles. |
@@ -318,14 +328,15 @@ strings, so any name works, `/`, `&` and `#` included.
 | `POST /queues/pause`, `/queues/resume` | Form posts with `queue` and `reason`; redirect to the overview. |
 | `GET /bulk?action=cancel\|replay&task_name=…[&queue=…][&error=…]`, `POST /bulk` | Confirm page with the capped match count, then one budgeted run with a Continue button if more remain. |
 | `GET /api/tasks/:id` | The task as JSON. |
-| `POST /api/tasks/:id/replay` | JSON body `{"reason": "…"}`; 204, or 409 if the task is not dead or cancelled. |
+| `POST /api/tasks/:id/replay` | JSON body `{"reason": "…"}`; 204, 400 if the reason is blank, or 409 if the task is not dead or cancelled. |
 | `GET /api/jobs`, `POST /api/jobs/:id/pause`, `POST /api/jobs/:id/resume`, `DELETE /api/jobs/:id` | Cron schedules (`cron` feature only). |
 
 Every action needs a non-empty reason (400 otherwise). A bulk action also needs
 the task name typed again. Lists show "Next" links only, with no page numbers or
 totals. Pages reload every `refresh_seconds`, except while a form field has
-focus or on the confirm and result pages; the Auto-refresh checkbox turns it
-off for that browser.
+focus, and never on the bulk confirm and result pages or on a failed action's
+error page (reloading a POST result would offer to resubmit it); the
+Auto-refresh checkbox turns it off for that browser.
 
 ## Queue status: what it means and what to do
 
@@ -354,8 +365,12 @@ Other things the overview shows:
   lower bound, marked `+`.
 - **Failure groups** group the window's dead tasks and failed attempts by task
   name and error. "Failed attempts" counts attempts that ended in a retry or an
-  expired lease, not tasks, so it measures the failure rate. Each group
-  links to the matching Failed list and to "Replay all…" for its dead tasks.
+  expired lease, not tasks, so it measures the failure rate. It looks at the
+  newest `count_cap` attempts that started in the window, failed or not; when
+  more than that started, the header shows the span covered, for example
+  `Failed attempts (last 7m)`, and the counts are lower bounds, marked `+`. Each
+  group links to the matching Failed list and to "Replay all…" for its dead
+  tasks.
 - **Recent admin actions** are the last 10, from every operator.
 - If the database is unreachable or a query fails, the overview is a 503 error
   page. It never shows a status it couldn't compute.

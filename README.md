@@ -43,7 +43,7 @@ Include it in the host application's migrations before starting workers:
 | --- | --- |
 | `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
-| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions` (replaces `queue_task_replays`, keeping its rows); `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks and failed attempts |
+| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions` (replaces `queue_task_replays`, keeping its rows); `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
 
 Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
 the worker registry are part of the core crate and always on.
@@ -221,6 +221,12 @@ Releases do not count attempts and have no limit, so `max_attempts` does not
 bound a task that hangs (for example, stuck on a remote call with no timeout):
 it is released and reclaimed at every deploy and never reaches `dead`. Put
 timeouts on a handler's own awaits.
+
+With the `cron` feature, shutdown can also cut off a materializer transaction,
+which stays open on its pooled connection holding its schedule row lock. The
+transaction sets `idle_in_transaction_session_timeout` to 30 s, so the server
+ends it after 30 s idle; until then, if the host keeps its pool alive after
+`run_until_shutdown` returns, other workers skip that schedule.
 
 ```rust,no_run
 use std::time::Duration;
@@ -473,7 +479,9 @@ scanning retained rows (see
   locked elsewhere are skipped, so concurrent calls split the work; for the same
   reason `more_remain = false` does not prove that nothing matching is left.
   `count_cancellable` and `count_replayable` count up to a cap. Cancel by name
-  scans the queue's queued rows: an index there would tax every enqueue.
+  reads every queued and running row through their partial indexes (never the
+  retained done, dead and cancelled rows) and filters by name: an index on the
+  name there would tax every enqueue.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
   (counts of queued, running, done and dead tasks, due count, oldest due age,
   depth by queue, name and priority with due count and oldest due age, and
