@@ -5,7 +5,7 @@ use uuid::Uuid;
 /// Maximum length (in `char`s) of a [`TaskName`], [`TaskKey`] or [`WorkerId`].
 const MAX_IDENTIFIER_LEN: usize = 255;
 
-/// Why a string was rejected as a [`TaskName`], [`TaskKey`] or [`WorkerId`].
+/// Why a string was rejected as a [`TaskName`], [`TaskKey`], [`QueueName`] or [`WorkerId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IdentifierError {
     #[error("identifier must not be empty")]

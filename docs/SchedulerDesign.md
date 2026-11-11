@@ -82,7 +82,7 @@ cursor. It is not part of the queue protocol.
 | §4.1 has no queue | `queue` column; claims filter one queue; per-queue worker limits | §16 "separate logical queues/worker pools" against starvation |
 | replay "SHOULD be audited" | `queue_task_replays` table | durable audit with operator and reason |
 | enqueue always notifies | notifies only when a row was inserted | a duplicate adds no work |
-| no cancel transition | none provided | §5 permits only the five listed transitions |
+| no cancel transition | none provided | §5 defines no cancel transition |
 | §5 lists five transitions | adds release (`running → queued`, `attempts − 1`) at worker shutdown | a deploy should neither consume an attempt nor leave the task until lease expiry |
 | no recurring schedules | optional `cron` producer | existing feature, layered on enqueue semantics |
 
@@ -144,7 +144,8 @@ one attempt row closes.
 startup:  generate UUID worker_id; LISTEN queue_available on one pooled connection;
           spawn maintenance (reaper + cleanup every reaper_interval)
 loop:     [cron] materialize due schedules, at most once per max_poll_interval
-          if no queue has a free permit: no claim cycle; wait max_poll_interval
+          if no queue has a free permit: no claim cycle; wait as below, capped at
+          max_poll_interval (a finishing handler, a notification or shutdown wakes it)
           for each queue with a free permit, in configuration order, on one connection:
             claim up to min(its free permits, claim_batch_size) from that queue
             spawn one dispatch per claim, holding one of that queue's permits
@@ -212,14 +213,14 @@ set per task at enqueue (default 3).
 - `Task` ties a stable name to one `Serialize + DeserializeOwned` payload type
   and is used by both `enqueue::<T>` and `register_task::<T>`.
 - Identifiers are validated newtypes: `TaskId`, `TaskKey`, `TaskName`,
-  `WorkerId`, `LockToken`.
+  `QueueName`, `WorkerId`, `LockToken`.
 - `TaskLease { task_id, worker_id, lock_token, attempt_no }` is the ownership
   proof every guarded transition takes. Handlers receive it as `ctx.lease`.
 - `TaskContext` carries the lease, `task_key`, `task_name`, `max_attempts`,
   `locked_until` (as of claim; heartbeats do not update it), and a
   `CancellationToken`.
-- `TaskError::{retry, permanent}` is the handler's failure classification
-  (§11.1).
+- `TaskError::{retry, permanent, interrupted}` is the handler's failure
+  classification (§11.1).
 - Observability (§23) goes through the `tracing` and `metrics` facades. The
   crate installs no subscriber or recorder. The metric names and labels are a
   public contract, listed in the [README](../README.md#observability).

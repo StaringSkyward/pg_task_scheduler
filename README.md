@@ -249,6 +249,83 @@ let inserted = store::complete_with_outbox(conn, &ctx.lease, &command).await?;
 Publishing `queue_outbox` rows is the application's job. The relay must set
 `published_at`, and receivers must deduplicate by `command_key`.
 
+## Running Queues
+
+Advice for choosing queues, sizing workers and deploying. The API is in
+[Queues](#queues) and [Shutdown](#shutdown).
+
+### Organising tasks into queues
+
+- Split queues by how long their work may wait and by what it uses, not by
+  priority level. Priority orders tasks within a queue; queues give capacity
+  that other work cannot take. For example:
+  - `default`: user-facing work that should start within seconds;
+  - `bulk`: exports and backfills;
+  - a queue per slow or rate-limited external dependency, so its slow handlers
+    or retry storms cannot fill every slot.
+- Put tasks that run longer than `shutdown_timeout` in their own queue, so a
+  separate deployment with a longer grace period can serve them.
+- Keep to a handful of queues. Each one adds a claim statement per worker loop
+  and splits capacity.
+- Set the queue on the task type (`Task::QUEUE`). Use `EnqueueOptions::queue`
+  only to route a single call, such as a backfill of a task type that normally
+  runs live. Cron schedules set it with `CreateJob::queue`.
+- Queue names should be short, lowercase and stable, and describe the kind of
+  work rather than the team that owns it.
+- To rename a queue without stranding tasks:
+  1. deploy workers that serve both names;
+  2. switch producers to the new name;
+  3. stop serving the old name once its depth is zero.
+- A task runs only on a worker that serves its queue **and** has a handler
+  registered for its task name.
+
+### Sizing workers
+
+- The handlers needed across all instances are about arrival rate × average
+  handler duration (Little's law). Set each instance's limit to that number
+  divided by the number of instances, times 1.5 to 2 to leave room for bursts
+  and retries.
+- Run separate deployments for queues that scale differently. Each process
+  configures only its own queues.
+- Size the pool at the sum of the queue limits + 2 per scheduler, plus whatever
+  handlers take (see Connections under [Operations](#operations)). Keep
+  (instances × pool size) under PostgreSQL's `max_connections`, with room to
+  spare.
+- A `claim_batch_size` above a queue's limit gains nothing.
+
+### Keeping queues healthy
+
+Poll `store::queue_stats` on a timer and publish the values as gauges (see
+[Observability](#observability)).
+
+| Signal | Meaning | Action |
+| --- | --- | --- |
+| `QueueDepth.oldest_due_age` above the queue's latency target | under capacity, or no worker serves the queue | check a worker serves it, then add capacity |
+| `due` growing steadily | arrivals exceed capacity | add instances or raise the limit |
+| p95 of `claim_latency_seconds{queue}` | the worker-side view of the same thing | same as above |
+| `tasks_dead_total`, `leases_lost_total`, `leases_expired_total` | handler bugs, or a lease too short for the work | fix the handler or raise `lease_duration` |
+| `tasks_released_total` | rises at deploys, which is expected | outside deploys, look for restart loops |
+
+### Deploys and shutdown
+
+- Make the orchestrator's grace period longer than `shutdown_timeout` + 5 s.
+- Set `shutdown_timeout` at or above a typical task's duration in the queues
+  that process serves.
+- Long handlers should watch `ctx.cancellation`, save progress keyed by
+  `task_key`, and return `TaskError::interrupted()`.
+- **Returning `Ok(())` after cancellation marks the task done.** Do not swallow
+  cancellation.
+- A task that has not stopped by the deadline is dropped mid-await. Anything it
+  had already started outside PostgreSQL may have happened, so the external
+  effect must be idempotent by `task_key`.
+- A dropped DB-contained handler can leave its pooled connection idle in
+  transaction, holding the task's row lock. If the host keeps the pool alive
+  after `run_until_shutdown` returns, peers' reapers (`SKIP LOCKED`) skip that
+  task until the connection is recycled or the process exits. Exit the process
+  (or drop the pool) after shutdown.
+- A release sends no notification, so another worker picks the task up within
+  `max_poll_interval`.
+
 ## Operations
 
 - **Reaper:** every worker runs it every `reaper_interval`. Expired leases go
@@ -263,8 +340,8 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
   `lock_token`. Each replay is recorded in `queue_task_replays`. Enqueue a new
   `task_key` instead if you want a new external effect.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
-  (counts by status, due count, oldest due age, depth by queue, name and priority with due count and oldest due age, and
-  outbox backlog).
+  (counts by status, due count, oldest due age, depth by queue, name and
+  priority with due count and oldest due age, and outbox backlog).
 - **Health:** `Scheduler::health()` reports starting, healthy, degraded, or
   stopped. Claim errors (and, with `cron`, materialize errors) set degraded;
   heartbeat and maintenance failures do not affect health. A worker with no free
@@ -322,8 +399,8 @@ Tasks the reaper marks dead are counted only in
 `pg_task_scheduler_tasks_materialized_total` counts tasks inserted; an occurrence
 that already exists as a task counts nothing.
 
-Queue-level gauges (counts by status, due count, oldest due age, depth by name
-and priority, outbox backlog) come from `store::queue_stats`. They are not
+Queue-level gauges (counts by status, due count, oldest due age, depth by queue,
+name and priority with due count and oldest due age per queue, outbox backlog) come from `store::queue_stats`. They are not
 emitted automatically because that query scans retained rows. Poll it at an
 interval that suits you and publish the values as gauges.
 

@@ -209,6 +209,12 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   heartbeats wait for connections until local deadlines drop the handlers.
   Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
   host), well below the 16 + 2 = 18 that the default queue's limit of 16 needs.
+- **Sizing:** the handlers needed across all instances are about arrival rate ×
+  average handler duration (Little's law). Each instance's limit is that number
+  divided by the instance count, times 1.5 to 2 for bursts and retries. Keep
+  (instances × pool `max_size`) under PostgreSQL's `max_connections`, with room
+  to spare. Queue layout, health signals and deploy advice are in the README's
+  [Running Queues](../README.md#running-queues).
 - **Lease duration:** keep it well above pool wait plus database latency, and
   above the longest DB-contained transaction. A database outage longer than the
   lease lets another worker start the task.
@@ -234,8 +240,8 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 | Worker crashes after claim | The lease expires; the reaper requeues the task or marks it `dead`. |
 | Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
 | Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
-| PostgreSQL unavailable | No transition happens; claim errors (and, with `cron`, materialize errors) set `Degraded`; heartbeat and maintenance failures do not affect health, and a fully busy worker runs no claim cycle so it keeps its last status. Workers retry without inventing local state. |
-| Graceful shutdown with handlers still running | Shutdown cancels every `ctx.cancellation` and drains for up to `shutdown_timeout`. A handler that returns `TaskError::interrupted()`, or is still running at the timeout and is dropped, has its task released: back to `queued`, due at once, the attempt not counted. A release not finished within 5 s more (the database is unreachable, or a dropped DB-contained transaction still holds the row lock) is aborted; the reaper recovers that task after the lease, and the attempt counts. |
+| PostgreSQL unavailable | No transition happens; claim errors (and, with `cron`, materialize errors) set `Degraded`; heartbeat and maintenance failures do not affect health, and a worker with no free handler slot in any queue runs no claim cycle so it keeps its last status. Workers retry without inventing local state. |
+| Graceful shutdown with handlers still running | Shutdown cancels every `ctx.cancellation` and drains for up to `shutdown_timeout`. A handler that returns `TaskError::interrupted()`, or is still running at the timeout and is dropped, has its task released: back to `queued`, due at once, the attempt not counted. A release not finished within 5 s more (the database is unreachable, or a dropped DB-contained transaction still holds the row lock) is aborted; the reaper recovers that task after the lease, and the attempt counts. A kept-alive pool can leave a dropped transaction's connection holding that lock, so exit the process after shutdown. |
 
 ## Validation Status
 
