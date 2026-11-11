@@ -50,8 +50,8 @@ Indexes follow §4.2:
 
 Each claim inserts one row with `attempt_no`, `lock_token`, `worker_id` and
 `started_at` in the same statement as the claim. Completion, retry, permanent
-failure, and the reaper close it with `finished_at`, an `outcome`
-(`done | retry | dead | lease_expired`), and `error`. Rows cascade when their
+failure, release, and the reaper close it with `finished_at`, an `outcome`
+(`done | retry | dead | lease_expired | released`), and `error`. Rows cascade when their
 task is deleted by retention.
 
 ### `queue_outbox` (§14)
@@ -81,6 +81,7 @@ cursor. It is not part of the queue protocol.
 | replay "SHOULD be audited" | `queue_task_replays` table | durable audit with operator and reason |
 | enqueue always notifies | notifies only when a row was inserted | a duplicate adds no work |
 | no cancel transition | none provided | §5 permits only the five listed transitions |
+| §5 lists five transitions | adds release (`running → queued`, `attempts − 1`) at worker shutdown | a deploy should neither consume an attempt nor leave the task until lease expiry |
 | no recurring schedules | optional `cron` producer | existing feature, layered on enqueue semantics |
 
 ## State Machine (§5)
@@ -88,13 +89,14 @@ cursor. It is not part of the queue protocol.
 ```text
               claim
     queued -------------> running
-      ^                     |  |
-      |                     |  +---- success ----> done
-      | retryable failure   |
-      | or expired lease    +------- permanent / exhausted ---> dead
-      +---------------------+                                   |
-      ^                                                         |
-      +-------------------- administrative replay --------------+
+      ^ ^                 |  |  |
+      | +-- release ------+  |  +---- success ----> done
+      |     (shutdown)       |
+      | retryable failure    |
+      | or expired lease     +------- permanent / exhausted ---> dead
+      +----------------------+                                   |
+      ^                                                          |
+      +-------------------- administrative replay ---------------+
 ```
 
 Code never writes `status` outside these transitions.
@@ -114,6 +116,7 @@ transaction (nested transactions become savepoints).
 | Complete + outbox | `store::complete_with_outbox(conn, lease, cmd)` | §14 | Returns whether a new outbox row was inserted. |
 | Retry | `store::retry(conn, lease, error, delay)` | §11.3 | `queued` at `now() + delay`, or `dead` if `attempts >= max_attempts`. |
 | Permanent failure | `store::fail_permanently(conn, lease, error)` | §11.4 | Task and attempt → `dead`. |
+| Release | `store::release(conn, lease)` | (none) | Worker shutdown only. `running → queued`, `attempts − 1`; `due_at` and `last_error` unchanged, so the task is due at once and keeps its place. Attempt → `released`. |
 | Reap | `store::reap_expired(conn, batch, crash_retry_delay)` | §12 | Bounded `SKIP LOCKED` batch. Closes the attempt as `lease_expired` in the same statement. |
 | Replay | `queue::replay(conn, id, operator, reason)` | §18 | `dead → queued`, `attempts = 0`, `lock_token + 1`, with an audit row. |
 | Cleanup | `store::cleanup(conn, &retention)` | §20 | One bounded delete per terminal status (so `completed_at` is an index condition), `done` first, sharing one `batch_size` budget; then one of published outbox rows. |
@@ -152,8 +155,12 @@ dispatch: run the handler and the lease keeper concurrently
                         deadline → cancel ctx.cancellation and drop the handler
           Ok      → complete   (LostOwnership after a handler-side completion is benign)
           retry   → retry with exponential backoff + jitter
+          interrupted → release during shutdown, otherwise retry
           permanent → fail_permanently
-shutdown: stop maintenance; UNLISTEN; drain handlers until shutdown_timeout; abort the rest
+shutdown: stop claiming and maintenance; cancel every ctx.cancellation; UNLISTEN;
+          drain handlers until shutdown_timeout; then drop the rest and release
+          their tasks, waiting up to 5 s (RELEASE_TIMEOUT); abort what remains
+          (the reaper recovers those tasks after the lease)
 dropped:  if the run future is dropped instead (aborted, or a failed try_join! sibling),
           maintenance stops, handlers are aborted, health becomes Stopped, and the
           LISTEN connection runs UNLISTEN on a task spawned on the worker's runtime

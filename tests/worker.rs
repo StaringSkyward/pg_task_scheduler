@@ -222,6 +222,35 @@ async fn permanent_error_marks_dead_after_one_attempt() {
 }
 
 #[tokio::test]
+async fn interrupted_without_shutdown_is_a_counted_retry() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .base_retry_delay(Duration::from_secs(3600))
+        .max_retry_delay(Duration::from_secs(3600))
+        .register_task::<Job, _, _>(|_ctx, _args| async { Err(TaskError::interrupted()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    let start = Instant::now();
+    while outcomes(&db, id).await != [Some(AttemptOutcome::Retry)] {
+        assert!(start.elapsed() < Duration::from_secs(3), "never retried");
+        tokio::time::sleep(ms(20)).await;
+    }
+    let mut conn = db.pool.get().await.unwrap();
+    let task = store::task(&mut conn, id).await.unwrap().unwrap();
+    drop(conn);
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.attempts, 1, "outside shutdown the attempt counts");
+    assert!(task.due_at > Utc::now() + chrono::Duration::minutes(30));
+
+    run.stop().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn db_contained_handler_survives_heartbeat_while_holding_row_lock() {
     let db = TestDb::new().await;
     db.pool
@@ -333,7 +362,6 @@ async fn crash_after_remote_accept_does_not_duplicate_external_effect() {
     let a = Scheduler::builder(db.pool.clone())
         .lease_duration(ms(500))
         .heartbeat_interval(ms(150))
-        .shutdown_timeout(ms(50))
         .register_task::<Job, _, _>(move |ctx, _args| {
             let (remote, accepted) = (remote_a.clone(), accepted_a.clone());
             async move {
@@ -350,7 +378,10 @@ async fn crash_after_remote_accept_does_not_duplicate_external_effect() {
     tokio::time::timeout(Duration::from_secs(5), accepted.notified())
         .await
         .expect("worker A should call the remote");
-    run_a.stop().await; // aborts the handler; the lease is left in place
+    // Crash worker A: dropping its run aborts the handler with no release, so the lease is left
+    // for the reaper (a graceful stop would release the task).
+    run_a.handle.abort();
+    let _ = run_a.handle.await;
 
     let remote_b = remote.clone();
     let b = Scheduler::builder(db.pool.clone())

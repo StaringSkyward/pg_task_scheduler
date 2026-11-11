@@ -2,14 +2,18 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TestDb;
+use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncConnection, AsyncPgConnection};
 use pg_task_scheduler::store;
 use pg_task_scheduler::{
-    AttemptOutcome, EnqueueOptions, Scheduler, Task, TaskId, TaskKey, TaskStatus, enqueue,
+    AttemptOutcome, EnqueueOptions, Scheduler, SchedulerError, Task, TaskError, TaskId, TaskKey,
+    TaskStatus, TaskView, enqueue,
 };
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 struct Blocker;
@@ -35,6 +39,38 @@ async fn enqueue_now<T: Task<Args = serde_json::Value>>(db: &TestDb) -> TaskId {
     .await
     .unwrap()
     .id
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+async fn task_of(db: &TestDb, id: TaskId) -> TaskView {
+    let mut conn = db.pool.get().await.unwrap();
+    store::task(&mut conn, id).await.unwrap().unwrap()
+}
+
+async fn outcomes(db: &TestDb, id: TaskId) -> Vec<Option<AttemptOutcome>> {
+    let mut conn = db.pool.get().await.unwrap();
+    store::attempts(&mut conn, id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.outcome)
+        .collect()
+}
+
+/// Run `scheduler` until its handler announces `started`.
+async fn run_until_started(
+    scheduler: Scheduler<Pool<AsyncPgConnection>>,
+    started: &Notify,
+) -> (CancellationToken, JoinHandle<Result<(), SchedulerError>>) {
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
+    tokio::time::timeout(Duration::from_secs(10), started.notified())
+        .await
+        .expect("handler should start within 10s");
+    (cancel, handle)
 }
 
 /// Regression test for "Shutdown can detach handler work from finalization".
@@ -170,5 +206,169 @@ async fn panicking_handler_is_not_finalized_and_is_recoverable() {
 
     cancel.cancel();
     handle.await.unwrap().unwrap();
+    db.cleanup().await;
+}
+
+/// ctx.cancellation fires when shutdown begins, not at the abort.
+#[tokio::test]
+async fn shutdown_cancels_handlers_and_interrupted_task_is_released() {
+    let db = TestDb::new().await;
+    let id = enqueue_now::<Blocker>(&db).await;
+    let started = Arc::new(Notify::new());
+    let started_h = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .max_poll_interval(ms(50))
+        .reaper_interval(Duration::from_secs(60))
+        .shutdown_timeout(Duration::from_secs(30))
+        .register_task::<Blocker, _, _>(move |ctx, _a| {
+            let started = started_h.clone();
+            async move {
+                started.notify_one();
+                ctx.cancellation.cancelled().await;
+                Err(TaskError::interrupted())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let (cancel, handle) = run_until_started(scheduler, &started).await;
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect(
+            "shutdown waited for shutdown_timeout: ctx.cancellation did not fire at drain start",
+        )
+        .unwrap()
+        .unwrap();
+
+    let task = task_of(&db, id).await;
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.attempts, 0, "the interrupted attempt must not count");
+    assert_eq!(task.locked_by, None);
+    assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Released)]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn handler_still_running_at_shutdown_timeout_is_released() {
+    let db = TestDb::new().await;
+    let id = enqueue_now::<Blocker>(&db).await;
+    let started = Arc::new(Notify::new());
+    let started_h = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .max_poll_interval(ms(50))
+        .reaper_interval(Duration::from_secs(60))
+        .shutdown_timeout(ms(200))
+        .register_task::<Blocker, _, _>(move |_ctx, _a| {
+            let started = started_h.clone();
+            async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let (cancel, handle) = run_until_started(scheduler, &started).await;
+
+    let stopping = Instant::now();
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+    assert!(stopping.elapsed() < ms(200) + Duration::from_secs(5));
+
+    let task = task_of(&db, id).await;
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.attempts, 0, "the dropped attempt must not count");
+    assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Released)]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn handler_finishing_during_drain_is_completed() {
+    let db = TestDb::new().await;
+    let id = enqueue_now::<Blocker>(&db).await;
+    let started = Arc::new(Notify::new());
+    let started_h = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .max_poll_interval(ms(50))
+        .reaper_interval(Duration::from_secs(60))
+        .shutdown_timeout(Duration::from_secs(5))
+        .register_task::<Blocker, _, _>(move |_ctx, _a| {
+            let started = started_h.clone();
+            async move {
+                // Ignores ctx.cancellation and finishes inside shutdown_timeout.
+                started.notify_one();
+                tokio::time::sleep(ms(300)).await;
+                Ok(())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let (cancel, handle) = run_until_started(scheduler, &started).await;
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+
+    assert_eq!(task_of(&db, id).await.status, TaskStatus::Done);
+    assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn shutdown_with_row_lock_held_returns_in_bounded_time() {
+    let db = TestDb::new().await;
+    let id = enqueue_now::<Blocker>(&db).await;
+    let started = Arc::new(Notify::new());
+    let started_h = started.clone();
+    let pool = db.pool.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .max_poll_interval(ms(50))
+        .reaper_interval(Duration::from_secs(60))
+        .shutdown_timeout(ms(200))
+        .register_task::<Blocker, _, _>(move |ctx, _a| {
+            let started = started_h.clone();
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool
+                    .get()
+                    .await
+                    .map_err(|e| TaskError::retry(e.to_string()))?;
+                // Holds the row lock until dropped, so a release can block behind it.
+                conn.transaction(async |c| {
+                    store::lock_owned(c, &ctx.lease).await?;
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    Ok::<_, SchedulerError>(())
+                })
+                .await
+                .map_err(|e| TaskError::retry(e.to_string()))
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let (cancel, handle) = run_until_started(scheduler, &started).await;
+
+    cancel.cancel();
+    tokio::time::timeout(
+        ms(200) + Duration::from_secs(5) + Duration::from_secs(2),
+        handle,
+    )
+    .await
+    .expect("shutdown hung behind the row lock")
+    .unwrap()
+    .unwrap();
+
+    let status = task_of(&db, id).await.status;
+    assert!(
+        matches!(status, TaskStatus::Queued | TaskStatus::Running),
+        "{status:?}"
+    );
+    // The dropped transaction is still open on an idle pooled connection; closing the pool
+    // ends it, so DROP SCHEMA does not wait forever behind its row lock.
+    db.pool.close();
     db.cleanup().await;
 }

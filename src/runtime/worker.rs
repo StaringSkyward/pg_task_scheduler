@@ -24,10 +24,23 @@ use crate::store;
 /// Shortest idle wait, so an overdue-but-unclaimable task cannot spin the loop.
 const MIN_WAIT: Duration = Duration::from_millis(10);
 
+/// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The shutdown phases every dispatch watches.
+#[derive(Clone)]
+struct Shutdown {
+    /// Shutdown began (`run_until_shutdown`'s token): handlers' `ctx.cancellation` fires.
+    begun: CancellationToken,
+    /// `shutdown_timeout` passed: running handlers are dropped and their tasks released.
+    expired: CancellationToken,
+}
+
 impl<P: SchedulerPool> Scheduler<P> {
-    /// Claim and run tasks until `cancel` fires. Then stop maintenance, drain running
-    /// handlers for up to `shutdown_timeout`, and abort the rest (their leases are left
-    /// for the reaper).
+    /// Claim and run tasks until `cancel` fires. Then stop claiming and maintenance, cancel
+    /// every handler's `ctx.cancellation`, and drain for up to `shutdown_timeout`. Handlers
+    /// still running then are dropped and their tasks released; after 5 s more, whatever is
+    /// left is aborted and the reaper recovers those tasks after the lease.
     pub async fn run_until_shutdown(self, cancel: CancellationToken) -> Result<(), SchedulerError> {
         let Scheduler {
             pool,
@@ -40,6 +53,10 @@ impl<P: SchedulerPool> Scheduler<P> {
         let names = registry.names();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrency.get()));
         let mut in_flight = JoinSet::new();
+        let shutdown = Shutdown {
+            begun: cancel.clone(),
+            expired: CancellationToken::new(),
+        };
         let runtime = tokio::runtime::Handle::current();
         let mut listener = Listener::<P> {
             conn: None,
@@ -67,12 +84,9 @@ impl<P: SchedulerPool> Scheduler<P> {
             if listener.conn.is_none() {
                 listener.conn = listen(&pool).await;
             }
-            let want = semaphore
-                .available_permits()
-                .min(config.claim_batch_size.get());
-            let wait = match NonZeroUsize::new(want) {
-                None => config.max_poll_interval,
-                Some(want) => {
+            let wait = match semaphore.available_permits() {
+                0 => config.max_poll_interval,
+                _ => {
                     let cycle = claim_cycle(
                         &pool,
                         &registry,
@@ -80,7 +94,7 @@ impl<P: SchedulerPool> Scheduler<P> {
                         &config,
                         &semaphore,
                         &mut in_flight,
-                        want,
+                        &shutdown,
                     )
                     .await;
                     // The last materialization's failure keeps health degraded but never stops
@@ -126,16 +140,21 @@ impl<P: SchedulerPool> Scheduler<P> {
         if let Some(conn) = listener.conn.take() {
             unlisten(conn).await;
         }
-        let drain = async {
-            while let Some(joined) = in_flight.join_next().await {
-                log_join(joined);
-            }
+        // `true` once every dispatch has ended within `limit`.
+        let mut drain = async |limit| {
+            let all = async {
+                while let Some(joined) = in_flight.join_next().await {
+                    log_join(joined);
+                }
+            };
+            tokio::time::timeout(limit, all).await.is_ok()
         };
-        if tokio::time::timeout(config.shutdown_timeout, drain)
-            .await
-            .is_err()
-        {
-            tracing::warn!("shutdown timeout: aborting running handlers");
+        if !drain(config.shutdown_timeout).await {
+            tracing::warn!("shutdown timeout: dropping running handlers and releasing their tasks");
+            shutdown.expired.cancel();
+            if !drain(RELEASE_TIMEOUT).await {
+                tracing::warn!("release timeout: aborting; the reaper recovers those tasks");
+            }
         }
         in_flight.shutdown().await;
         Ok(()) // `health` reports Stopped as it drops
@@ -236,8 +255,9 @@ async fn notified<C: DerefMut<Target = AsyncPgConnection>>(listener: &mut Option
     true
 }
 
-/// Claim up to `want` due tasks and spawn a dispatch for each. `None` when the batch was
-/// full, else how long to wait: until the next due task, within `MIN_WAIT..=max_poll_interval`.
+/// Claim up to `min(free permits, claim_batch_size)` due tasks and spawn a dispatch for each.
+/// `None` when the batch was full, else how long to wait: until the next due task, within
+/// `MIN_WAIT..=max_poll_interval`.
 async fn claim_cycle<P: SchedulerPool>(
     pool: &P,
     registry: &Registry,
@@ -245,8 +265,12 @@ async fn claim_cycle<P: SchedulerPool>(
     config: &Arc<Config>,
     semaphore: &Arc<Semaphore>,
     in_flight: &mut JoinSet<()>,
-    want: NonZeroUsize,
+    shutdown: &Shutdown,
 ) -> Result<Option<Duration>, SchedulerError> {
+    let want = semaphore
+        .available_permits()
+        .min(config.claim_batch_size.get());
+    let want = NonZeroUsize::new(want).ok_or(SchedulerError::Invariant("no free permit"))?;
     let mut conn = acquire(pool).await?;
     let sent = Instant::now();
     let claimed = timed(
@@ -283,6 +307,7 @@ async fn claim_cycle<P: SchedulerPool>(
             task,
             deadline,
             permit,
+            shutdown.clone(),
         ));
     }
     if full {
@@ -337,6 +362,7 @@ fn dispatch<P: SchedulerPool>(
     task: ClaimedTask,
     deadline: Instant,
     permit: OwnedSemaphorePermit,
+    shutdown: Shutdown,
 ) -> impl Future<Output = ()> {
     let span = tracing::info_span!(
         "task",
@@ -350,8 +376,9 @@ fn dispatch<P: SchedulerPool>(
     async move {
         let _permit = permit;
         let name = task.task_name.as_str().to_owned();
-        let cancellation = CancellationToken::new();
-        // Cancels ctx.cancellation however dispatch ends: lease lost, finished, or aborted.
+        // Cancelled when shutdown begins, and by the guard however dispatch ends: lease lost,
+        // finished, released, or aborted.
+        let cancellation = shutdown.begun.child_token();
         let cancel_on_drop = cancellation.clone().drop_guard();
         let ctx = TaskContext {
             lease: task.lease.clone(),
@@ -399,10 +426,16 @@ fn dispatch<P: SchedulerPool>(
                 }
                 return;
             }
+            // `shutdown_timeout` passed with the handler still running; it is dropped already.
+            () = shutdown.expired.cancelled() => {
+                release(&pool, &task.lease, name).await;
+                return;
+            }
         };
         metrics::histogram!("pg_task_scheduler_task_duration_seconds", "task_name" => name.clone())
             .record(started.elapsed());
-        finish(&pool, &config, &task.lease, name, result).await;
+        let shutting_down = shutdown.begun.is_cancelled();
+        finish(&pool, &config, &task.lease, name, result, shutting_down).await;
     }
     .instrument(span)
 }
@@ -444,14 +477,19 @@ async fn keep_lease<P: SchedulerPool>(
     }
 }
 
-/// Record the handler's result with an ownership-guarded transition.
+/// Record the handler's result with an ownership-guarded transition. A handler interrupted
+/// by shutdown has its task released rather than retried.
 async fn finish<P: SchedulerPool>(
     pool: &P,
     config: &Config,
     lease: &TaskLease,
     name: String,
     result: Result<(), TaskError>,
+    shutting_down: bool,
 ) {
+    if shutting_down && matches!(&result, Err(error) if error.is_interrupted()) {
+        return release(pool, lease, name).await;
+    }
     let mut conn = match acquire(pool).await {
         Ok(conn) => conn,
         Err(error) => {
@@ -514,6 +552,27 @@ async fn finish<P: SchedulerPool>(
         }
         Err(store_error) => {
             tracing::warn!(classification, error = %message, %store_error, "task failed; result not recorded");
+        }
+    }
+}
+
+/// Return the task to `queued` at shutdown without counting the attempt. On failure it stays
+/// `running` until the reaper recovers it after the lease, and that attempt counts.
+async fn release<P: SchedulerPool>(pool: &P, lease: &TaskLease, name: String) {
+    let released = async {
+        let mut conn = acquire(pool).await?;
+        timed("release", store::release(&mut conn, lease)).await
+    }
+    .await;
+    match released {
+        Ok(()) => {
+            metrics::counter!("pg_task_scheduler_tasks_released_total", "task_name" => name)
+                .increment(1);
+            tracing::info!("task released at shutdown; attempt not counted");
+        }
+        Err(SchedulerError::LostOwnership(_)) => tracing::warn!("lost ownership before release"),
+        Err(error) => {
+            tracing::error!(%error, "release failed; the reaper recovers the task after the lease");
         }
     }
 }

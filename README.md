@@ -120,6 +120,27 @@ Handlers classify every failure:
   `max_attempts` is exhausted, then marks the task `dead`.
 - `TaskError::permanent(..)`, and any error converted with `?`, marks the task
   `dead` immediately.
+- `TaskError::interrupted()` is for a handler that stopped early because
+  shutdown began. During shutdown the task is released without counting the
+  attempt. Outside shutdown it is retried like `TaskError::retry(..)`.
+
+### Shutdown
+
+When the token passed to `run_until_shutdown` fires, the worker stops claiming
+and cancels every running handler's `ctx.cancellation`. It then waits up to
+`shutdown_timeout` for the handlers to finish.
+
+A handler that stops early returns `TaskError::interrupted()`. The task goes back
+to `queued`, due at once, and the attempt is not counted. Handlers still running
+at the timeout are dropped and their tasks released the same way, for up to 5 s
+more. A task whose release fails (for example, the database is unreachable)
+stays `running` until the reaper recovers it after the lease, and that attempt
+counts.
+
+Set the orchestrator's grace period (for example Kubernetes
+`terminationGracePeriodSeconds`) above `shutdown_timeout + 5 s`. A released task
+starts again from the beginning, so make long tasks resumable: keep their
+progress keyed by `task_key`.
 
 ### PostgreSQL-contained work
 
@@ -235,6 +256,7 @@ them:
 | `pg_task_scheduler_tasks_done_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_retried_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_dead_total` | counter | `task_name` |
+| `pg_task_scheduler_tasks_released_total` | counter | `task_name` (released at shutdown; the attempt is not counted) |
 | `pg_task_scheduler_leases_lost_total` | counter | `task_name` |
 | `pg_task_scheduler_heartbeat_failures_total` | counter | `task_name` |
 | `pg_task_scheduler_leases_expired_total` | counter | (none; reaper) |
@@ -242,7 +264,7 @@ them:
 | `pg_task_scheduler_cleanup_deleted_total` | counter | `kind` = `task` or `outbox` |
 | `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name` (claim time − `due_at`, database clock) |
 | `pg_task_scheduler_task_duration_seconds` | histogram | `task_name` |
-| `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `reap`, `cleanup` or `materialize` (`materialize` is `cron` only) |
+| `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `release`, `reap`, `cleanup` or `materialize` (`materialize` is `cron` only) |
 
 Tasks the reaper marks dead are counted only in
 `pg_task_scheduler_leases_expired_total`, not in `pg_task_scheduler_tasks_dead_total`.

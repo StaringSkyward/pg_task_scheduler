@@ -64,6 +64,7 @@ different registrations can share one queue.
 | Old generation ACKs after a reclaim | `lock_token` no longer matches; zero rows. |
 | Heartbeat races the reaper | Either the heartbeat extends a still-valid lease, or the reaper requeues the expired row and the heartbeat matches zero rows. |
 | Completion races the reaper | Completion needs an unexpired lease; once expired, only the reaper can move the row. |
+| Release races lease expiry | Release needs an unexpired lease; after expiry only the reaper moves the row, and the attempt counts. |
 | Reaper races a DB-contained transaction | The handler holds the task row via `lock_owned`; the reaper's `SKIP LOCKED` passes over it. |
 | Two reapers select one expired task | One locks it; the other skips it. |
 | Stale worker emits an outbox command | The outbox insert depends on the guarded completion CTE; no completed row means no outbox row. |
@@ -88,6 +89,12 @@ future when either:
 
 The local deadline only makes the worker give up early. It never extends
 ownership, and host clocks never decide validity.
+
+`ctx.cancellation` is cancelled when worker shutdown begins, when the lease
+keeper gives up, or when the dispatch ends. A handler that stops early because
+shutdown began should return `TaskError::interrupted()`; its task is then
+released without counting the attempt. Shutdown drops handlers still running at
+`shutdown_timeout` and releases their tasks the same way.
 
 Cancellation is cooperative. Async code stops when its future is dropped or when
 it observes the token. Blocking code, independently spawned work, and remote
@@ -214,14 +221,16 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 | Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
 | Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
 | PostgreSQL unavailable | No transition happens; claim errors (and, with `cron`, materialize errors) set `Degraded`; heartbeat and maintenance failures do not affect health, and a fully busy worker runs no claim cycle so it keeps its last status. Workers retry without inventing local state. |
-| Graceful shutdown with handlers still running | Handlers drain until `shutdown_timeout`, then are aborted; their leases are left for the reaper. |
+| Graceful shutdown with handlers still running | Shutdown cancels every `ctx.cancellation` and drains for up to `shutdown_timeout`. A handler that returns `TaskError::interrupted()`, or is still running at the timeout and is dropped, has its task released: back to `queued`, due at once, the attempt not counted. A release not finished within 5 s more (the database is unreachable, or a dropped DB-contained transaction still holds the row lock) is aborted; the reaper recovers that task after the lease, and the attempt counts. |
 
 ## Validation Status
 
 The integration suite covers every §27 requirement. See the table in
 [Scheduler Design](SchedulerDesign.md#testing-contract-27). It also covers:
 heartbeats while a handler holds the row lock, replay followed by a reclaim,
-notification and next-due wakeups, and shutdown without detached work.
+notification and next-due wakeups, shutdown without detached work, and shutdown
+release: an interrupted handler, a handler still running at `shutdown_timeout`,
+and a release blocked behind a dropped transaction's row lock.
 
 Not yet automated:
 

@@ -10,7 +10,9 @@ pub struct TaskContext {
     pub max_attempts: i32,
     /// Lease expiry as of claim; not updated by heartbeats.
     pub locked_until: DateTime<Utc>,
-    /// Cancelled when heartbeat proves that this worker no longer owns the
-    /// task, or when worker shutdown aborts the handler.
+    /// Cancelled when worker shutdown begins, when a heartbeat proves this
+    /// worker no longer owns the task, or when the dispatch ends. A handler
+    /// that stops early because shutdown began should return
+    /// `TaskError::interrupted()`.
     pub cancellation: tokio_util::sync::CancellationToken,
 }
