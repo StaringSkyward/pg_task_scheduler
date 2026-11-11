@@ -27,14 +27,14 @@
 <table>
 <thead><tr>
   <th>Queue</th><th>Status</th><th>Workers</th><th>Slots in use / total</th>
-  <th>Due</th><th>Oldest due wait</th><th>{{ done_header }}</th><th>{{ dead_header }}</th><th>Pause</th>
+  <th>Queued</th><th>Due</th><th>Oldest due wait</th><th>{{ done_header }}</th><th>{{ dead_header }}</th><th>Pause</th>
 </tr></thead>
 <tbody>
 {% for r in rows %}
 <tr>
   <td><a href="{{ r.link }}">{{ r.name }}</a></td>
   <td><span class="status {{ r.status }}">{{ r.status }}</span>{% if !r.reason.is_empty() %} <small>{{ r.reason }}</small>{% endif %}</td>
-  <td>{{ r.workers }}</td><td>{{ r.slots }}</td><td>{{ r.due }}</td><td>{{ r.oldest }}</td>
+  <td>{{ r.workers }}</td><td>{{ r.slots }}</td><td>{{ r.queued }}</td><td>{{ r.due }}</td><td>{{ r.oldest }}</td>
   <td>{{ r.done }}</td><td>{{ r.dead }}</td>
   <td><form method="post" action="{{ base }}/queues/{% if r.paused %}resume{% else %}pause{% endif %}">
     <input type="hidden" name="queue" value="{{ r.name }}">

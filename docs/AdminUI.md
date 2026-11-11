@@ -50,7 +50,8 @@ of the design spec; a bare "§N.M" is an entry in this document.
   before the detail.
 - **Expected behaviour:** The overview, top to bottom: an alert for queues that
   are paused or have due tasks and no live worker; a workers summary (live,
-  lost, last seen); one row per queue with a status and its reason; failure
+  lost, last seen); one row per queue with a status and its reason, and its
+  queued, due, done and dead counts; failure
   groups; due task names with no handler; the last 10 admin actions; links to
   the lists. Nothing else: no charts, no history (`pages::overview_*` tests).
 
@@ -232,9 +233,10 @@ of the design spec; a bare "§N.M" is an entry in this document.
   time.
 - **Expected behaviour:** Good credentials pass; a wrong password, unknown user,
   malformed header, other scheme or no header gets 401 with the challenge
-  (`auth::basic_auth_accepts_valid_rejects_invalid`). A bad hash fails
-  configuration without echoing the hash (same test). Duplicate names fail the
-  standalone config without echoing the hash
+  (`auth::basic_auth_accepts_valid_rejects_invalid`). A hash that isn't
+  argon2id fails `with_basic_auth` validation, and the error names the user
+  but does not echo the hash (same test). Duplicate names fail the standalone
+  config's validation, also without echoing a hash
   (`pg-task-admin config::rejects_duplicate_users`).
 
 ### 2.5 At most one argon2 verify per CPU
@@ -1004,11 +1006,15 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Source:** spec §6.4 item 3 (call).
 - **Decision:** One row per queue that has queued or running tasks, a live
   worker serving it, or a pause, sorted by name. Columns: queue, status and
-  reason, live workers serving it, slots in use / total, due, oldest due wait,
-  Done (window), Dead (window), and a Pause or Resume form.
+  reason, live workers serving it, slots in use / total, queued (every queued
+  task, due or not), due, oldest due wait, Done (window), Dead (window), and a
+  Pause or Resume form.
 - **Why:** A queue with only finished tasks and no worker needs no attention.
 - **Expected behaviour:** A paused or registered queue appears with no tasks
-  (`overview::overview_lists_paused_and_registered_queues_without_tasks`).
+  (`overview::overview_lists_paused_and_registered_queues_without_tasks`). A
+  queue with 2 due and 3 future tasks reads Queued 5 and Due 2
+  (`pages::overview_shows_queued_total_beside_due`); both are capped counts
+  (§3.3).
   "Slots in use" counts the queue's running tasks across all workers; "total"
   sums the live serving workers' limits.
 
@@ -1024,12 +1030,10 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Expected behaviour:** Every list route resolves
   (`pages::all_list_routes_resolve`); a failure group's link filters Failed to
   exactly that name and error (`pages::failed_page_filters_by_group`). The
-  totals are the overview's capped counts: Due for queued tasks, and Done and
-  Dead over the window for completed and failed ones (§3.4). Queued without a
-  queue lists the known queues to pick from
-  (`pages::queued_without_queue_offers_known_queues`). **Divergence:** goal 2
-  asks for a queued total; no page shows a count of queued tasks that are not
-  yet due, although `store::overview` computes it (`QueueOverview.queued`).
+  totals are the overview's capped counts: Queued (and Due) for queued tasks
+  (§7.2), and Done and Dead over the window for completed and failed ones
+  (§3.4). Queued without a queue lists the known queues to pick from
+  (`pages::queued_without_queue_offers_known_queues`).
 
 ### 7.4 Queued: dequeue order, split at `now()`
 
@@ -1152,9 +1156,12 @@ of the design spec; a bare "§N.M" is an entry in this document.
   (`config::rejects_missing_auth`, `config::rejects_unknown_mode`,
   `config::rejects_basic_without_users`, `config::rejects_unknown_key`); the
   environment supplies the URL when the file doesn't
-  (`config::database_url_falls_back_to_env`). Parse errors give the line and
-  the parser's message, not the surrounding source text, so a password hash is
-  not echoed. **Divergence:** the spec says "secrets can come
+  (`config::database_url_falls_back_to_env`). A parse error gives the line and
+  the parser's message, never the surrounding config text. The message itself
+  can quote a value of the wrong type (a string where a number belongs, say),
+  so a secret typed into the wrong key can appear in it (§10). Validation
+  errors after parsing (no users, duplicate user names) never include a hash
+  (`config::rejects_duplicate_users`). **Divergence:** the spec says "secrets can come
   from the environment"; only the database URL can. Password hashes live in the
   file.
 
@@ -1260,7 +1267,8 @@ Found in review and deliberately left; none affects correctness of the queue.
 - The standalone config: `bind` takes an IP address, not a host name;
   `pool_size = 0` and a negative `count_cap` are not rejected; `auth.header` is
   checked only at startup; keys that don't apply to the chosen mode are ignored;
-  a TOML error message can quote a mistyped value.
+  a TOML parse error can quote a value of the wrong type, which may be a secret
+  typed into the wrong key (§8.3).
 - The binary's dependencies (`toml`, `tracing-subscriber`, tokio's signal and
   net features) are compiled by embedders too.
 - The overview's dismiss button keeps focus after a click, which pauses

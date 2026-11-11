@@ -56,6 +56,63 @@ async fn overview_empty_install_renders() {
     db.cleanup().await;
 }
 
+/// The overview's queue-table cells for `queue`, keyed by column header, tags stripped.
+fn queue_row(body: &str, queue: &str) -> std::collections::HashMap<String, String> {
+    let strip = |html: &str| {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out.trim().to_owned()
+    };
+    let table = body
+        .split("<h2>Queues</h2>")
+        .nth(1)
+        .and_then(|t| t.split("</table>").next())
+        .expect("queue table");
+    let headers: Vec<String> = table
+        .split("<th>")
+        .skip(1)
+        .map(|h| strip(h.split("</th>").next().unwrap()))
+        .collect();
+    let link = format!("href=\"/queued?queue={queue}\"");
+    let row = table
+        .split("<tr>")
+        .find(|r| r.contains(&link))
+        .expect("queue row");
+    let cells = row
+        .split("<td>")
+        .skip(1)
+        .map(|c| strip(c.split("</td>").next().unwrap()));
+    headers.into_iter().zip(cells).collect()
+}
+
+#[tokio::test]
+async fn overview_shows_queued_total_beside_due() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, due_at) \
+         SELECT 'k' || g, 'send', 'email', \
+                CASE WHEN g <= 2 THEN now() - interval '1 minute' \
+                     ELSE now() + interval '1 hour' END \
+         FROM generate_series(1, 5) g",
+    )
+    .await;
+    let (status, _, body) = get(app(&db), "/").await;
+    assert_eq!(status, StatusCode::OK);
+    let row = queue_row(&body, "email");
+    assert_eq!(row.get("Queued").map(String::as_str), Some("5"), "{row:?}");
+    assert_eq!(row.get("Due").map(String::as_str), Some("2"), "{row:?}");
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn overview_alerts_unserved_queue() {
     let db = TestDb::new().await;

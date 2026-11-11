@@ -308,7 +308,7 @@ strings, so any name works, `/`, `&` and `#` included.
 
 | Route | What it shows or does |
 | --- | --- |
-| `GET /`, `GET /overview` | The overview: alert, workers summary, queue table with status, failure groups, tasks with no handler, recent actions. |
+| `GET /`, `GET /overview` | The overview: alert, workers summary, queue table with status and counts, failure groups, tasks with no handler, recent actions. |
 | `GET /workers` | Every registered worker, live first; lost workers greyed. |
 | `GET /queued?queue=…` | One queue in dequeue order. Without `queue`, a list of known queues. |
 | `GET /running` | Running tasks, soonest lease expiry first. |
@@ -345,6 +345,9 @@ live worker; dismissing it lasts until that set of queues changes.
 
 Other things the overview shows:
 
+- **Queued and Due** count the queue's queued tasks: all of them, and those
+  already due. Each reads at most `count_cap` rows and shows `10,000+` beyond
+  that.
 - **Done and Dead columns** count the last `window` (1 h). When at least
   `count_cap` tasks finished in that time, the header shows the span actually
   covered, for example `Done (last 7m)`, and every count in the column is a
