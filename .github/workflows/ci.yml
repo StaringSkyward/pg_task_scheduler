@@ -70,5 +70,8 @@ jobs:
         run: cargo build
 
       - name: Test
+        run: cargo test
+
+      - name: Test (all features)
         run: cargo test --all-features
 
