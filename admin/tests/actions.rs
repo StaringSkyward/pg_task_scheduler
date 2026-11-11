@@ -170,6 +170,24 @@ async fn cancel_requires_reason() {
     db.cleanup().await;
 }
 
+/// A failed action's page never auto-reloads: reloading a POST result asks to resubmit it,
+/// and resubmitting could run the action again.
+#[tokio::test]
+async fn failed_action_page_does_not_auto_refresh() {
+    let db = TestDb::new().await;
+    let id = queued(&db, "a", "default", "k1").await;
+    let blank = post(app(&db), &format!("/tasks/{id}/cancel"), &[("reason", "")]).await;
+    let missing = post(app(&db), "/tasks/999999/cancel", &[("reason", "r")]).await;
+    for (r, want) in [
+        (blank, StatusCode::BAD_REQUEST),
+        (missing, StatusCode::CONFLICT),
+    ] {
+        assert_eq!(r.status, want);
+        assert!(r.body.contains(r#"data-refresh="0""#), "{}", r.body);
+    }
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn cross_site_form_post_is_rejected() {
     let db = TestDb::new().await;

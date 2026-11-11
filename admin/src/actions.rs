@@ -25,17 +25,17 @@ pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
         .route("/bulk", get(confirm::<P>).post(bulk::<P>))
 }
 
+/// The error page, never auto-refreshed: reloading a POST result would offer to resubmit it.
 fn fail(
     state: &AppState<impl SchedulerPool>,
     status: StatusCode,
     msg: impl Into<String>,
 ) -> Response {
-    let config = &state.config;
     render(
         ErrorPage {
             title: "Action failed",
-            base: config.base_path.clone(),
-            refresh: config.refresh_seconds,
+            base: state.config.base_path.clone(),
+            refresh: 0,
             error: msg.into(),
         },
         status,
