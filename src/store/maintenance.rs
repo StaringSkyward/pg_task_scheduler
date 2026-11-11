@@ -36,14 +36,28 @@ const REAP: &str = r#"
     SELECT status FROM reaped
 "#;
 
-// §20, both terminal states in one bounded statement (served by queue_tasks_terminal_cleanup_idx).
-const CLEANUP_TASKS: &str = r#"
+// §20, one statement per terminal status: each is an ordered range scan of
+// queue_tasks_terminal_cleanup_idx with `completed_at < cutoff` as its index condition,
+// stopping at the LIMIT. One OR across both statuses cannot be one range: the planner
+// walks the whole index filtering every retained row, or bitmap-scans and sorts every
+// eligible row before the LIMIT.
+const CLEANUP_DONE: &str = r#"
     WITH doomed AS (
         SELECT id FROM queue_tasks
-        WHERE (status = 'done' AND completed_at < now() - $1::interval)
-           OR (status = 'dead' AND completed_at < now() - $2::interval)
+        WHERE status = 'done' AND completed_at < now() - $1::interval
         ORDER BY completed_at ASC, id ASC
-        LIMIT $3
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM queue_tasks AS q USING doomed AS d WHERE q.id = d.id
+"#;
+
+const CLEANUP_DEAD: &str = r#"
+    WITH doomed AS (
+        SELECT id FROM queue_tasks
+        WHERE status = 'dead' AND completed_at < now() - $1::interval
+        ORDER BY completed_at ASC, id ASC
+        LIMIT $2
         FOR UPDATE SKIP LOCKED
     )
     DELETE FROM queue_tasks AS q USING doomed AS d WHERE q.id = d.id
@@ -89,23 +103,37 @@ pub async fn reap_expired(
     })
 }
 
-/// Delete one bounded batch of expired terminal tasks and one of published outbox rows. Call
-/// repeatedly until both counts are below `retention.batch_size`.
+/// Delete one bounded batch of expired terminal tasks (`done` first, then `dead`, at most
+/// `retention.batch_size` in all) and one of published outbox rows. Call repeatedly until
+/// both counts are below `retention.batch_size`.
 pub async fn cleanup(
     conn: &mut AsyncPgConnection,
     retention: &Retention,
 ) -> Result<CleanupSummary, SchedulerError> {
-    let batch = limit(retention.batch_size);
-    let tasks = diesel::sql_query(CLEANUP_TASKS)
+    let batch = retention.batch_size;
+    let done = diesel::sql_query(CLEANUP_DONE)
         .bind::<sql_types::Interval, _>(pg_interval(retention.done))
-        .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
-        .bind::<sql_types::BigInt, _>(batch)
+        .bind::<sql_types::BigInt, _>(limit(batch))
         .execute(conn)
         .await?;
+    // Both statuses share one budget: a call deletes at most `batch_size` task rows.
+    let dead = match NonZeroUsize::new(batch.get().saturating_sub(done)) {
+        Some(left) => {
+            diesel::sql_query(CLEANUP_DEAD)
+                .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
+                .bind::<sql_types::BigInt, _>(limit(left))
+                .execute(conn)
+                .await?
+        }
+        None => 0,
+    };
     let outbox = diesel::sql_query(CLEANUP_OUTBOX)
         .bind::<sql_types::Interval, _>(pg_interval(retention.outbox_published))
-        .bind::<sql_types::BigInt, _>(batch)
+        .bind::<sql_types::BigInt, _>(limit(batch))
         .execute(conn)
         .await?;
-    Ok(CleanupSummary { tasks, outbox })
+    Ok(CleanupSummary {
+        tasks: done + dead,
+        outbox,
+    })
 }
