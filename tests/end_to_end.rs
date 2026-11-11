@@ -1,12 +1,15 @@
 #![cfg(feature = "cron")]
 mod common;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob};
 use pg_task_scheduler::{
-    CronExpression, JobLifecycle, MaxAttempts, Scheduler, TaskId, TaskName, TaskStatus, store,
+    CronExpression, EnqueueOptions, HealthStatus, JobLifecycle, MaxAttempts, Scheduler, TaskId,
+    TaskKey, TaskName, TaskStatus, enqueue, store,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -91,4 +94,78 @@ async fn wait_done(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+struct Hold;
+impl pg_task_scheduler::Task for Hold {
+    const NAME: &'static str = "hold";
+    type Args = serde_json::Value;
+}
+
+/// A failing materialization degrades health, but claiming goes on: a full batch still
+/// loops straight into the next claim instead of sleeping for `max_poll_interval`.
+#[tokio::test]
+async fn materialize_failure_degrades_health_without_slowing_claims() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query("DROP TABLE scheduler_jobs")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    for i in 0..3 {
+        enqueue::<Hold>(
+            &mut conn,
+            TaskKey::try_from(format!("k{i}")).unwrap(),
+            serde_json::json!({}),
+            EnqueueOptions::immediate(),
+        )
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    let started = Arc::new(AtomicU32::new(0));
+    let counter = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .claim_batch_size(NonZeroUsize::MIN) // every claim of one task is a full batch
+        .max_poll_interval(Duration::from_secs(10))
+        .shutdown_timeout(Duration::from_millis(100))
+        .register_task::<Hold, _, _>(move |_ctx, _args| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await // no handler finishing wakes the loop
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let health = scheduler.health();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
+
+    let start = std::time::Instant::now();
+    while started.load(Ordering::SeqCst) < 3 {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "full batches waited for max_poll_interval"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let h = health.borrow().clone();
+    assert_eq!(h.status, HealthStatus::Degraded);
+    assert!(
+        h.last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("scheduler_jobs"),
+        "{h:?}"
+    );
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
+    db.cleanup().await;
 }

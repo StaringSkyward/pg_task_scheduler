@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,17 +39,26 @@ impl<P: SchedulerPool> Scheduler<P> {
         let names = registry.names();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrency.get()));
         let mut in_flight = JoinSet::new();
-        let mut listener: Option<P::Conn> = None;
+        let mut listener = Listener::<P>(None);
         let mut failures = 0u64;
-        // A child token: cancelled together with `cancel`.
-        let maintenance =
-            tokio::spawn(maintain(pool.clone(), config.clone(), cancel.child_token()));
+        // A child token: cancelled together with `cancel`, or by the guard if this future is
+        // dropped (aborted, or a failed `try_join!` sibling) so maintenance never outlives it.
+        let maintenance_token = cancel.child_token();
+        let _stop_maintenance = maintenance_token.clone().drop_guard();
+        let maintenance = tokio::spawn(maintain(pool.clone(), config.clone(), maintenance_token));
+        #[cfg(feature = "cron")]
+        let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
         while !cancel.is_cancelled() {
+            // At most once per `max_poll_interval`; the wait below wakes for it, so a due
+            // schedule is materialized within `max_poll_interval`.
             #[cfg(feature = "cron")]
-            let materialized = materialize(&pool).await;
-            if listener.is_none() {
-                listener = listen(&pool).await;
+            if Instant::now() >= next_materialize {
+                next_materialize = Instant::now() + config.max_poll_interval;
+                materialized = materialize(&pool).await;
+            }
+            if listener.0.is_none() {
+                listener.0 = listen(&pool).await;
             }
             let want = semaphore
                 .available_permits()
@@ -66,10 +76,12 @@ impl<P: SchedulerPool> Scheduler<P> {
                         want,
                     )
                     .await;
-                    // A failed materialization degrades health but never stops claiming.
+                    // The last materialization's failure degrades health but never stops claiming.
                     #[cfg(feature = "cron")]
-                    let cycle = materialized.and(cycle);
-                    report(&health_tx, &mut failures, cycle.as_ref().err());
+                    let failed = cycle.as_ref().err().or(materialized.as_ref().err());
+                    #[cfg(not(feature = "cron"))]
+                    let failed = cycle.as_ref().err();
+                    report(&health_tx, &mut failures, failed);
                     match cycle {
                         Ok(Some(wait)) => wait,
                         Ok(None) => continue, // full batch: more work is likely due
@@ -80,23 +92,25 @@ impl<P: SchedulerPool> Scheduler<P> {
                     }
                 }
             };
+            #[cfg(feature = "cron")]
+            let wait = wait.min(next_materialize.saturating_duration_since(Instant::now()));
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
                 Some(joined) = in_flight.join_next() => log_join(joined),
-                listening = notified(&mut listener) => if !listening {
+                listening = notified(&mut listener.0) => if !listening {
                     tracing::warn!("LISTEN connection failed; re-listening");
-                    listener = None;
+                    listener = Listener(None);
                 },
                 () = tokio::time::sleep(wait) => {}
             }
         }
 
-        let _ = maintenance.await;
-        if let Some(mut conn) = listener
-            && let Err(error) = diesel::sql_query("UNLISTEN *").execute(&mut *conn).await
-        {
-            tracing::warn!(%error, "UNLISTEN failed");
+        if let Err(error) = maintenance.await {
+            tracing::error!(%error, "maintenance task panicked");
+        }
+        if let Some(conn) = listener.0.take() {
+            unlisten(conn).await;
         }
         let drain = async {
             while let Some(joined) = in_flight.join_next().await {
@@ -134,7 +148,7 @@ fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// Turn due recurring schedules into queued tasks.
+/// Turn due recurring schedules into queued tasks; the metric counts tasks inserted.
 #[cfg(feature = "cron")]
 async fn materialize<P: SchedulerPool>(pool: &P) -> Result<(), SchedulerError> {
     let mut conn = acquire(pool).await?;
@@ -159,6 +173,28 @@ async fn listen<P: SchedulerPool>(pool: &P) -> Option<P::Conn> {
     listening
         .inspect_err(|error| tracing::warn!(%error, "LISTEN failed; polling only"))
         .ok()
+}
+
+/// The `LISTEN` connection, if any. Dropped while still holding one (the run future was
+/// dropped, or the connection failed), it runs `UNLISTEN *` on a spawned task before the
+/// connection returns to the pool: a pooled connection left listening buffers every
+/// `queue_available` notification in the database, unbounded, for as long as it lives.
+struct Listener<P: SchedulerPool>(Option<P::Conn>);
+
+impl<P: SchedulerPool> Drop for Listener<P> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(unlisten(conn));
+        }
+    }
+}
+
+async fn unlisten<C: DerefMut<Target = AsyncPgConnection>>(mut conn: C) {
+    if let Err(error) = diesel::sql_query("UNLISTEN *").execute(&mut *conn).await {
+        tracing::warn!(%error, "UNLISTEN failed");
+    }
 }
 
 /// Wait for a notification (forever without a listener), then drain any already
@@ -260,7 +296,7 @@ fn log_join(joined: Result<(), JoinError>) {
     if let Err(error) = joined
         && error.is_panic()
     {
-        tracing::error!(%error, "handler panicked; the reaper recovers its task after the lease");
+        tracing::error!(%error, "dispatch panicked; the reaper recovers its task after the lease");
     }
 }
 
@@ -287,7 +323,7 @@ fn dispatch<P: SchedulerPool>(
         let name = task.task_name.as_str().to_owned();
         let cancellation = CancellationToken::new();
         // Cancels ctx.cancellation however dispatch ends: lease lost, finished, or aborted.
-        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let cancel_on_drop = cancellation.clone().drop_guard();
         let ctx = TaskContext {
             lease: task.lease.clone(),
             task_key: task.task_key,
@@ -301,11 +337,37 @@ fn dispatch<P: SchedulerPool>(
         // handler holding the row lock must keep being polled while a heartbeat waits.
         let result = tokio::select! {
             biased;
-            result = handler(ctx, task.payload) => result,
+            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
+                Ok(result) => result,
+                // Not finalized: the attempt stays open and the reaper recovers the task.
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
+                    return;
+                }
+            },
             () = keep_lease(&pool, &task.lease, &config, &name, deadline) => {
-                metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
-                    .increment(1);
-                tracing::warn!("lease lost; handler dropped");
+                drop(cancel_on_drop); // cancel now, not after the check below
+                // A DB-contained handler may have committed its own completion while a
+                // heartbeat waited on the row lock; that heartbeat then matches no row.
+                // Bounded, so a database outage cannot hold the permit here.
+                let completed = async {
+                    store::completed_by(&mut *acquire(&pool).await?, &task.lease).await
+                };
+                let completed = tokio::time::timeout(config.heartbeat_interval, completed).await;
+                if matches!(completed, Ok(Ok(true))) {
+                    metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name)
+                        .increment(1);
+                    tracing::debug!("handler completed the task itself");
+                } else {
+                    metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
+                        .increment(1);
+                    tracing::warn!("lease lost; handler dropped");
+                }
                 return;
             }
         };
@@ -442,12 +504,15 @@ async fn maintain<P: SchedulerPool>(pool: P, config: Arc<Config>, cancel: Cancel
     }
 }
 
-/// Loop each bounded batch until a short one: expired leases first, then retention.
+/// Rounds of one reap batch then one cleanup batch, until both run short. Reaping runs
+/// every round, so a cleanup backlog never delays lease recovery.
 async fn maintenance_pass<P: SchedulerPool>(
     pool: &P,
     config: &Config,
 ) -> Result<(), SchedulerError> {
     let mut conn = acquire(pool).await?;
+    let batch = config.retention.batch_size.get();
+    let mut cleaning = true;
     loop {
         let reaped = timed(
             "reap",
@@ -460,18 +525,15 @@ async fn maintenance_pass<P: SchedulerPool>(
         .await?;
         let n = reaped.requeued + reaped.dead;
         metrics::counter!("pg_task_scheduler_leases_expired_total").increment(count(n));
-        if n < config.reaper_batch_size.get() {
-            break;
+        if cleaning {
+            let deleted = timed("cleanup", store::cleanup(&mut conn, &config.retention)).await?;
+            metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "task")
+                .increment(count(deleted.tasks));
+            metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "outbox")
+                .increment(count(deleted.outbox));
+            cleaning = deleted.tasks >= batch || deleted.outbox >= batch;
         }
-    }
-    let batch = config.retention.batch_size.get();
-    loop {
-        let deleted = timed("cleanup", store::cleanup(&mut conn, &config.retention)).await?;
-        metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "task")
-            .increment(count(deleted.tasks));
-        metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "outbox")
-            .increment(count(deleted.outbox));
-        if deleted.tasks < batch && deleted.outbox < batch {
+        if n < config.reaper_batch_size.get() && !cleaning {
             return Ok(());
         }
     }

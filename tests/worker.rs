@@ -11,8 +11,8 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use pg_task_scheduler::store;
 use pg_task_scheduler::{
-    AttemptOutcome, EnqueueOptions, HealthStatus, MaxAttempts, Scheduler, SchedulerError, Task,
-    TaskError, TaskId, TaskKey, TaskStatus, TaskView, enqueue,
+    AttemptOutcome, EnqueueOptions, HealthStatus, MaxAttempts, Retention, Scheduler,
+    SchedulerError, Task, TaskError, TaskId, TaskKey, TaskStatus, TaskView, WorkerId, enqueue,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -380,5 +380,259 @@ async fn crash_after_remote_accept_does_not_duplicate_external_effect() {
             Some(AttemptOutcome::Done)
         ]
     );
+    db.cleanup().await;
+}
+
+/// Claim one queued `name` task outside any scheduler, with a 60 s lease.
+async fn claim_elsewhere(db: &TestDb, name: &str) -> TaskId {
+    let mut conn = db.pool.get().await.unwrap();
+    store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &[name.to_owned()],
+        NonZeroUsize::MIN,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap()
+    .lease
+    .task_id
+}
+
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// Dropping the run future without cancelling it (an aborted JoinHandle, a failed
+/// `try_join!` sibling) must stop maintenance, and must not hand the LISTEN connection
+/// back to the pool still subscribed, where it would buffer every notification.
+#[tokio::test]
+async fn aborted_run_stops_maintenance_and_unlistens() {
+    let db = TestDb::new().await;
+    struct Other;
+    impl Task for Other {
+        const NAME: &'static str = "other";
+        type Args = serde_json::Value;
+    }
+    let mut conn = db.pool.get().await.unwrap();
+    enqueue::<Other>(
+        &mut conn,
+        TaskKey::try_from("other").unwrap(),
+        json!({}),
+        EnqueueOptions::immediate(),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    let other = claim_elsewhere(&db, "other").await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .reaper_interval(ms(50))
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let Worker { cancel, handle } = start(scheduler);
+    tokio::time::sleep(ms(300)).await; // idle and listening
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+
+    // A detached maintenance task would reap this within one 50 ms interval.
+    db.expire_lease(other).await;
+    tokio::time::sleep(ms(300)).await;
+    let task = {
+        let mut conn = db.pool.get().await.unwrap();
+        store::task(&mut conn, other).await.unwrap().unwrap()
+    };
+    assert_eq!(
+        task.status,
+        TaskStatus::Running,
+        "maintenance outlived the run"
+    );
+
+    // Wait for every pooled connection to be idle in the pool (the spawned UNLISTEN holds
+    // the listener until it is done), then check that none of them is still listening.
+    let start = Instant::now();
+    while db.pool.status().available < db.pool.status().size {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a connection never returned"
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+    let mut conns = Vec::new();
+    for _ in 0..db.pool.status().size {
+        conns.push(db.pool.get().await.unwrap());
+    }
+    for conn in &mut conns {
+        let listening = diesel::sql_query("SELECT count(*) AS n FROM pg_listening_channels()")
+            .get_result::<Count>(conn)
+            .await
+            .unwrap()
+            .n;
+        assert_eq!(listening, 0, "a pooled connection is still LISTENing");
+    }
+    drop((conns, cancel));
+    db.cleanup().await;
+}
+
+/// A retention backlog must not hold up lease recovery: the reaper runs between cleanup
+/// batches, not only after the backlog drains.
+#[tokio::test]
+async fn cleanup_backlog_does_not_starve_reaper() {
+    let db = TestDb::new().await;
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+             SELECT 'old-' || i, 'job', 'done', now() - interval '8 days' \
+             FROM generate_series(1, 20000) AS i",
+        )
+        .await
+        .unwrap();
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    claim_elsewhere(&db, "job").await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .reaper_interval(Duration::from_secs(60)) // one pass, starting now
+        .crash_retry_delay(Duration::from_secs(3600)) // keep the reaped task queued
+        .retention(Retention {
+            batch_size: NonZeroUsize::MIN, // one row per cleanup batch: a long drain
+            ..Retention::default()
+        })
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    tokio::time::sleep(ms(200)).await; // the pass is now draining the backlog
+
+    db.expire_lease(id).await;
+    wait_for(&db, id, TaskStatus::Queued, Duration::from_secs(1)).await;
+    let left = db
+        .scalar("SELECT count(*) AS n FROM queue_tasks WHERE status = 'done'")
+        .await;
+    assert!(
+        left > 0,
+        "the backlog drained first, so this proves nothing"
+    );
+
+    run.stop().await;
+    db.cleanup().await;
+}
+
+/// Counter totals by metric name. A local recorder sees every task here: `#[tokio::test]`
+/// runs them all on the test thread.
+#[derive(Clone, Default)]
+struct Counters(Arc<Mutex<HashMap<String, u64>>>);
+
+impl Counters {
+    fn get(&self, name: &str) -> u64 {
+        self.0.lock().unwrap().get(name).copied().unwrap_or(0)
+    }
+}
+
+struct NamedCounter(Counters, String);
+
+impl metrics::CounterFn for NamedCounter {
+    fn increment(&self, value: u64) {
+        *self.0.0.lock().unwrap().entry(self.1.clone()).or_default() += value;
+    }
+    fn absolute(&self, _value: u64) {}
+}
+
+impl metrics::Recorder for Counters {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(Arc::new(NamedCounter(self.clone(), key.name().to_owned())))
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// A DB-contained handler completes the task and is still running when a heartbeat
+/// matches no row. The task is done by this lease, so it counts as done, not as a lost lease.
+#[tokio::test]
+async fn db_contained_completion_before_handler_returns_counts_as_done() {
+    let counters = Counters::default();
+    let _recorder = metrics::set_default_local_recorder(&counters);
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let pool = db.pool.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(600))
+        .heartbeat_interval(ms(200))
+        .register_task::<Job, _, _>(move |ctx, _args| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool
+                    .get()
+                    .await
+                    .map_err(|e| TaskError::retry(e.to_string()))?;
+                conn.transaction::<_, SchedulerError, _>(async |c| {
+                    store::lock_owned(c, &ctx.lease).await?;
+                    // The heartbeat at 200 ms waits on this row lock, then matches no row.
+                    tokio::time::sleep(ms(300)).await;
+                    store::complete(c, &ctx.lease).await
+                })
+                .await
+                .map_err(|e| TaskError::retry(e.to_string()))?;
+                // Never return: the lease keeper ends this dispatch.
+                std::future::pending().await
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, id, TaskStatus::Done, Duration::from_secs(3)).await;
+    let (done, lost) = (
+        "pg_task_scheduler_tasks_done_total",
+        "pg_task_scheduler_leases_lost_total",
+    );
+    let start = Instant::now();
+    while counters.get(done) + counters.get(lost) == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "dispatch never ended"
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+    assert_eq!((counters.get(done), counters.get(lost)), (1, 0));
+
+    run.stop().await;
     db.cleanup().await;
 }
