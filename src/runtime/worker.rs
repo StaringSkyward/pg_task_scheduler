@@ -37,6 +37,12 @@ struct Shutdown {
     expired: CancellationToken,
 }
 
+/// A served queue and the permits that limit its running handlers.
+struct WorkerQueue {
+    name: QueueName,
+    permits: Arc<Semaphore>,
+}
+
 impl<P: SchedulerPool> Scheduler<P> {
     /// Claim and run tasks until `cancel` fires. Then stop claiming and maintenance, cancel
     /// every handler's `ctx.cancellation`, and drain for up to `shutdown_timeout`. Handlers
@@ -52,7 +58,14 @@ impl<P: SchedulerPool> Scheduler<P> {
         let health = StoppedOnDrop(health_tx);
         let config = Arc::new(config);
         let names = registry.names();
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrency.get()));
+        let queues: Vec<_> = config
+            .queues
+            .iter()
+            .map(|(name, limit)| WorkerQueue {
+                name: name.clone(),
+                permits: Arc::new(Semaphore::new(limit.get())),
+            })
+            .collect();
         let mut in_flight = JoinSet::new();
         let shutdown = Shutdown {
             begun: cancel.clone(),
@@ -85,36 +98,35 @@ impl<P: SchedulerPool> Scheduler<P> {
             if listener.conn.is_none() {
                 listener.conn = listen(&pool).await;
             }
-            let wait = match semaphore.available_permits() {
-                0 => config.max_poll_interval,
-                _ => {
-                    let cycle = claim_cycle(
-                        &pool,
-                        &registry,
-                        &names,
-                        &config,
-                        &semaphore,
-                        &mut in_flight,
-                        &shutdown,
-                    )
-                    .await;
-                    // The last materialization's failure keeps health degraded but never stops
-                    // claiming; it counts as one failure per failed run, not per claim cycle.
-                    #[cfg(feature = "cron")]
-                    let (failed, fresh) = (
-                        cycle.as_ref().err().or(materialized.as_ref().err()),
-                        cycle.is_err() || (materialized_now && materialized.is_err()),
-                    );
-                    #[cfg(not(feature = "cron"))]
-                    let (failed, fresh) = (cycle.as_ref().err(), true);
-                    report(&health.0, &mut failures, failed, fresh);
-                    match cycle {
-                        Ok(Some(wait)) => wait,
-                        Ok(None) => continue, // full batch: more work is likely due
-                        Err(error) => {
-                            tracing::error!(%error, "claim failed");
-                            config.max_poll_interval
-                        }
+            let wait = if queues.iter().all(|q| q.permits.available_permits() == 0) {
+                config.max_poll_interval
+            } else {
+                let cycle = claim_cycle(
+                    &pool,
+                    &registry,
+                    &names,
+                    &config,
+                    &queues,
+                    &mut in_flight,
+                    &shutdown,
+                )
+                .await;
+                // The last materialization's failure keeps health degraded but never stops
+                // claiming; it counts as one failure per failed run, not per claim cycle.
+                #[cfg(feature = "cron")]
+                let (failed, fresh) = (
+                    cycle.as_ref().err().or(materialized.as_ref().err()),
+                    cycle.is_err() || (materialized_now && materialized.is_err()),
+                );
+                #[cfg(not(feature = "cron"))]
+                let (failed, fresh) = (cycle.as_ref().err(), true);
+                report(&health.0, &mut failures, failed, fresh);
+                match cycle {
+                    Ok(Some(wait)) => wait,
+                    Ok(None) => continue, // full batch: more work is likely due
+                    Err(error) => {
+                        tracing::error!(%error, "claim failed");
+                        config.max_poll_interval
                     }
                 }
             };
@@ -256,67 +268,80 @@ async fn notified<C: DerefMut<Target = AsyncPgConnection>>(listener: &mut Option
     true
 }
 
-/// Claim up to `min(free permits, claim_batch_size)` due tasks and spawn a dispatch for each.
-/// `None` when the batch was full, else how long to wait: until the next due task, within
-/// `MIN_WAIT..=max_poll_interval`.
+/// For each queue with a free permit, in configuration order: claim up to
+/// `min(its free permits, claim_batch_size)` of its due tasks and spawn a dispatch for each.
+/// `None` when any batch was full, else how long to wait: until the next due task in a queue
+/// that still has a free permit, within `MIN_WAIT..=max_poll_interval`.
 async fn claim_cycle<P: SchedulerPool>(
     pool: &P,
     registry: &Registry,
     names: &[String],
     config: &Arc<Config>,
-    semaphore: &Arc<Semaphore>,
+    queues: &[WorkerQueue],
     in_flight: &mut JoinSet<()>,
     shutdown: &Shutdown,
 ) -> Result<Option<Duration>, SchedulerError> {
-    let want = semaphore
-        .available_permits()
-        .min(config.claim_batch_size.get());
-    let want = NonZeroUsize::new(want).ok_or(SchedulerError::Invariant("no free permit"))?;
     let mut conn = acquire(pool).await?;
-    let sent = Instant::now();
-    let claimed = timed(
-        "claim",
-        store::claim(
-            &mut conn,
-            &config.worker_id,
-            &QueueName::default(),
-            names,
-            want,
-            config.lease_duration,
-        ),
-    )
-    .await?;
-    let full = claimed.len() == want.get();
-    for task in claimed {
-        let name = task.task_name.as_str().to_owned();
-        let latency = (task.claimed_at - task.due_at).to_std().unwrap_or_default();
-        metrics::counter!("pg_task_scheduler_tasks_claimed_total", "task_name" => name.clone())
-            .increment(1);
-        metrics::histogram!("pg_task_scheduler_claim_latency_seconds", "task_name" => name)
-            .record(latency);
-        let permit = semaphore
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| SchedulerError::Invariant("claimed more tasks than free permits"))?;
-        let handler = registry
-            .get(&task.task_name)
-            .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
-        let deadline = sent + config.lease_duration;
-        in_flight.spawn(dispatch(
-            pool.clone(),
-            config.clone(),
-            handler,
-            task,
-            deadline,
-            permit,
-            shutdown.clone(),
-        ));
+    let mut full = false;
+    for queue in queues {
+        let free = queue.permits.available_permits();
+        let Some(want) = NonZeroUsize::new(free.min(config.claim_batch_size.get())) else {
+            continue;
+        };
+        let sent = Instant::now();
+        let claimed = timed(
+            "claim",
+            store::claim(
+                &mut conn,
+                &config.worker_id,
+                &queue.name,
+                names,
+                want,
+                config.lease_duration,
+            ),
+        )
+        .await?;
+        full |= claimed.len() == want.get();
+        for task in claimed {
+            let name = task.task_name.as_str().to_owned();
+            let queue_label = queue.name.as_str().to_owned();
+            let latency = (task.claimed_at - task.due_at).to_std().unwrap_or_default();
+            metrics::counter!("pg_task_scheduler_tasks_claimed_total", "task_name" => name.clone(), "queue" => queue_label.clone())
+                .increment(1);
+            metrics::histogram!("pg_task_scheduler_claim_latency_seconds", "task_name" => name, "queue" => queue_label)
+                .record(latency);
+            let permit =
+                queue.permits.clone().try_acquire_owned().map_err(|_| {
+                    SchedulerError::Invariant("claimed more tasks than free permits")
+                })?;
+            let handler = registry
+                .get(&task.task_name)
+                .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
+            let deadline = sent + config.lease_duration;
+            in_flight.spawn(dispatch(
+                pool.clone(),
+                config.clone(),
+                handler,
+                task,
+                deadline,
+                permit,
+                shutdown.clone(),
+            ));
+        }
     }
     if full {
         return Ok(None);
     }
-    let next = store::next_due_in(&mut conn, &[QueueName::default()], names).await?;
     let max = config.max_poll_interval;
+    let open: Vec<QueueName> = queues
+        .iter()
+        .filter(|q| q.permits.available_permits() > 0)
+        .map(|q| q.name.clone())
+        .collect();
+    if open.is_empty() {
+        return Ok(Some(max));
+    }
+    let next = store::next_due_in(&mut conn, &open, names).await?;
     Ok(Some(next.unwrap_or(max).max(MIN_WAIT).min(max)))
 }
 
@@ -371,6 +396,7 @@ fn dispatch<P: SchedulerPool>(
         task_id = task.lease.task_id.0,
         task_key = task.task_key.as_str(),
         task_name = task.task_name.as_str(),
+        queue = task.queue.as_str(),
         attempt_no = task.lease.attempt_no,
         worker_id = config.worker_id.as_str(),
         lock_token = task.lease.lock_token.0,

@@ -25,7 +25,8 @@ scheduled tasks, and retries all use the same `due_at` mechanism.
   exactly-once only when the destination deduplicates by `task_key` (or fences
   by `lock_token`).
 - **Best-effort priority:** `FOR UPDATE SKIP LOCKED` can skip a locked
-  high-priority task and run a lower one.
+  high-priority task and run a lower one. Priority applies within a queue; use
+  queues to isolate work that must not starve.
 
 See [Concurrency Model](docs/Concurrency.md) for races, fencing, and scaling,
 and [Scheduler Design](docs/SchedulerDesign.md) for the data model and state
@@ -127,6 +128,51 @@ Handlers classify every failure:
   shutdown began. During shutdown the task is released without counting the
   attempt. Outside shutdown it is retried like `TaskError::retry(..)`.
 
+### Queues
+
+Every task belongs to one queue. A worker serves the queues configured with
+`.queue(name, limit)`, each with its own limit on running handlers:
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use pg_task_scheduler::{Scheduler, Task};
+# struct SendEmail;
+# impl Task for SendEmail { const NAME: &'static str = "send-email"; type Args = serde_json::Value; }
+
+struct RebuildReport;
+
+impl Task for RebuildReport {
+    const NAME: &'static str = "rebuild-report";
+    const QUEUE: &'static str = "bulk";
+    type Args = serde_json::Value;
+}
+
+# async fn example(pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>) -> Result<(), Box<dyn std::error::Error>> {
+let scheduler = Scheduler::builder(pool)
+    .queue("default", NonZeroUsize::new(16).unwrap())?
+    .queue("bulk", NonZeroUsize::new(4).unwrap())?
+    .register_task::<SendEmail, _, _>(|_ctx, _args| async { Ok(()) })?
+    .register_task::<RebuildReport, _, _>(|_ctx, _args| async { Ok(()) })?
+    .build()?;
+# let _ = scheduler;
+# Ok(())
+# }
+```
+
+- **Routing:** a task goes to `Task::QUEUE` (default `"default"`).
+  `EnqueueOptions::queue(..)` overrides it for one enqueue.
+- **Priority** orders tasks only within a queue. A queue full of high-priority
+  tasks cannot take another queue's handler slots.
+- **Limits** apply per scheduler instance: three instances serving `bulk` at 4
+  run up to 12 `bulk` handlers. Each claim takes up to `claim_batch_size` tasks
+  from one queue.
+- **Defaults:** with no `.queue(..)` call, a worker serves `default` with a
+  limit of 16. Configuring any queue replaces that implicit default, so add
+  `.queue("default", n)` to keep serving it. Configuring a queue again replaces
+  its limit.
+- **Unserved queues:** a queue that no running worker serves never runs; its
+  tasks stay `queued`. `store::queue_stats` reports depth by queue.
+
 ### Shutdown
 
 When the token passed to `run_until_shutdown` fires, the worker stops claiming
@@ -221,23 +267,25 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
   outbox backlog).
 - **Health:** `Scheduler::health()` reports starting, healthy, degraded, or
   stopped. Claim errors (and, with `cron`, materialize errors) set degraded;
-  heartbeat and maintenance failures do not affect health. A fully busy worker
-  runs no claim cycle, so it keeps its last status. `consecutive_failures`
-  counts failed cycles; a materialize failure counts once until the next
-  materialization, however many claim cycles run meanwhile. Status becomes
-  stopped when `run_until_shutdown` returns or its future is dropped.
+  heartbeat and maintenance failures do not affect health. A worker with no free
+  handler slot in any queue runs no claim cycle, so it keeps its last status.
+  `consecutive_failures` counts failed cycles; a materialize failure counts once
+  until the next materialization, however many claim cycles run meanwhile.
+  Status becomes stopped when `run_until_shutdown` returns or its future is
+  dropped.
 - **Timeouts:** set `statement_timeout` and `lock_timeout` on pool connections.
   Queue statements are short.
 - **Connections:** each running scheduler holds one pool connection for
   `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
   finalization, and maintenance. Handlers hold no connection unless they take
   one. Per scheduler sharing a pool, that is 1 for `LISTEN`, 1 for claims and
-  maintenance, and up to `max_concurrency` for heartbeats and finalization, plus
-  one per handler that takes its own. So set the pool's `max_size` to at least
-  `max_concurrency + 2` per scheduler, plus whatever handlers take. A smaller pool
-  starves heartbeats until local deadlines drop handlers. Deadpool's default
-  `max_size` is 2 × the logical CPU count (4 on a 2-vCPU host), well below the
-  18 that the default `max_concurrency` of 16 needs.
+  maintenance, and up to the sum of queue limits for heartbeats and
+  finalization, plus one per handler that takes its own. So set the pool's
+  `max_size` to at least the sum of queue limits + 2 per scheduler, plus whatever
+  handlers take. A smaller pool starves heartbeats until local deadlines drop
+  handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4 on a
+  2-vCPU host), well below the 16 + 2 = 18 that the default queue's limit of 16
+  needs.
 
 ### Observability
 
@@ -245,17 +293,17 @@ The crate emits signals through the standard facades and configures neither of
 them:
 
 - **Logs and spans** use [`tracing`](https://docs.rs/tracing). Each task runs
-  inside a `task` span with `task_id`, `task_key`, `task_name`, `attempt_no`,
-  `worker_id`, and `lock_token`. Failure events add `classification`
-  (`retryable` or `permanent`) and, for retries, `retry_due_at`. Install any
-  subscriber you like.
+  inside a `task` span with `task_id`, `task_key`, `task_name`, `queue`,
+  `attempt_no`, `worker_id`, and `lock_token`. Failure events add
+  `classification` (`retryable` or `permanent`) and, for retries,
+  `retry_due_at`. Install any subscriber you like.
 - **Metrics** use [`metrics`](https://docs.rs/metrics). Install a recorder or
   exporter (Prometheus, StatsD, OpenTelemetry, …) in the application. Without
   one, every metric call is a no-op.
 
 | Metric | Kind | Labels |
 | --- | --- | --- |
-| `pg_task_scheduler_tasks_claimed_total` | counter | `task_name` |
+| `pg_task_scheduler_tasks_claimed_total` | counter | `task_name`, `queue` |
 | `pg_task_scheduler_tasks_done_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_retried_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_dead_total` | counter | `task_name` |
@@ -265,7 +313,7 @@ them:
 | `pg_task_scheduler_leases_expired_total` | counter | (none; reaper) |
 | `pg_task_scheduler_tasks_materialized_total` | counter | (none; `cron` feature only) |
 | `pg_task_scheduler_cleanup_deleted_total` | counter | `kind` = `task` or `outbox` |
-| `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name` (claim time − `due_at`, database clock) |
+| `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name`, `queue` (claim time − `due_at`, database clock) |
 | `pg_task_scheduler_task_duration_seconds` | histogram | `task_name` |
 | `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `release`, `reap`, `cleanup` or `materialize` (`materialize` is `cron` only) |
 

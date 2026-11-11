@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::error::{RegisterError, SchedulerError, TaskError};
-use crate::ids::{IdentifierError, TaskName, WorkerId};
+use crate::ids::{IdentifierError, QueueName, TaskName, WorkerId};
 use crate::models::Retention;
 use crate::pool::SchedulerPool;
 use crate::queue::Task;
@@ -21,7 +21,8 @@ const MAX_DURATION: Duration = Duration::from_secs(5 * 365 * 86_400);
 
 pub(crate) struct Config {
     pub worker_id: WorkerId,
-    pub max_concurrency: NonZeroUsize,
+    /// Served queues and their handler limits, in configuration order.
+    pub queues: Vec<(QueueName, NonZeroUsize)>,
     pub claim_batch_size: NonZeroUsize,
     pub lease_duration: Duration,
     pub heartbeat_interval: Duration,
@@ -56,9 +57,7 @@ macro_rules! setters {
 
 impl<P: SchedulerPool> SchedulerBuilder<P> {
     setters! {
-        /// Handlers running at once (default 16).
-        max_concurrency: NonZeroUsize;
-        /// Most tasks taken per claim statement (default 16).
+        /// Most tasks taken per claim statement, per queue (default 16).
         claim_batch_size: NonZeroUsize;
         /// Lease granted by each claim and heartbeat, in PostgreSQL time (default 60 s).
         lease_duration: Duration;
@@ -84,6 +83,22 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         /// to return; those still running are released, for up to 5 s more, then aborted
         /// (default 25 s).
         shutdown_timeout: Duration;
+    }
+
+    /// Serve `name`, running at most `limit` of its handlers at once. Configuring any queue
+    /// replaces the implicit `default` queue (limit 16). Add `.queue("default", n)` to keep
+    /// serving it.
+    pub fn queue(
+        mut self,
+        name: impl TryInto<QueueName, Error: Into<IdentifierError>>,
+        limit: NonZeroUsize,
+    ) -> Result<Self, IdentifierError> {
+        let name = name.try_into().map_err(Into::into)?;
+        match self.config.queues.iter_mut().find(|(q, _)| *q == name) {
+            Some(entry) => entry.1 = limit,
+            None => self.config.queues.push((name, limit)),
+        }
+        Ok(self)
     }
 
     /// Register a handler for `name`; the payload is deserialized into `A`.
@@ -112,7 +127,10 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         self.register::<T::Args, _, _>(T::NAME, handler)
     }
 
-    pub fn build(self) -> Result<Scheduler<P>, SchedulerError> {
+    pub fn build(mut self) -> Result<Scheduler<P>, SchedulerError> {
+        if self.config.queues.is_empty() {
+            self.config.queues.push((QueueName::default(), SIXTEEN));
+        }
         let c = &self.config;
         let r = &c.retention;
         let durations = [
@@ -182,7 +200,7 @@ impl<P: SchedulerPool> Scheduler<P> {
             registry: Registry::new(),
             config: Config {
                 worker_id: WorkerId::generate(),
-                max_concurrency: SIXTEEN,
+                queues: Vec::new(),
                 claim_batch_size: SIXTEEN,
                 lease_duration: Duration::from_secs(60),
                 heartbeat_interval: Duration::from_secs(20),
@@ -236,6 +254,39 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    fn n(v: usize) -> NonZeroUsize {
+        NonZeroUsize::new(v).unwrap()
+    }
+
+    #[test]
+    fn default_queue_when_none_configured() {
+        let s = builder().build().unwrap();
+        assert_eq!(s.config.queues, vec![(QueueName::default(), SIXTEEN)]);
+    }
+
+    #[test]
+    fn configured_queue_replaces_default_and_last_limit_wins() {
+        let s = builder()
+            .queue("bulk", n(2))
+            .unwrap()
+            .queue("bulk", n(3))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            s.config.queues,
+            vec![(QueueName::try_from("bulk").unwrap(), n(3))]
+        );
+    }
+
+    #[test]
+    fn queue_rejects_invalid_name() {
+        assert!(matches!(
+            builder().queue("", n(1)),
+            Err(IdentifierError::Empty)
+        ));
     }
 
     #[test]

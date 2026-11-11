@@ -79,6 +79,7 @@ cursor. It is not part of the queue protocol.
 | --- | --- | --- |
 | attempts PK `(task_id, attempt_no)` | PK `(task_id, lock_token)` plus an index on `(task_id, attempt_no)` | §18 replay resets `attempts`, so the next claim would reuse `attempt_no = 1` and violate the PK. `lock_token` never repeats. |
 | claim selects any due task | adds `task_name = ANY($registered)` | a worker claims only names it can execute |
+| §4.1 has no queue | `queue` column; claims filter one queue; per-queue worker limits | §16 "separate logical queues/worker pools" against starvation |
 | replay "SHOULD be audited" | `queue_task_replays` table | durable audit with operator and reason |
 | enqueue always notifies | notifies only when a row was inserted | a duplicate adds no work |
 | no cancel transition | none provided | §5 permits only the five listed transitions |
@@ -143,11 +144,14 @@ one attempt row closes.
 startup:  generate UUID worker_id; LISTEN queue_available on one pooled connection;
           spawn maintenance (reaper + cleanup every reaper_interval)
 loop:     [cron] materialize due schedules, at most once per max_poll_interval
-          claim up to min(free permits, claim_batch_size)
-          spawn one dispatch per claim
-          if the batch was full: loop again immediately
-          otherwise wait for the first of: notification, next due_at
-          (clamped to 10 ms..max_poll_interval), [cron] the next materialization,
+          if no queue has a free permit: no claim cycle; wait max_poll_interval
+          for each queue with a free permit, in configuration order, on one connection:
+            claim up to min(its free permits, claim_batch_size) from that queue
+            spawn one dispatch per claim, holding one of that queue's permits
+          if any batch was full: loop again immediately
+          otherwise wait for the first of: notification, next due_at among queues
+          that still have a free permit (clamped to 10 ms..max_poll_interval;
+          max_poll_interval if none has), [cron] the next materialization,
           a handler finishing, shutdown
 maintain: every reaper_interval, rounds of one reap batch then one cleanup batch
           until both run short
@@ -187,8 +191,8 @@ recovers it after the lease expires.
 
 | Builder method | Default |
 | --- | --- |
-| `max_concurrency` | 16 handlers per scheduler |
-| `claim_batch_size` | 16 |
+| `queue(name, limit)` | `default`, 16 handlers per scheduler; configuring any queue replaces it |
+| `claim_batch_size` | 16 per queue claim |
 | `lease_duration` | 60 s |
 | `heartbeat_interval` | 20 s (must be ≤ lease / 3) |
 | `max_poll_interval` | 1 s |

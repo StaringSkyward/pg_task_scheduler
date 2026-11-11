@@ -11,8 +11,9 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use pg_task_scheduler::store;
 use pg_task_scheduler::{
-    AttemptOutcome, EnqueueOptions, HealthStatus, MaxAttempts, Retention, Scheduler,
-    SchedulerError, Task, TaskError, TaskId, TaskKey, TaskStatus, TaskView, WorkerId, enqueue,
+    AttemptOutcome, EnqueueOptions, HealthStatus, MaxAttempts, Priority, QueueName, Retention,
+    Scheduler, SchedulerError, Task, TaskError, TaskId, TaskKey, TaskStatus, TaskView, WorkerId,
+    enqueue,
 };
 use serde_json::json;
 use tokio::sync::Notify;
@@ -27,6 +28,14 @@ impl Task for Job {
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
+}
+
+fn n(v: usize) -> NonZeroUsize {
+    NonZeroUsize::new(v).unwrap()
+}
+
+fn bulk() -> QueueName {
+    QueueName::try_from("bulk").unwrap()
 }
 
 async fn enqueue_job(db: &TestDb, key: &str, options: EnqueueOptions) -> TaskId {
@@ -309,7 +318,8 @@ async fn bulk_workers_process_each_task_once() {
         .map(|_| {
             start(
                 Scheduler::builder(db.pool.clone())
-                    .max_concurrency(NonZeroUsize::new(4).unwrap())
+                    .queue("default", n(4))
+                    .unwrap()
                     .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
                     .unwrap()
                     .build()
@@ -341,6 +351,77 @@ async fn bulk_workers_process_each_task_once() {
             .await,
         0
     );
+    db.cleanup().await;
+}
+
+/// One pool of 2 would give both slots to the priority-10 tasks forever; queues isolate capacity.
+#[tokio::test]
+async fn busy_queue_does_not_starve_another_queue() {
+    let db = TestDb::new().await;
+    for i in 0..3 {
+        let options = EnqueueOptions::immediate().priority(Priority::new(10));
+        enqueue_job(&db, &format!("hi{i}"), options).await;
+    }
+    let lo = enqueue_job(&db, "lo", EnqueueOptions::immediate().queue(bulk())).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .queue("default", n(1))
+        .unwrap()
+        .queue("bulk", n(1))
+        .unwrap()
+        .shutdown_timeout(ms(100))
+        .register_task::<Job, _, _>(|ctx, _args| async move {
+            if ctx.task_key.as_str().starts_with("hi") {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, lo, TaskStatus::Done, Duration::from_secs(3)).await;
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM queue_tasks WHERE status = 'running'")
+            .await,
+        1
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT count(*) AS n FROM queue_tasks WHERE status = 'queued' AND task_key LIKE 'hi%'"
+        )
+        .await,
+        2
+    );
+
+    run.stop().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn worker_claims_only_its_configured_queues() {
+    let db = TestDb::new().await;
+    let d = enqueue_job(&db, "d", EnqueueOptions::immediate()).await;
+    let b = enqueue_job(&db, "b", EnqueueOptions::immediate().queue(bulk())).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .queue("bulk", n(1))
+        .unwrap()
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, b, TaskStatus::Done, Duration::from_secs(3)).await;
+    tokio::time::sleep(ms(300)).await;
+    let task = {
+        let mut conn = db.pool.get().await.unwrap();
+        store::task(&mut conn, d).await.unwrap().unwrap()
+    };
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.attempts, 0);
+
+    run.stop().await;
     db.cleanup().await;
 }
 

@@ -37,9 +37,9 @@ no reaper has touched the row yet. It can no longer heartbeat or finalize.
 
 `store::claim` is a single statement:
 
-1. Select due, claimable `queued` rows for the worker's registered task names, in
-   `priority DESC, due_at, id` order, `FOR UPDATE SKIP LOCKED`, up to the batch
-   limit.
+1. Select due, claimable `queued` rows of one queue for the worker's registered
+   task names, in `priority DESC, due_at, id` order, `FOR UPDATE SKIP LOCKED`, up
+   to the batch limit.
 2. Move them to `running`: `attempts + 1`, `lock_token + 1`,
    `locked_by = worker`, `locked_until = clock_timestamp() + lease`.
 3. Insert one `queue_task_attempts` row per claim.
@@ -47,12 +47,17 @@ no reaper has touched the row yet. It can no longer heartbeat or finalize.
 
 The statement is atomic, so a claim and its attempt row commit together or not at
 all. Concurrent claimers skip each other's locked rows, so a queued task gets one
-owner. A scheduler claims at most `min(free permits, claim_batch_size)` tasks.
-`max_concurrency` limits each instance separately, so ten instances at 16 can run
-160 handlers.
+owner.
 
-Workers claim only task names they have handlers for. Worker groups with
-different registrations can share one queue.
+A scheduler serves the queues configured with `.queue(name, limit)` (by default
+`default` at 16), each with its own permits. Each cycle, it claims from every
+queue with a free permit, in configuration order, at most
+`min(that queue's free permits, claim_batch_size)` tasks per queue. Limits apply
+to each instance separately, so ten instances serving `bulk` at 4 can run 40
+`bulk` handlers.
+
+Workers claim only task names they have handlers for, from queues they serve.
+Worker groups with different registrations can share one queue.
 
 ## Races
 
@@ -167,9 +172,17 @@ in one transaction.
 The claim order (`priority DESC, due_at, id`) is a preference, not a guarantee.
 `SKIP LOCKED` lets a worker take a lower-ranked row while a higher one is locked.
 Handler durations reorder completion. Future tasks are never claimed before
-`due_at`, measured in database time. Sustained high-priority load can starve low
-priorities. If that matters, add aging, quotas, or separate worker groups based on
-measurement.
+`due_at`, measured in database time.
+
+Priority orders tasks only within a queue. Sustained high-priority load can
+starve lower priorities in the same queue. Queues handle starvation: each has its
+own handler limit, so a busy queue cannot take another queue's slots. Put work
+that must not starve in its own queue.
+
+There is no priority ageing. An `ORDER BY` that depends on the current time
+defeats the claim index, so every claim would sort all due rows. Periodically
+promoting old rows instead rewrites them, and loses the priority the producer
+chose.
 
 ## Wakeups and Polling
 
@@ -177,7 +190,8 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 
 - enqueue sends `NOTIFY queue_available` on commit when it inserts a task;
 - an idle worker waits for the first of: a notification, the next `due_at`
-  among its task names (database time), or `max_poll_interval` (default 1 s);
+  among its task names in queues with a free permit (database time), or
+  `max_poll_interval` (default 1 s);
 - scheduled tasks and retries become due with no notification, through the
   next-`due_at` wait;
 - if the listening connection fails, the worker keeps polling and re-listens on
@@ -188,13 +202,13 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 - **Connection pool:** each scheduler permanently holds one connection for
   `LISTEN`. Claims, heartbeats, finalization, maintenance, and DB-contained
   handlers take short-lived connections. Each scheduler needs 1 connection for
-  `LISTEN`, plus 1 for claims and maintenance, plus up to `max_concurrency` for
-  heartbeats and finalization, plus one per handler that takes its own. So size
-  `max_size ≥ max_concurrency + 2` per scheduler sharing the pool, plus whatever
-  handlers take. If DB-contained handlers share an undersized pool, heartbeats
-  wait for connections until local deadlines drop the handlers. Deadpool's
-  default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU host), well
-  below the 18 that the default `max_concurrency` of 16 needs.
+  `LISTEN`, plus 1 for claims and maintenance, plus up to the sum of queue limits
+  for heartbeats and finalization, plus one per handler that takes its own. So
+  size `max_size ≥ sum of queue limits + 2` per scheduler sharing the pool, plus
+  whatever handlers take. If DB-contained handlers share an undersized pool,
+  heartbeats wait for connections until local deadlines drop the handlers.
+  Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
+  host), well below the 16 + 2 = 18 that the default queue's limit of 16 needs.
 - **Lease duration:** keep it well above pool wait plus database latency, and
   above the longest DB-contained transaction. A database outage longer than the
   lease lets another worker start the task.
