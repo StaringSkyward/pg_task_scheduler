@@ -21,6 +21,7 @@ async fn claim_uses_claim_index() {
         r#"EXPLAIN SELECT id FROM queue_tasks
            WHERE status = 'queued' AND due_at <= now() AND attempts < max_attempts
              AND queue = 'default' AND task_name = ANY('{email}')
+             AND NOT EXISTS (SELECT 1 FROM queue_pauses WHERE queue = 'default')
            ORDER BY priority DESC, due_at, id LIMIT 16"#,
     )
     .get_results::<PlanLine>(&mut conn)
@@ -47,7 +48,8 @@ async fn next_due_in_uses_due_index() {
         .unwrap();
     let plan = diesel::sql_query(
         "EXPLAIN SELECT min(next.due_at) - now() AS wait \
-         FROM unnest('{default,bulk}'::text[]) AS q(queue) \
+         FROM (SELECT queue FROM unnest('{default,bulk}'::text[]) AS u(queue) \
+               WHERE NOT EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = u.queue)) AS q \
          CROSS JOIN LATERAL ( \
              SELECT min(due_at) AS due_at FROM queue_tasks \
              WHERE status = 'queued' AND queue = q.queue \

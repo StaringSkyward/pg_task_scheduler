@@ -484,3 +484,93 @@ pub async fn count_replayable(
     .await?
     .n)
 }
+
+/// A paused queue.
+#[derive(Debug, Clone, diesel::QueryableByName)]
+pub struct QueuePause {
+    #[diesel(sql_type = sql_types::Text)]
+    pub queue: QueueName,
+    #[diesel(sql_type = sql_types::Text)]
+    pub operator: String,
+    #[diesel(sql_type = sql_types::Text)]
+    pub reason: String,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    pub paused_at: DateTime<Utc>,
+}
+
+// State change and audit row in one statement: the audit is written only if the row was inserted.
+const PAUSE: &str = r#"
+    WITH paused AS (
+        INSERT INTO queue_pauses (queue, operator, reason) VALUES ($1, $2, $3)
+        ON CONFLICT (queue) DO NOTHING RETURNING queue
+    ), act AS (
+        INSERT INTO queue_admin_actions (action, queue, affected, operator, reason)
+        SELECT 'pause', queue, 0, $2, $3 FROM paused
+    )
+    SELECT EXISTS (SELECT 1 FROM paused) AS changed
+"#;
+
+const RESUME: &str = r#"
+    WITH resumed AS (
+        DELETE FROM queue_pauses WHERE queue = $1 RETURNING queue
+    ), act AS (
+        INSERT INTO queue_admin_actions (action, queue, affected, operator, reason)
+        SELECT 'resume', queue, 0, $2, $3 FROM resumed
+    )
+    SELECT EXISTS (SELECT 1 FROM resumed) AS changed
+"#;
+
+#[derive(diesel::QueryableByName)]
+struct ChangedRow {
+    #[diesel(sql_type = sql_types::Bool)]
+    changed: bool,
+}
+
+/// Stop every worker claiming from `queue`; running tasks finish. `true` if newly paused.
+pub async fn pause_queue(
+    conn: &mut AsyncPgConnection,
+    queue: &QueueName,
+    operator: &str,
+    reason: &str,
+) -> Result<bool, SchedulerError> {
+    Ok(diesel::sql_query(PAUSE)
+        .bind::<sql_types::Text, _>(queue)
+        .bind::<sql_types::Text, _>(operator)
+        .bind::<sql_types::Text, _>(reason)
+        .get_result::<ChangedRow>(conn)
+        .await?
+        .changed)
+}
+
+/// Let workers claim from `queue` again and wake them. `true` if it was paused.
+pub async fn resume_queue(
+    conn: &mut AsyncPgConnection,
+    queue: &QueueName,
+    operator: &str,
+    reason: &str,
+) -> Result<bool, SchedulerError> {
+    let changed = diesel::sql_query(RESUME)
+        .bind::<sql_types::Text, _>(queue)
+        .bind::<sql_types::Text, _>(operator)
+        .bind::<sql_types::Text, _>(reason)
+        .get_result::<ChangedRow>(conn)
+        .await?
+        .changed;
+    if changed {
+        diesel::sql_query("SELECT pg_notify('queue_available', '')")
+            .execute(conn)
+            .await?;
+    }
+    Ok(changed)
+}
+
+/// Every paused queue, ordered by queue.
+pub async fn paused_queues(
+    conn: &mut AsyncPgConnection,
+) -> Result<Vec<QueuePause>, SchedulerError> {
+    Ok(diesel::sql_query(
+        "SELECT queue, operator, reason, paused_at FROM queue_pauses ORDER BY queue",
+    )
+    .get_results::<QueuePause>(conn)
+    .await?)
+}

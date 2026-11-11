@@ -50,3 +50,11 @@ DROP TABLE queue_task_replays;
 CREATE INDEX queue_tasks_failed_name_idx
     ON queue_tasks (task_name, status, completed_at DESC, id DESC)
     WHERE status IN ('dead', 'cancelled');
+
+-- 4. queue pauses: a row stops every worker claiming from that queue.
+CREATE TABLE queue_pauses (
+    queue     TEXT PRIMARY KEY,
+    operator  TEXT NOT NULL,
+    reason    TEXT NOT NULL,
+    paused_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

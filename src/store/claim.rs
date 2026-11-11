@@ -41,6 +41,7 @@ const CLAIM: &str = r#"
         SELECT id FROM queue_tasks
         WHERE status = 'queued' AND due_at <= now() AND attempts < max_attempts
           AND queue = $5 AND task_name = ANY($1)
+          AND NOT EXISTS (SELECT 1 FROM queue_pauses WHERE queue = $5)
         ORDER BY priority DESC, due_at ASC, id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
@@ -120,7 +121,8 @@ pub async fn next_due_in(
 ) -> Result<Option<Duration>, SchedulerError> {
     let row = diesel::sql_query(
         "SELECT min(next.due_at) - now() AS wait \
-         FROM unnest($1::text[]) AS q(queue) \
+         FROM (SELECT queue FROM unnest($1::text[]) AS u(queue) \
+               WHERE NOT EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = u.queue)) AS q \
          CROSS JOIN LATERAL ( \
              SELECT min(due_at) AS due_at FROM queue_tasks \
              WHERE status = 'queued' AND queue = q.queue \

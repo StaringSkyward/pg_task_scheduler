@@ -301,6 +301,15 @@ Advice for choosing queues, sizing workers and deploying. The API is in
 - A task runs only on a worker that serves its queue **and** has a handler
   registered for its task name.
 
+### Pausing a queue
+
+`store::pause_queue(conn, &queue, operator, reason)` stops every worker, on
+every instance, claiming from that queue. It survives restarts. Running tasks
+finish; a task that fails or is released while paused goes back to `queued` and
+waits. Producers and cron keep enqueuing. `store::resume_queue` lets workers
+claim again and wakes them at once. Both return whether the state changed, and
+write an audit row only when it did. `store::paused_queues` lists the pauses.
+
 ### Sizing workers
 
 - The handlers needed across all instances are about arrival rate × average
