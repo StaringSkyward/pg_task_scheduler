@@ -13,5 +13,6 @@ pub use maintenance::{cleanup, reap_expired};
 #[cfg(feature = "cron")]
 pub use materialize::materialize_due_jobs;
 pub use transitions::{
-    complete, complete_with_outbox, completed_by, fail_permanently, heartbeat, lock_owned, retry,
+    complete, complete_with_outbox, completed_by, fail_permanently, heartbeat, lock_owned, release,
+    retry,
 };

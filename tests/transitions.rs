@@ -362,3 +362,51 @@ async fn completed_by_detects_own_completion() {
     assert!(!store::completed_by(&mut conn, &other).await.unwrap());
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn release_requeues_and_refunds_the_attempt() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    store::release(&mut conn, &c.lease).await.unwrap();
+    let t = store::task(&mut conn, c.lease.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.attempts, 0);
+    assert_eq!(t.due_at, c.due_at); // keeps its place in line
+    assert_eq!(t.lock_token, c.lease.lock_token);
+    assert!(t.locked_by.is_none() && t.locked_until.is_none() && t.last_error.is_none());
+    let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].outcome, Some(AttemptOutcome::Released));
+    assert!(a[0].finished_at.is_some() && a[0].error.is_none());
+    // The next claim reuses attempt_no 1 under a new token.
+    let again = claim_one(&mut conn).await.unwrap();
+    assert_eq!(
+        (again.lease.attempt_no, again.lease.lock_token),
+        (1, LockToken(2))
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn release_with_stale_or_expired_lease_is_lost_ownership() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    let stale = TaskLease {
+        lock_token: LockToken(c.lease.lock_token.0 + 1),
+        ..c.lease.clone()
+    };
+    lost(store::release(&mut conn, &stale).await, &stale);
+    db.expire_lease(c.lease.task_id).await;
+    lost(store::release(&mut conn, &c.lease).await, &c.lease);
+    let t = store::task(&mut conn, c.lease.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((t.status, t.attempts), (TaskStatus::Running, 1));
+    db.cleanup().await;
+}

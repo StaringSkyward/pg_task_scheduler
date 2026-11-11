@@ -78,26 +78,46 @@ pub enum RegisterError {
 /// gets stored in `queue_tasks.last_error`.
 pub struct TaskError {
     source: Box<dyn std::error::Error + Send + Sync>,
-    retryable: bool,
+    kind: Kind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Retry,
+    Permanent,
+    Interrupted,
 }
 
 impl TaskError {
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
             source: message.into().into(),
-            retryable: false,
+            kind: Kind::Permanent,
         }
     }
 
     pub fn retry(message: impl Into<String>) -> Self {
         Self {
             source: message.into().into(),
-            retryable: true,
+            kind: Kind::Retry,
+        }
+    }
+
+    /// Return from a handler that stopped because `ctx.cancellation` fired during shutdown: the
+    /// task is released without counting the attempt. Outside shutdown it is retried like `retry`.
+    pub fn interrupted() -> Self {
+        Self {
+            source: "interrupted by worker shutdown".into(),
+            kind: Kind::Interrupted,
         }
     }
 
     pub fn is_retryable(&self) -> bool {
-        self.retryable
+        matches!(self.kind, Kind::Retry | Kind::Interrupted)
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.kind == Kind::Interrupted
     }
 }
 
@@ -105,7 +125,7 @@ impl std::fmt::Debug for TaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TaskError")
             .field("source", &self.source)
-            .field("retryable", &self.retryable)
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -120,7 +140,7 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for TaskError {
     fn from(e: E) -> Self {
         TaskError {
             source: Box::new(e),
-            retryable: false,
+            kind: Kind::Permanent,
         }
     }
 }
@@ -142,6 +162,15 @@ mod tests {
         assert!(TaskError::retry("e").is_retryable());
         assert!(!TaskError::permanent("e").is_retryable());
         assert_eq!(TaskError::permanent("e").to_string(), "e");
+    }
+
+    #[test]
+    fn task_error_interrupted() {
+        let e = TaskError::interrupted();
+        assert!(e.is_interrupted() && e.is_retryable());
+        assert!(!TaskError::retry("e").is_interrupted());
+        assert!(!TaskError::permanent("e").is_interrupted());
+        assert_eq!(e.to_string(), "interrupted by worker shutdown");
     }
 
     #[cfg(feature = "cron")]

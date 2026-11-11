@@ -86,7 +86,7 @@ CREATE TABLE queue_task_attempts (
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ,
     outcome TEXT
-        CHECK (outcome IN ('done', 'retry', 'dead', 'lease_expired')),
+        CHECK (outcome IN ('done', 'retry', 'dead', 'lease_expired', 'released')),
     error TEXT,
 
     PRIMARY KEY (task_id, lock_token)

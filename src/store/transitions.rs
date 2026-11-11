@@ -23,6 +23,13 @@ const HEARTBEAT: &str = concat!(
 
 const LOCK_OWNED: &str = concat!("SELECT id FROM queue_tasks ", owned!(), " FOR UPDATE");
 
+const RELEASE: &str = concat!(
+    "UPDATE queue_tasks SET status = 'queued', attempts = attempts - 1, \
+     locked_by = NULL, locked_until = NULL, updated_at = now() ",
+    owned!(),
+    " RETURNING id"
+);
+
 const COMPLETE: &str = concat!(
     "UPDATE queue_tasks SET status = 'done', locked_by = NULL, locked_until = NULL, \
      completed_at = now(), updated_at = now() ",
@@ -191,6 +198,22 @@ pub async fn complete(
             return Err(lost(lease));
         }
         close_attempt(c, lease, "done", None).await
+    })
+    .await
+}
+
+/// Return a running task to `queued` without counting this attempt (worker shutdown). `due_at` is
+/// unchanged, so it is due at once and keeps its place.
+pub async fn release(
+    conn: &mut AsyncPgConnection,
+    lease: &TaskLease,
+) -> Result<(), SchedulerError> {
+    conn.transaction::<_, SchedulerError, _>(async |c| {
+        let rows = owned_query!(RELEASE, lease).get_results::<IdRow>(c).await?;
+        if rows.is_empty() {
+            return Err(lost(lease));
+        }
+        close_attempt(c, lease, "released", None).await
     })
     .await
 }

@@ -28,6 +28,7 @@ pub enum AttemptOutcome {
     Retry,
     Dead,
     LeaseExpired,
+    Released,
 }
 
 /// A stored status/outcome string that matches no known variant.
@@ -63,6 +64,7 @@ text_enum!(TaskStatus, "task status", {
 });
 text_enum!(AttemptOutcome, "attempt outcome", {
     Done => "done", Retry => "retry", Dead => "dead", LeaseExpired => "lease_expired",
+    Released => "released",
 });
 
 /// A task handed to a worker by `store::claim`.
@@ -290,6 +292,7 @@ mod task_enum_tests {
             AttemptOutcome::Retry,
             AttemptOutcome::Dead,
             AttemptOutcome::LeaseExpired,
+            AttemptOutcome::Released,
         ] {
             assert_eq!(AttemptOutcome::from_str(o.as_str()), Ok(o));
         }
