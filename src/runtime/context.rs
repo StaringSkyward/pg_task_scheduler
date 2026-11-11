@@ -1,17 +1,18 @@
-use crate::ids::{JobId, JobName, LeaseToken, RunId};
+use crate::ids::{TaskKey, TaskName};
+use crate::models::TaskLease;
 use chrono::{DateTime, Utc};
-use std::num::NonZeroU32;
 
 #[derive(Debug, Clone)]
-pub struct JobContext {
-    pub run_id: RunId,
-    pub job_id: Option<JobId>,
-    pub job_name: JobName,
-    pub scheduled_for: DateTime<Utc>,
-    pub attempt: NonZeroU32,
-    pub lease_token: LeaseToken,
-    pub lease_expires_at: DateTime<Utc>,
-    /// Cancelled when lease renewal proves that this worker no longer owns the
-    /// task, or when scheduler shutdown aborts the handler.
+pub struct TaskContext {
+    pub lease: TaskLease,
+    pub task_key: TaskKey,
+    pub task_name: TaskName,
+    pub max_attempts: i32,
+    /// Lease expiry as of claim; not updated by heartbeats.
+    pub locked_until: DateTime<Utc>,
+    /// Cancelled when worker shutdown begins, when a heartbeat proves this
+    /// worker no longer owns the task, or when the dispatch ends. A handler
+    /// that stops early because shutdown began should return
+    /// `TaskError::interrupted()`.
     pub cancellation: tokio_util::sync::CancellationToken,
 }

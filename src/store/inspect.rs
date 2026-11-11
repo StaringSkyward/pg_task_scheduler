@@ -1,121 +1,229 @@
+use chrono::{DateTime, Utc};
+use diesel::pg::data_types::PgInterval;
+use diesel::sql_types;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::error::SchedulerError;
-use crate::ids::RunId;
-use crate::models::{
-    AttemptState, Lease, RunState, StatusRow, StoredAttemptOutcome, StoredRunState, TaskAttempt,
-};
+use crate::ids::{LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
+use crate::models::{Attempt, QueueDepth, QueueStats, TaskView, interval_to_duration};
 
-const SELECT: &str = r#"
-    SELECT id, job_id, scheduled_for, attempt_count, worker_id, lease_token,
-           lease_expires_at, started_at, state, finished_at, last_error
-    FROM scheduler_runs WHERE id = $1
-"#;
-
-pub async fn run_state(
-    conn: &mut AsyncPgConnection,
-    run_id: RunId,
-) -> Result<Option<RunState>, SchedulerError> {
-    let mut rows: Vec<StatusRow> = diesel::sql_query(SELECT)
-        .bind::<diesel::sql_types::Uuid, _>(run_id)
-        .get_results(conn)
-        .await?;
-    rows.pop().map(state_of).transpose()
-}
-
-fn state_of(row: StatusRow) -> Result<RunState, SchedulerError> {
-    match row.state {
-        StoredRunState::Pending => Ok(RunState::Pending),
-        StoredRunState::Running => Ok(RunState::Running(Lease {
-            worker_id: row
-                .worker_id
-                .ok_or(SchedulerError::Invariant("running task without worker"))?,
-            lease_token: row
-                .lease_token
-                .ok_or(SchedulerError::Invariant("running task without token"))?,
-            lease_expires_at: row
-                .lease_expires_at
-                .ok_or(SchedulerError::Invariant("running task without expiry"))?,
-            started_at: row
-                .started_at
-                .ok_or(SchedulerError::Invariant("running task without start"))?,
-        })),
-        StoredRunState::Completed => Ok(RunState::Completed {
-            finished_at: row
-                .finished_at
-                .ok_or(SchedulerError::Invariant("completed task without finish"))?,
-        }),
-        StoredRunState::Failed => Ok(RunState::Failed {
-            finished_at: row
-                .finished_at
-                .ok_or(SchedulerError::Invariant("failed task without finish"))?,
-            error: row
-                .last_error
-                .ok_or(SchedulerError::Invariant("failed task without error"))?,
-        }),
-        StoredRunState::Cancelled => Ok(RunState::Cancelled {
-            finished_at: row
-                .finished_at
-                .ok_or(SchedulerError::Invariant("cancelled task without finish"))?,
-        }),
-    }
+#[derive(diesel::QueryableByName)]
+struct TaskRow {
+    #[diesel(sql_type = sql_types::BigInt)]
+    id: TaskId,
+    #[diesel(sql_type = sql_types::Text)]
+    task_key: TaskKey,
+    #[diesel(sql_type = sql_types::Text)]
+    task_name: TaskName,
+    #[diesel(sql_type = sql_types::Text)]
+    queue: QueueName,
+    #[diesel(sql_type = sql_types::Jsonb)]
+    payload: serde_json::Value,
+    #[diesel(sql_type = sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = sql_types::Integer)]
+    priority: i32,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    due_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Integer)]
+    attempts: i32,
+    #[diesel(sql_type = sql_types::Integer)]
+    max_attempts: i32,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    locked_by: Option<WorkerId>,
+    #[diesel(sql_type = sql_types::BigInt)]
+    lock_token: LockToken,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    locked_until: Option<DateTime<Utc>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    last_error: Option<String>,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    created_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    updated_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(diesel::QueryableByName)]
 struct AttemptRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    attempt_number: i32,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    worker_id: crate::WorkerId,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    started_at: chrono::DateTime<chrono::Utc>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    lease_expires_at: chrono::DateTime<chrono::Utc>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<crate::schema::sql_types::SchedulerAttemptOutcome>)]
-    outcome: Option<StoredAttemptOutcome>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    #[diesel(sql_type = sql_types::Integer)]
+    attempt_no: i32,
+    #[diesel(sql_type = sql_types::BigInt)]
+    lock_token: LockToken,
+    #[diesel(sql_type = sql_types::Text)]
+    worker_id: WorkerId,
+    #[diesel(sql_type = sql_types::Timestamptz)]
+    started_at: DateTime<Utc>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    finished_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    outcome: Option<String>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
     error: Option<String>,
 }
 
-pub async fn task_attempts(
+/// Read one task, or `None` if it does not exist.
+pub async fn task(
     conn: &mut AsyncPgConnection,
-    run_id: RunId,
-) -> Result<Vec<TaskAttempt>, SchedulerError> {
-    let rows = diesel::sql_query(
-        r#"SELECT attempt_number, worker_id, started_at, lease_expires_at,
-                  finished_at, outcome, error
-           FROM scheduler_run_attempts
-           WHERE run_id = $1
-           ORDER BY attempt_number"#,
+    id: TaskId,
+) -> Result<Option<TaskView>, SchedulerError> {
+    let row = diesel::sql_query(
+        "SELECT id, task_key, task_name, queue, payload, status, priority, due_at, attempts, \
+         max_attempts, locked_by, lock_token, locked_until, last_error, created_at, \
+         updated_at, completed_at FROM queue_tasks WHERE id = $1",
     )
-    .bind::<diesel::sql_types::Uuid, _>(run_id)
-    .get_results::<AttemptRow>(conn)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let attempt = u32::try_from(row.attempt_number)
-                .ok()
-                .and_then(std::num::NonZeroU32::new)
-                .ok_or(SchedulerError::Invariant(
-                    "attempt history contains a non-positive number",
-                ))?;
-            let state = match row.outcome {
-                None => AttemptState::Running,
-                Some(StoredAttemptOutcome::Completed) => AttemptState::Completed,
-                Some(StoredAttemptOutcome::Failed) => AttemptState::Failed { error: row.error },
-                Some(StoredAttemptOutcome::Expired) => AttemptState::Expired { error: row.error },
-                Some(StoredAttemptOutcome::Cancelled) => AttemptState::Cancelled,
-            };
-            Ok(TaskAttempt {
-                attempt,
-                worker_id: row.worker_id,
-                started_at: row.started_at,
-                lease_expires_at: row.lease_expires_at,
-                finished_at: row.finished_at,
-                state,
-            })
+    .bind::<sql_types::BigInt, _>(id)
+    .get_results::<TaskRow>(conn)
+    .await?
+    .pop();
+    row.map(|r| {
+        Ok(TaskView {
+            id: r.id,
+            task_key: r.task_key,
+            task_name: r.task_name,
+            queue: r.queue,
+            payload: r.payload,
+            status: r
+                .status
+                .parse()
+                .map_err(|_| SchedulerError::Invariant("unknown task status"))?,
+            priority: r.priority,
+            due_at: r.due_at,
+            attempts: r.attempts,
+            max_attempts: r.max_attempts,
+            locked_by: r.locked_by,
+            lock_token: r.lock_token,
+            locked_until: r.locked_until,
+            last_error: r.last_error,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            completed_at: r.completed_at,
         })
-        .collect()
+    })
+    .transpose()
+}
+
+/// Attempt history of a task, oldest claim first.
+pub async fn attempts(
+    conn: &mut AsyncPgConnection,
+    id: TaskId,
+) -> Result<Vec<Attempt>, SchedulerError> {
+    diesel::sql_query(
+        "SELECT attempt_no, lock_token, worker_id, started_at, finished_at, outcome, error \
+         FROM queue_task_attempts WHERE task_id = $1 ORDER BY lock_token",
+    )
+    .bind::<sql_types::BigInt, _>(id)
+    .get_results::<AttemptRow>(conn)
+    .await?
+    .into_iter()
+    .map(|r| {
+        Ok(Attempt {
+            attempt_no: r.attempt_no,
+            lock_token: r.lock_token,
+            worker_id: r.worker_id,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            outcome: r
+                .outcome
+                .map(|o| o.parse())
+                .transpose()
+                .map_err(|_| SchedulerError::Invariant("unknown attempt outcome"))?,
+            error: r.error,
+        })
+    })
+    .collect()
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountsRow {
+    #[diesel(sql_type = sql_types::BigInt)]
+    queued: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    running: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    done: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    dead: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    due: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
+    oldest_due_age: Option<PgInterval>,
+}
+
+#[derive(diesel::QueryableByName)]
+struct DepthRow {
+    #[diesel(sql_type = sql_types::Text)]
+    queue: QueueName,
+    #[diesel(sql_type = sql_types::Text)]
+    task_name: TaskName,
+    #[diesel(sql_type = sql_types::Integer)]
+    priority: i32,
+    #[diesel(sql_type = sql_types::BigInt)]
+    queued: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    due: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
+    oldest_due_age: Option<PgInterval>,
+}
+
+#[derive(diesel::QueryableByName)]
+struct OutboxStatsRow {
+    #[diesel(sql_type = sql_types::BigInt)]
+    unpublished: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
+    oldest_age: Option<PgInterval>,
+}
+
+/// Queue counts, per-name depth and outbox backlog.
+pub async fn queue_stats(conn: &mut AsyncPgConnection) -> Result<QueueStats, SchedulerError> {
+    // ponytail: full scan of retained rows; keep a counter table if this gets slow
+    let c = diesel::sql_query(
+        "SELECT count(*) FILTER (WHERE status = 'queued') AS queued, \
+                count(*) FILTER (WHERE status = 'running') AS running, \
+                count(*) FILTER (WHERE status = 'done') AS done, \
+                count(*) FILTER (WHERE status = 'dead') AS dead, \
+                count(*) FILTER (WHERE status = 'queued' AND due_at <= now()) AS due, \
+                now() - min(due_at) FILTER (WHERE status = 'queued' AND due_at <= now()) \
+                    AS oldest_due_age \
+         FROM queue_tasks",
+    )
+    .get_result::<CountsRow>(conn)
+    .await?;
+    let depth = diesel::sql_query(
+        "SELECT queue, task_name, priority, count(*) AS queued, \
+                count(*) FILTER (WHERE due_at <= now()) AS due, \
+                now() - min(due_at) FILTER (WHERE due_at <= now()) AS oldest_due_age \
+         FROM queue_tasks WHERE status = 'queued' \
+         GROUP BY queue, task_name, priority ORDER BY queue, task_name, priority DESC",
+    )
+    .get_results::<DepthRow>(conn)
+    .await?;
+    let o = diesel::sql_query(
+        "SELECT count(*) AS unpublished, now() - min(created_at) AS oldest_age \
+         FROM queue_outbox WHERE published_at IS NULL",
+    )
+    .get_result::<OutboxStatsRow>(conn)
+    .await?;
+    Ok(QueueStats {
+        queued: c.queued,
+        running: c.running,
+        done: c.done,
+        dead: c.dead,
+        due: c.due,
+        oldest_due_age: c.oldest_due_age.map(interval_to_duration),
+        depth: depth
+            .into_iter()
+            .map(|r| QueueDepth {
+                queue: r.queue,
+                task_name: r.task_name,
+                priority: r.priority,
+                queued: r.queued,
+                due: r.due,
+                oldest_due_age: r.oldest_due_age.map(interval_to_duration),
+            })
+            .collect(),
+        outbox_unpublished: o.unpublished,
+        oldest_unpublished_age: o.oldest_age.map(interval_to_duration),
+    })
 }

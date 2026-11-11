@@ -1,20 +1,18 @@
+#![cfg(feature = "cron")]
 mod common;
-use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
-use diesel_async::RunQueryDsl;
 use pg_task_scheduler::jobs::{self, Applied, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::{
-    CorruptJobRow, CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts,
-    SchedulerError, store,
+    CorruptJobRow, CronExpression, JobId, JobLifecycle, MaxAttempts, QueueName, SchedulerError,
+    TaskName, store,
 };
 
 fn spec(name: &str, cron: &str) -> CreateJob {
     CreateJob::new(
-        JobName::try_from(name).unwrap(),
+        TaskName::try_from(name).unwrap(),
         CronExpression::parse(cron).unwrap(),
-        LeaseDuration::try_from(Duration::from_secs(300)).unwrap(),
         MaxAttempts::try_from(3u32).unwrap(),
         JobLifecycle::Active,
         serde_json::json!({"k": "v"}),
@@ -75,7 +73,7 @@ async fn ensure_job_preserves_due_cursor_and_no_slot_skipped() {
 
     // The materializer catches up the missed slot: the occurrence IS created.
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
-    assert_eq!(db.run_ids(id).await.len(), 1);
+    assert_eq!(db.task_ids(id).await.len(), 1);
     db.cleanup().await;
 }
 
@@ -88,7 +86,6 @@ async fn ensure_job_preserves_is_paused_on_conflict() {
             "p",
             "*/5 * * * *",
             Utc::now() + chrono::Duration::hours(1),
-            "5 minutes",
             3,
             true,
         )
@@ -252,24 +249,6 @@ async fn get_unparseable_cron_is_corrupt_job() {
 }
 
 #[tokio::test]
-async fn database_rejects_calendar_lease_interval() {
-    let db = TestDb::new().await;
-    let mut conn = db.pool.get().await.unwrap();
-    let error = diesel::sql_query(
-        "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at, lease_duration) \
-         VALUES ('d', '*/5 * * * *', now(), interval '1 day')",
-    )
-    .execute(&mut conn)
-    .await
-    .expect_err("calendar lease intervals must be rejected by PostgreSQL");
-    assert!(matches!(
-        error,
-        diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, _)
-    ));
-    db.cleanup().await;
-}
-
-#[tokio::test]
 async fn pause_resume_delete_missing_is_not_found() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
@@ -286,5 +265,21 @@ async fn pause_resume_delete_missing_is_not_found() {
         jobs::delete(&mut conn, missing).await.unwrap(),
         Applied::NotFound
     );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn ensure_job_reconciles_queue() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let a = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(a.queue, QueueName::default());
+    let bulk = QueueName::try_from("bulk").unwrap();
+    let b = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *").queue(bulk))
+        .await
+        .unwrap();
+    assert_eq!(b.queue.as_str(), "bulk");
     db.cleanup().await;
 }

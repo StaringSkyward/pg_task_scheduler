@@ -1,134 +1,199 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use crate::error::{JobError, RegisterError, SchedulerError};
-use crate::ids::{IdentifierError, JobName, WorkerId};
+use crate::error::{RegisterError, SchedulerError, TaskError};
+use crate::ids::{IdentifierError, QueueName, TaskName, WorkerId};
+use crate::models::Retention;
 use crate::pool::SchedulerPool;
 use crate::queue::Task;
-use crate::runtime::context::JobContext;
+use crate::runtime::context::TaskContext;
 use crate::runtime::health::WorkerHealth;
 use crate::runtime::registry::Registry;
 
-/// Compile-time constant so there is no runtime partiality (no `unwrap`/`expect`
-/// in production paths). `const Option::unwrap` is stable since Rust 1.64.
-const DEFAULT_MAX_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+const SIXTEEN: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+const HUNDRED: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
-#[derive(Debug, Clone)]
+/// Longest duration `build()` accepts for any setting: 5 years (5 × 365 days). Every
+/// duration becomes a PostgreSQL interval added to or subtracted from `now()`, and a far
+/// larger one (such as `Duration::MAX`) fails each such statement with
+/// "timestamp out of range".
+const MAX_DURATION: Duration = Duration::from_secs(5 * 365 * 86_400);
+
 pub(crate) struct Config {
     pub worker_id: WorkerId,
-    pub poll_interval: Duration,
+    /// Served queues and their handler limits, in configuration order.
+    pub queues: Vec<(QueueName, NonZeroUsize)>,
+    pub claim_batch_size: NonZeroUsize,
+    pub lease_duration: Duration,
+    pub heartbeat_interval: Duration,
+    pub max_poll_interval: Duration,
+    pub base_retry_delay: Duration,
+    pub max_retry_delay: Duration,
+    pub retry_jitter: Duration,
     pub reaper_interval: Duration,
+    pub reaper_batch_size: NonZeroUsize,
+    pub crash_retry_delay: Duration,
+    pub retention: Retention,
     pub shutdown_timeout: Duration,
-    pub max_concurrency: NonZeroUsize,
 }
 
 pub struct SchedulerBuilder<P: SchedulerPool> {
     pool: P,
     registry: Registry,
-    worker_id: WorkerId,
-    poll_interval: Duration,
-    reaper_interval: Duration,
-    shutdown_timeout: Duration,
-    max_concurrency: NonZeroUsize,
+    config: Config,
+    /// `(T::NAME, T::QUEUE)` of typed registrations, for the unserved-queue warning.
+    typed_queues: Vec<(&'static str, QueueName)>,
 }
 
-impl<P: SchedulerPool + std::fmt::Debug> std::fmt::Debug for SchedulerBuilder<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SchedulerBuilder")
-            .field("registry", &self.registry)
-            .field("worker_id", &self.worker_id)
-            .field("poll_interval", &self.poll_interval)
-            .field("reaper_interval", &self.reaper_interval)
-            .field("shutdown_timeout", &self.shutdown_timeout)
-            .field("max_concurrency", &self.max_concurrency)
-            .finish_non_exhaustive()
-    }
+macro_rules! setters {
+    ($($(#[$doc:meta])* $name:ident: $ty:ty;)+) => {
+        $(
+            $(#[$doc])*
+            pub fn $name(mut self, value: $ty) -> Self {
+                self.config.$name = value;
+                self
+            }
+        )+
+    };
 }
 
 impl<P: SchedulerPool> SchedulerBuilder<P> {
-    pub(crate) fn new(pool: P, worker_id: WorkerId) -> Self {
-        Self {
-            pool,
-            registry: Registry::new(),
-            worker_id,
-            poll_interval: Duration::from_secs(1),
-            reaper_interval: Duration::from_secs(20),
-            shutdown_timeout: Duration::from_secs(25),
-            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+    setters! {
+        /// Most tasks taken per claim statement, per queue (default 16).
+        claim_batch_size: NonZeroUsize;
+        /// Lease granted by each claim and heartbeat, in PostgreSQL time (default 60 s).
+        lease_duration: Duration;
+        /// Heartbeat period; at most a third of `lease_duration` (default 20 s).
+        heartbeat_interval: Duration;
+        /// Longest idle wait between polls (default 1 s).
+        max_poll_interval: Duration;
+        /// Retry delay after the first attempt, doubling per attempt (default 1 s).
+        base_retry_delay: Duration;
+        /// Cap on the exponential retry delay, before jitter (default 5 min).
+        max_retry_delay: Duration;
+        /// Upper bound of the uniform random delay added to each retry (default 1 s).
+        retry_jitter: Duration;
+        /// Period of the reaper and retention cleanup (default 20 s).
+        reaper_interval: Duration;
+        /// Expired leases recovered per reaper statement (default 100).
+        reaper_batch_size: NonZeroUsize;
+        /// Delay before a reaped task is due again (default 10 s).
+        crash_retry_delay: Duration;
+        /// Retention of terminal rows (default [`Retention::default`]).
+        retention: Retention;
+        /// Shutdown cancels every handler's `ctx.cancellation`, then waits this long for handlers
+        /// to return; those still running are released, for up to 5 s more, then aborted
+        /// (default 25 s).
+        shutdown_timeout: Duration;
+    }
+
+    /// Serve `name`, running at most `limit` of its handlers at once. Configuring any queue
+    /// replaces the implicit `default` queue (limit 16). Add `.queue("default", n)` to keep
+    /// serving it.
+    pub fn queue(
+        mut self,
+        name: impl TryInto<QueueName, Error: Into<IdentifierError>>,
+        limit: NonZeroUsize,
+    ) -> Result<Self, IdentifierError> {
+        let name = name.try_into().map_err(Into::into)?;
+        match self.config.queues.iter_mut().find(|(q, _)| *q == name) {
+            Some(entry) => entry.1 = limit,
+            None => self.config.queues.push((name, limit)),
         }
+        Ok(self)
     }
 
-    pub fn poll_interval(mut self, d: Duration) -> Self {
-        self.poll_interval = d;
-        self
-    }
-
-    pub fn reaper_interval(mut self, d: Duration) -> Self {
-        self.reaper_interval = d;
-        self
-    }
-
-    pub fn shutdown_timeout(mut self, d: Duration) -> Self {
-        self.shutdown_timeout = d;
-        self
-    }
-
-    pub fn max_concurrency(mut self, n: NonZeroUsize) -> Self {
-        self.max_concurrency = n;
-        self
-    }
-
+    /// Register a handler for `name`; the payload is deserialized into `A`.
     pub fn register<A, F, Fut>(
         mut self,
-        name: impl TryInto<JobName, Error: Into<IdentifierError>>,
+        name: impl TryInto<TaskName, Error: Into<IdentifierError>>,
         handler: F,
     ) -> Result<Self, RegisterError>
     where
         A: serde::de::DeserializeOwned + Send + 'static,
-        F: Fn(JobContext, A) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
+        F: Fn(TaskContext, A) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
-        let name = name.try_into().map_err(Into::into)?; // E -> IdentifierError -> RegisterError::Name
-        self.registry.register(name, handler)?; // DuplicateJobName -> RegisterError::Duplicate
+        let name = name.try_into().map_err(Into::into)?;
+        self.registry.register(name, handler)?;
         Ok(self)
     }
 
-    pub fn register_task<T, F, Fut>(self, handler: F) -> Result<Self, RegisterError>
+    /// Register a handler for `T::NAME` taking `T::Args`.
+    pub fn register_task<T, F, Fut>(mut self, handler: F) -> Result<Self, RegisterError>
     where
         T: Task,
-        F: Fn(JobContext, T::Args) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<(), JobError>> + Send + 'static,
+        F: Fn(TaskContext, T::Args) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
-        self.register::<T::Args, _, _>(T::NAME, handler)
+        let queue = QueueName::try_from(T::QUEUE)?;
+        self = self.register::<T::Args, _, _>(T::NAME, handler)?;
+        self.typed_queues.push((T::NAME, queue));
+        Ok(self)
     }
 
-    pub fn build(self) -> Result<Scheduler<P>, SchedulerError> {
-        if self.registry.is_empty() {
-            return Err(SchedulerError::Config(
-                "at least one handler must be registered".into(),
-            ));
+    pub fn build(mut self) -> Result<Scheduler<P>, SchedulerError> {
+        if self.config.queues.is_empty() {
+            self.config.queues.push((QueueName::default(), SIXTEEN));
         }
-        if self.poll_interval.is_zero() {
-            return Err(SchedulerError::Config(
-                "poll_interval must be greater than zero".into(),
-            ));
+        for (task_name, queue) in &self.typed_queues {
+            if !self.config.queues.iter().any(|(q, _)| q == queue) {
+                tracing::warn!(
+                    task_name,
+                    queue = queue.as_str(),
+                    "task's default queue is not served by this worker; tasks enqueued with the default queue will not run here"
+                );
+            }
         }
-        if self.reaper_interval.is_zero() {
-            return Err(SchedulerError::Config(
-                "reaper_interval must be greater than zero".into(),
-            ));
+        let c = &self.config;
+        let r = &c.retention;
+        let durations = [
+            c.lease_duration,
+            c.heartbeat_interval,
+            c.max_poll_interval,
+            c.base_retry_delay,
+            c.max_retry_delay,
+            c.retry_jitter,
+            c.reaper_interval,
+            c.crash_retry_delay,
+            c.shutdown_timeout,
+            r.done,
+            r.dead,
+            r.idempotency_horizon,
+            r.outbox_published,
+        ];
+        let invalid = if self.registry.is_empty() {
+            Some("at least one handler must be registered")
+        } else if durations.iter().any(|d| *d > MAX_DURATION) {
+            Some("every duration must be at most 5 years")
+        } else if [
+            c.lease_duration,
+            c.heartbeat_interval,
+            c.max_poll_interval,
+            c.reaper_interval,
+        ]
+        .contains(&Duration::ZERO)
+        {
+            Some("lease, heartbeat, poll and reaper intervals must be greater than zero")
+        } else if c.heartbeat_interval.saturating_mul(3) > c.lease_duration {
+            Some("heartbeat_interval must be at most a third of lease_duration")
+        } else if c.base_retry_delay > c.max_retry_delay {
+            Some("base_retry_delay must not exceed max_retry_delay")
+        } else if c.retention.done < c.retention.idempotency_horizon
+            || c.retention.dead < c.retention.idempotency_horizon
+        {
+            Some("done and dead retention must be at least the idempotency horizon")
+        } else {
+            None
+        };
+        if let Some(message) = invalid {
+            return Err(SchedulerError::Config(message.into()));
         }
         let (health_tx, _) = tokio::sync::watch::channel(WorkerHealth::default());
         Ok(Scheduler {
             pool: self.pool,
             registry: self.registry,
-            config: Config {
-                worker_id: self.worker_id,
-                poll_interval: self.poll_interval,
-                reaper_interval: self.reaper_interval,
-                shutdown_timeout: self.shutdown_timeout,
-                max_concurrency: self.max_concurrency,
-            },
+            config: self.config,
             health_tx,
         })
     }
@@ -142,10 +207,33 @@ pub struct Scheduler<P: SchedulerPool> {
 }
 
 impl<P: SchedulerPool> Scheduler<P> {
-    /// `worker_id` is a required constructor argument — a `Scheduler` cannot
-    /// exist without one (no `Option`, no runtime "missing worker_id" error).
-    pub fn builder(pool: P, worker_id: WorkerId) -> SchedulerBuilder<P> {
-        SchedulerBuilder::new(pool, worker_id)
+    /// A builder with the documented defaults and a fresh UUID worker id (§7.1).
+    pub fn builder(pool: P) -> SchedulerBuilder<P> {
+        SchedulerBuilder {
+            pool,
+            registry: Registry::new(),
+            typed_queues: Vec::new(),
+            config: Config {
+                worker_id: WorkerId::generate(),
+                queues: Vec::new(),
+                claim_batch_size: SIXTEEN,
+                lease_duration: Duration::from_secs(60),
+                heartbeat_interval: Duration::from_secs(20),
+                max_poll_interval: Duration::from_secs(1),
+                base_retry_delay: Duration::from_secs(1),
+                max_retry_delay: Duration::from_secs(300),
+                retry_jitter: Duration::from_secs(1),
+                reaper_interval: Duration::from_secs(20),
+                reaper_batch_size: HUNDRED,
+                crash_retry_delay: Duration::from_secs(10),
+                retention: Retention::default(),
+                shutdown_timeout: Duration::from_secs(25),
+            },
+        }
+    }
+
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.config.worker_id
     }
 
     pub fn health(&self) -> tokio::sync::watch::Receiver<WorkerHealth> {
@@ -157,13 +245,11 @@ impl<P: SchedulerPool> Scheduler<P> {
 mod tests {
     use super::*;
 
-    /// Minimal fake pool satisfying `SchedulerPool` at the type level; it never
-    /// acquires a connection (used only so the builder can be constructed in tests).
-    #[derive(Clone, Debug)]
+    /// Satisfies `SchedulerPool` at the type level only; `build()` never acquires.
+    #[derive(Clone)]
     struct FakePool;
 
-    impl crate::pool::SchedulerPool for FakePool {
-        // Box<AsyncPgConnection> satisfies DerefMut<Target = AsyncPgConnection>.
+    impl SchedulerPool for FakePool {
         type Conn = Box<diesel_async::AsyncPgConnection>;
 
         async fn acquire(&self) -> Result<Self::Conn, crate::pool::PoolError> {
@@ -171,56 +257,204 @@ mod tests {
         }
     }
 
-    /// `build()` returns `SchedulerError::Config` when no handler is registered.
-    #[test]
-    fn build_errors_on_empty_registry() {
-        let worker_id = WorkerId::try_from("test-worker").unwrap();
-        let result = Scheduler::<FakePool>::builder(FakePool, worker_id).build();
-
-        match result {
-            Err(SchedulerError::Config(_)) => {} // expected
-            Err(other) => panic!("expected SchedulerError::Config, got {other:?}"),
-            Ok(_) => panic!("build() must fail when no handlers are registered"),
-        }
+    fn builder() -> SchedulerBuilder<FakePool> {
+        Scheduler::builder(FakePool)
+            .register::<serde_json::Value, _, _>("t", |_c, _a| async { Ok(()) })
+            .unwrap()
     }
 
-    /// Registering the same name twice is rejected at the second `register`.
+    fn rejected(b: SchedulerBuilder<FakePool>) -> bool {
+        matches!(b.build(), Err(SchedulerError::Config(_)))
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn n(v: usize) -> NonZeroUsize {
+        NonZeroUsize::new(v).unwrap()
+    }
+
+    #[test]
+    fn default_queue_when_none_configured() {
+        let s = builder().build().unwrap();
+        assert_eq!(s.config.queues, vec![(QueueName::default(), SIXTEEN)]);
+    }
+
+    #[test]
+    fn configured_queue_replaces_default_and_last_limit_wins() {
+        let s = builder()
+            .queue("bulk", n(2))
+            .unwrap()
+            .queue("bulk", n(3))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            s.config.queues,
+            vec![(QueueName::try_from("bulk").unwrap(), n(3))]
+        );
+    }
+
+    #[test]
+    fn queue_rejects_invalid_name() {
+        assert!(matches!(
+            builder().queue("", n(1)),
+            Err(IdentifierError::Empty)
+        ));
+    }
+
+    #[test]
+    fn build_errors_on_empty_registry() {
+        assert!(rejected(Scheduler::builder(FakePool)));
+    }
+
+    #[test]
+    fn defaults_build() {
+        assert!(builder().build().is_ok());
+    }
+
     #[test]
     fn builder_rejects_duplicate_registration() {
-        let builder = Scheduler::<FakePool>::builder(FakePool, WorkerId::try_from("w").unwrap())
-            .register::<serde_json::Value, _, _>("dup", |_c, _a| async { Ok(()) })
+        let err = builder()
+            .register::<serde_json::Value, _, _>("t", |_c, _a| async { Ok(()) })
+            .err()
             .unwrap();
-        let err = builder
-            .register::<serde_json::Value, _, _>("dup", |_c, _a| async { Ok(()) })
-            .unwrap_err();
         assert!(matches!(err, RegisterError::Duplicate(_)), "got {err:?}");
     }
 
-    /// An invalid job name still surfaces, now through `RegisterError::Name`.
     #[test]
     fn builder_rejects_invalid_name() {
-        let err = Scheduler::<FakePool>::builder(FakePool, WorkerId::try_from("w").unwrap())
+        let err = Scheduler::builder(FakePool)
             .register::<serde_json::Value, _, _>("", |_c, _a| async { Ok(()) })
-            .unwrap_err();
+            .err()
+            .unwrap();
         assert!(
             matches!(err, RegisterError::Name(IdentifierError::Empty)),
             "got {err:?}"
         );
     }
 
-    /// Guards the `impl TryInto<JobName, Error: Into<IdentifierError>>` signature:
-    /// an already-constructed `JobName` is still accepted by `register`.
     #[test]
-    fn builder_accepts_prebuilt_job_name() {
-        let name = JobName::try_from("built").unwrap();
-        let result = Scheduler::<FakePool>::builder(FakePool, WorkerId::try_from("w").unwrap())
+    fn register_task_rejects_invalid_task_queue() {
+        struct BadQueue;
+        impl Task for BadQueue {
+            const NAME: &'static str = "bad_queue";
+            const QUEUE: &'static str = "";
+            type Args = serde_json::Value;
+        }
+        let err = Scheduler::builder(FakePool)
+            .register_task::<BadQueue, _, _>(|_c, _a| async { Ok(()) })
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, RegisterError::Name(IdentifierError::Empty)),
+            "got {err:?}"
+        );
+    }
+
+    /// Guards the `impl TryInto<TaskName, Error: Into<IdentifierError>>` signature.
+    #[test]
+    fn builder_accepts_prebuilt_task_name() {
+        let name = TaskName::try_from("built").unwrap();
+        let result = Scheduler::builder(FakePool)
             .register::<serde_json::Value, _, _>(name, |_c, _a| async { Ok(()) });
         assert!(result.is_ok());
     }
 
-    /// `DEFAULT_MAX_CONCURRENCY` evaluates to 16 (compile-time const sanity check).
     #[test]
-    fn default_concurrency_is_16() {
-        assert_eq!(DEFAULT_MAX_CONCURRENCY.get(), 16);
+    fn build_rejects_heartbeat_not_below_a_third_of_lease() {
+        let lease = || builder().lease_duration(secs(60));
+        assert!(rejected(lease().heartbeat_interval(secs(21))));
+        assert!(lease().heartbeat_interval(secs(20)).build().is_ok());
+    }
+
+    #[test]
+    fn build_rejects_retention_shorter_than_idempotency_horizon() {
+        let r = Retention::default();
+        let short = r.idempotency_horizon - secs(1);
+        assert!(rejected(
+            builder().retention(Retention { done: short, ..r })
+        ));
+        assert!(rejected(
+            builder().retention(Retention { dead: short, ..r })
+        ));
+        let at_horizon = Retention {
+            done: r.idempotency_horizon,
+            dead: r.idempotency_horizon,
+            ..r
+        };
+        assert!(builder().retention(at_horizon).build().is_ok());
+    }
+
+    #[test]
+    fn build_rejects_base_retry_above_max() {
+        assert!(rejected(
+            builder()
+                .base_retry_delay(secs(10))
+                .max_retry_delay(secs(5))
+        ));
+    }
+
+    #[test]
+    fn build_rejects_durations_over_5_years() {
+        assert_eq!(MAX_DURATION, secs(157_680_000));
+        let over = MAX_DURATION + secs(1);
+        let r = Retention::default();
+        let horizon = |d| Retention {
+            done: d,
+            dead: d,
+            idempotency_horizon: d,
+            ..r
+        };
+        // Each setting, with any companion value its other rules need. heartbeat_interval is
+        // absent: at most lease / 3, it can never reach the cap without the lease passing it.
+        type Set = fn(SchedulerBuilder<FakePool>, Duration) -> SchedulerBuilder<FakePool>;
+        let settings: [Set; 11] = [
+            |b, d| b.lease_duration(d),
+            |b, d| b.max_poll_interval(d),
+            |b, d| b.base_retry_delay(d).max_retry_delay(d),
+            |b, d| b.max_retry_delay(d),
+            |b, d| b.retry_jitter(d),
+            |b, d| b.reaper_interval(d),
+            |b, d| b.crash_retry_delay(d),
+            |b, d| b.shutdown_timeout(d),
+            |b, d| {
+                b.retention(Retention {
+                    done: d,
+                    ..Retention::default()
+                })
+            },
+            |b, d| {
+                b.retention(Retention {
+                    dead: d,
+                    ..Retention::default()
+                })
+            },
+            |b, d| {
+                b.retention(Retention {
+                    outbox_published: d,
+                    ..Retention::default()
+                })
+            },
+        ];
+        for (i, set) in settings.into_iter().enumerate() {
+            assert!(
+                set(builder(), MAX_DURATION).build().is_ok(),
+                "setting {i} at the cap"
+            );
+            assert!(rejected(set(builder(), over)), "setting {i} over the cap");
+        }
+        assert!(rejected(builder().retention(horizon(over))));
+        assert!(builder().retention(horizon(MAX_DURATION)).build().is_ok());
+        assert!(rejected(builder().max_retry_delay(Duration::MAX)));
+    }
+
+    #[test]
+    fn build_rejects_zero_intervals() {
+        assert!(rejected(builder().lease_duration(Duration::ZERO)));
+        assert!(rejected(builder().heartbeat_interval(Duration::ZERO)));
+        assert!(rejected(builder().max_poll_interval(Duration::ZERO)));
+        assert!(rejected(builder().reaper_interval(Duration::ZERO)));
     }
 }

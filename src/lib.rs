@@ -1,77 +1,39 @@
-//! # pg_task_scheduler
-//!
-//! PostgreSQL-backed immediate, delayed, and recurring work with
-//! **leased at-least-once** execution.
-//!
-//! Each scheduled occurrence is a durable row in PostgreSQL.  A worker claims it
-//! using `FOR UPDATE SKIP LOCKED` and a fencing token.  If the worker crashes or
-//! exceeds its lease, another worker reclaims the row after the lease expires.
-//! Because a run may therefore execute more than once for the same occurrence,
-//! **handlers must be idempotent** — use `ctx.run_id` or `ctx.scheduled_for` as
-//! idempotency keys.
-//!
-//! Install the schema in `migrations/0001_create_scheduler_tables/up.sql`
-//! before starting the scheduler.
-//!
-//! ## Quick start
-//!
-//! ```no_run
-//! # async fn ex(pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>) -> Result<(), Box<dyn std::error::Error>> {
-//! use std::time::Duration;
-//! use pg_task_scheduler::{Scheduler, WorkerId, JobContext, JobError};
-//! use tokio_util::sync::CancellationToken;
-//!
-//! #[derive(serde::Deserialize)]
-//! struct DigestArgs { user_id: uuid::Uuid }
-//!
-//! async fn send_digest(ctx: JobContext, _args: DigestArgs) -> Result<(), JobError> {
-//!     // ctx.run_id and ctx.scheduled_for are stable across retries — use them as
-//!     // idempotency keys so re-execution is safe.
-//!     let _ = ctx.run_id;
-//!     Ok(())
-//! }
-//!
-//! let scheduler = Scheduler::builder(pool, WorkerId::try_from("api-1")?)
-//!     .poll_interval(Duration::from_secs(1))
-//!     .register::<DigestArgs, _, _>("send_digest_email", send_digest)?
-//!     .build()?;
-//! scheduler.run_until_shutdown(CancellationToken::new()).await?;
-//! # Ok(()) }
-//! ```
-
-mod cron;
-mod error;
-mod ids;
-mod metrics;
-mod models;
-mod pool;
-pub mod queue;
-mod schema;
-pub mod store;
-
-pub mod jobs;
-pub mod runtime;
+#![doc = include_str!("../README.md")]
 
 #[cfg(feature = "axum")]
 pub mod admin;
+#[cfg(feature = "cron")]
+mod cron;
+mod error;
+mod ids;
+#[cfg(feature = "cron")]
+pub mod jobs;
+mod models;
+mod pool;
+pub mod queue;
+pub mod runtime;
+#[cfg(feature = "cron")]
+mod schema;
+pub mod store;
 
-pub use crate::cron::CronExpression;
-pub use crate::error::{CorruptJobRow, DuplicateJobName, JobError, RegisterError, SchedulerError};
-pub use crate::ids::{
-    DeduplicationKey, IdentifierError, JobId, JobName, LeaseToken, RunId, ScheduleId, TaskId,
-    WorkerId,
-};
-pub use crate::jobs::{Applied, CreateJob, ScheduleUpdate};
-pub use crate::models::RunOutcome;
+pub use crate::error::{DuplicateTaskName, RegisterError, SchedulerError, TaskError};
+pub use crate::ids::{IdentifierError, LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
 pub use crate::models::{
-    AttemptState, ClaimedRun, FailureOutcome, FinalizeOutcome, Job, JobLifecycle, Lease,
-    LeaseDuration, LeaseDurationError, MaxAttempts, MaxAttemptsError, Outcome, RenewalOutcome,
-    RetryBackoff, RunState, TaskAttempt,
+    Attempt, AttemptOutcome, ClaimedTask, CleanupSummary, MaxAttempts, MaxAttemptsError,
+    OutboxCommand, ParseEnumError, QueueDepth, QueueStats, ReapSummary, Retention, RetryOutcome,
+    TaskLease, TaskStatus, TaskView,
 };
 pub use crate::pool::{PoolError, SchedulerPool};
-pub use crate::queue::{
-    Availability, CancelOutcome, Deduplication, EnqueueOptions, EnqueuedTask, Priority, Task,
-    cancel, enqueue, prune_terminal,
-};
-pub use crate::runtime::JobContext;
-pub use crate::runtime::{HealthStatus, Scheduler, SchedulerBuilder, WorkerHealth};
+pub use crate::queue::{EnqueueOptions, Enqueued, Priority, Task, enqueue, replay};
+pub use crate::runtime::{HealthStatus, Scheduler, SchedulerBuilder, TaskContext, WorkerHealth};
+
+#[cfg(feature = "cron")]
+pub use crate::cron::CronExpression;
+#[cfg(feature = "cron")]
+pub use crate::error::CorruptJobRow;
+#[cfg(feature = "cron")]
+pub use crate::ids::JobId;
+#[cfg(feature = "cron")]
+pub use crate::jobs::{Applied, CreateJob, ScheduleUpdate};
+#[cfg(feature = "cron")]
+pub use crate::models::{Job, JobLifecycle};

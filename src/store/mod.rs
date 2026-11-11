@@ -1,11 +1,18 @@
-mod claim;
-mod finalize;
-mod inspect;
-mod materialize;
-mod reap;
+//! Store operations on the queue tables (added task by task).
 
-pub use claim::{claim_batch, claim_one};
-pub use finalize::{fail_run, finalize_run, renew_lease};
-pub use inspect::{run_state, task_attempts};
+mod claim;
+mod inspect;
+mod maintenance;
+#[cfg(feature = "cron")]
+mod materialize;
+mod transitions;
+
+pub use claim::{claim, next_due_in};
+pub use inspect::{attempts, queue_stats, task};
+pub use maintenance::{cleanup, reap_expired};
+#[cfg(feature = "cron")]
 pub use materialize::materialize_due_jobs;
-pub use reap::{RecoverySummary, reap_expired, recover_expired};
+pub use transitions::{
+    complete, complete_with_outbox, completed_by, fail_permanently, heartbeat, lock_owned, release,
+    retry,
+};

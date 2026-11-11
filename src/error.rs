@@ -1,7 +1,10 @@
 //! Crate error types.
 
-use crate::ids::{IdentifierError, JobId, JobName};
-use crate::models::{LeaseDurationError, MaxAttemptsError};
+#[cfg(feature = "cron")]
+use crate::ids::JobId;
+use crate::ids::{IdentifierError, TaskId, TaskKey, TaskName};
+#[cfg(feature = "cron")]
+use crate::models::MaxAttemptsError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -9,6 +12,7 @@ pub enum SchedulerError {
     Database(#[from] diesel::result::Error),
     #[error("connection pool error: {0}")]
     Pool(String),
+    #[cfg(feature = "cron")]
     #[error("cron parse error: {0}")]
     Cron(String),
     #[error("configuration error: {0}")]
@@ -22,9 +26,16 @@ pub enum SchedulerError {
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+    /// The same `task_key` was enqueued with a different task name or payload.
+    #[error("idempotency conflict for task key {}", .0.as_str())]
+    IdempotencyConflict(TaskKey),
+    /// A worker-owned mutation matched no row: the lease was lost or expired.
+    #[error("lost ownership of task {0:?}")]
+    LostOwnership(TaskId),
     /// A persisted `scheduler_jobs` row failed to project into a domain `Job`
     /// because a stored value violates an invariant the scheduler guarantees on
     /// write (e.g. the row was edited directly in SQL).
+    #[cfg(feature = "cron")]
     #[error("corrupt job row {job_id:?}: {source}")]
     CorruptJob {
         job_id: JobId,
@@ -37,20 +48,19 @@ pub enum SchedulerError {
 /// arm is a value the scheduler guarantees on write, so reaching one means the row
 /// was corrupted. The cron arm is a `String` because cron errors are stringly
 /// crate-wide (`src/cron.rs`); tightening that is a separate finding.
+#[cfg(feature = "cron")]
 #[derive(Debug, thiserror::Error)]
 pub enum CorruptJobRow {
     #[error("unparseable cron: {0}")]
     Cron(String),
     #[error(transparent)]
-    LeaseDuration(#[from] LeaseDurationError),
-    #[error(transparent)]
     MaxAttempts(#[from] MaxAttemptsError),
 }
 
-/// A handler was already registered for this job name.
+/// A handler was already registered for this task name.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("a handler is already registered for job name {}", .0.as_str())]
-pub struct DuplicateJobName(pub JobName);
+#[error("a handler is already registered for task name {}", .0.as_str())]
+pub struct DuplicateTaskName(pub TaskName);
 
 /// Why `SchedulerBuilder::register` rejected a registration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -58,63 +68,79 @@ pub enum RegisterError {
     #[error(transparent)]
     Name(#[from] IdentifierError),
     #[error(transparent)]
-    Duplicate(#[from] DuplicateJobName),
+    Duplicate(#[from] DuplicateTaskName),
 }
 
 /// Opaque handler error. Deliberately does NOT implement `std::error::Error`
 /// (same trick as `anyhow::Error`) so the blanket `From<E: Error>` below is
-/// coherent — if `JobError` were itself an `Error`, that blanket would collide
-/// with the std reflexive `From<JobError> for JobError`. Its `Display` is what
-/// gets stored in `scheduler_run_outcomes.last_error`.
-pub struct JobError {
+/// coherent — if `TaskError` were itself an `Error`, that blanket would collide
+/// with the std reflexive `From<TaskError> for TaskError`. Its `Display` is what
+/// gets stored in `queue_tasks.last_error`.
+pub struct TaskError {
     source: Box<dyn std::error::Error + Send + Sync>,
-    retryable: bool,
+    kind: Kind,
 }
 
-impl JobError {
-    pub fn msg(message: impl Into<String>) -> Self {
-        Self::permanent(message)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Retry,
+    Permanent,
+    Interrupted,
+}
 
+impl TaskError {
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
             source: message.into().into(),
-            retryable: false,
+            kind: Kind::Permanent,
         }
     }
 
     pub fn retry(message: impl Into<String>) -> Self {
         Self {
             source: message.into().into(),
-            retryable: true,
+            kind: Kind::Retry,
+        }
+    }
+
+    /// Return from a handler that stopped because `ctx.cancellation` fired during shutdown: the
+    /// task is released without counting the attempt. Outside shutdown it is retried like `retry`.
+    pub fn interrupted() -> Self {
+        Self {
+            source: "interrupted by worker shutdown".into(),
+            kind: Kind::Interrupted,
         }
     }
 
     pub fn is_retryable(&self) -> bool {
-        self.retryable
+        matches!(self.kind, Kind::Retry | Kind::Interrupted)
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.kind == Kind::Interrupted
     }
 }
 
-impl std::fmt::Debug for JobError {
+impl std::fmt::Debug for TaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobError")
+        f.debug_struct("TaskError")
             .field("source", &self.source)
-            .field("retryable", &self.retryable)
+            .field("kind", &self.kind)
             .finish()
     }
 }
 
-impl std::fmt::Display for JobError {
+impl std::fmt::Display for TaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.source, f)
     }
 }
 
-impl<E: std::error::Error + Send + Sync + 'static> From<E> for JobError {
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for TaskError {
     fn from(e: E) -> Self {
-        JobError {
+        TaskError {
             source: Box::new(e),
-            retryable: false,
+            kind: Kind::Permanent,
         }
     }
 }
@@ -124,19 +150,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_error_from_std_error() {
+    fn task_error_from_std_error() {
         let serde_err = serde_json::from_str::<i32>("x").unwrap_err();
-        let job_err = JobError::from(serde_err);
+        let task_err = TaskError::from(serde_err);
         // Should produce a non-empty display string from the inner error.
-        assert!(!job_err.to_string().is_empty());
+        assert!(!task_err.to_string().is_empty());
     }
 
     #[test]
-    fn job_error_msg_display() {
-        let job_err = JobError::msg("e");
-        assert_eq!(job_err.to_string(), "e");
+    fn task_error_retry_flag() {
+        assert!(TaskError::retry("e").is_retryable());
+        assert!(!TaskError::permanent("e").is_retryable());
+        assert_eq!(TaskError::permanent("e").to_string(), "e");
     }
 
+    #[test]
+    fn task_error_interrupted() {
+        let e = TaskError::interrupted();
+        assert!(e.is_interrupted() && e.is_retryable());
+        assert!(!TaskError::retry("e").is_interrupted());
+        assert!(!TaskError::permanent("e").is_interrupted());
+        assert_eq!(e.to_string(), "interrupted by worker shutdown");
+    }
+
+    #[cfg(feature = "cron")]
     #[test]
     fn corrupt_job_row_from_max_attempts() {
         let e: CorruptJobRow = MaxAttemptsError::NonPositive.into();

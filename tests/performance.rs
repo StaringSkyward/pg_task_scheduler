@@ -11,17 +11,17 @@ struct PlanLine {
 }
 
 #[tokio::test]
-async fn pending_claim_uses_hot_partial_index() {
+async fn claim_uses_claim_index() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     conn.batch_execute("SET enable_seqscan = off")
         .await
         .unwrap();
     let plan = diesel::sql_query(
-        r#"EXPLAIN SELECT id FROM scheduler_runs
-           WHERE state = 'pending'::scheduler_run_state
-             AND available_at <= now() AND job_name = 'example-task'
-           ORDER BY priority DESC, available_at, id LIMIT 16"#,
+        r#"EXPLAIN SELECT id FROM queue_tasks
+           WHERE status = 'queued' AND due_at <= now() AND attempts < max_attempts
+             AND queue = 'default' AND task_name = ANY('{email}')
+           ORDER BY priority DESC, due_at, id LIMIT 16"#,
     )
     .get_results::<PlanLine>(&mut conn)
     .await
@@ -31,7 +31,84 @@ async fn pending_claim_uses_hot_partial_index() {
     .collect::<Vec<_>>()
     .join("\n");
     assert!(
-        plan.contains("scheduler_runs_pending_claim_idx"),
+        plan.contains("queue_tasks_claim_idx"),
+        "unexpected query plan:\n{plan}"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn next_due_in_uses_due_index() {
+    // The query below mirrors `next_due_in` in src/store/claim.rs; keep them in step.
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let plan = diesel::sql_query(
+        "EXPLAIN SELECT min(next.due_at) - now() AS wait \
+         FROM unnest('{default,bulk}'::text[]) AS q(queue) \
+         CROSS JOIN LATERAL ( \
+             SELECT min(due_at) AS due_at FROM queue_tasks \
+             WHERE status = 'queued' AND queue = q.queue \
+               AND attempts < max_attempts AND task_name = ANY('{email}') \
+         ) AS next",
+    )
+    .get_results::<PlanLine>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.line)
+    .collect::<Vec<_>>()
+    .join("\n");
+    // Each queue's probe is a Limit over an index scan whose Index Cond fixes `queue`;
+    // `queue` as a mere Filter (or `= ANY`) would scan every queued row of the queues.
+    let lines: Vec<&str> = plan.lines().collect();
+    let scan = lines
+        .iter()
+        .position(|l| l.contains("Index Scan using queue_tasks_due_idx"));
+    assert!(
+        !plan.contains("Seq Scan")
+            && scan.is_some_and(|i| {
+                i > 0
+                    && lines[i - 1].contains("Limit")
+                    && lines[i + 1].contains("Index Cond:")
+                    && lines[i + 1].contains("(queue = ")
+            }),
+        "unexpected query plan:\n{plan}"
+    );
+    db.cleanup().await;
+}
+
+/// Published-outbox cleanup reaches eligible rows through an index condition on
+/// `published_at`, so a backlog of old unpublished rows is never walked.
+#[tokio::test]
+async fn outbox_cleanup_uses_published_index() {
+    // The query below mirrors CLEANUP_OUTBOX's selection in src/store/maintenance.rs.
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let plan = diesel::sql_query(
+        "EXPLAIN SELECT id FROM queue_outbox \
+         WHERE published_at < now() - interval '7 days' \
+         ORDER BY published_at, id LIMIT 1000 FOR UPDATE SKIP LOCKED",
+    )
+    .get_results::<PlanLine>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.line)
+    .collect::<Vec<_>>()
+    .join("\n");
+    // An ordered Index Scan or a Bitmap Index Scan (the planner's pick on a small table)
+    // both qualify: either way `published_at` bounds the scan.
+    assert!(
+        plan.contains("queue_outbox_published_idx")
+            && plan
+                .lines()
+                .any(|l| l.contains("Index Cond:") && l.contains("published_at")),
         "unexpected query plan:\n{plan}"
     );
     db.cleanup().await;

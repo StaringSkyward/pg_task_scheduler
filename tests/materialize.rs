@@ -1,12 +1,17 @@
+#![cfg(feature = "cron")]
 mod common;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::store;
-use pg_task_scheduler::{
-    CronExpression, JobId, JobLifecycle, JobName, LeaseDuration, MaxAttempts, WorkerId,
-};
-use std::time::Duration as StdDuration;
+use pg_task_scheduler::{CronExpression, JobLifecycle, MaxAttempts, QueueName, TaskId, TaskName};
+
+fn occurrence_key(job: impl std::fmt::Display, at: DateTime<Utc>) -> String {
+    format!(
+        "schedule:{job}:{}",
+        at.to_rfc3339_opts(SecondsFormat::Micros, true)
+    )
+}
 
 #[tokio::test]
 async fn materializes_missed_slot_and_advances() {
@@ -15,13 +20,23 @@ async fn materializes_missed_slot_and_advances() {
     let job = db.insert_job("j", "*/1 * * * *", past).await;
     let mut conn = db.pool.get().await.unwrap();
 
+    let old_next_run_at = db.job_next_run_at(job).await;
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
-    let runs = db.run_ids(job).await;
+    let runs = db.task_ids(job).await;
     assert_eq!(runs.len(), 1);
+    let task = store::task(&mut conn, TaskId(runs[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.task_key.as_str(), occurrence_key(job, old_next_run_at));
+    assert_eq!(task.task_name.as_str(), "j");
+    assert_eq!(task.due_at, old_next_run_at);
+    assert_eq!(task.payload, serde_json::json!({}));
+    assert_eq!(task.max_attempts, 3);
     assert!(db.job_next_run_at(job).await > Utc::now());
     // second pass: next_run_at now future → nothing
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 0);
-    assert_eq!(db.run_ids(job).await.len(), 1);
+    assert_eq!(db.task_ids(job).await.len(), 1);
     db.cleanup().await;
 }
 
@@ -35,14 +50,13 @@ async fn skips_not_due_and_paused() {
             "paused",
             "*/1 * * * *",
             Utc::now() - Duration::minutes(1),
-            "5 minutes",
             3,
             true,
         )
         .await;
     let mut conn = db.pool.get().await.unwrap();
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 0);
-    assert!(db.run_ids(paused).await.is_empty());
+    assert!(db.task_ids(paused).await.is_empty());
     db.cleanup().await;
 }
 
@@ -63,7 +77,8 @@ async fn pauses_job_with_uncorrupted_cron_left_intact() {
             .unwrap();
     }
     let mut conn = db.pool.get().await.unwrap();
-    let _ = store::materialize_due_jobs(&mut conn).await.unwrap();
+    // A paused job inserts no task.
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 0);
     assert!(db.is_paused(job).await, "bad cron pauses the job");
     db.cleanup().await;
 }
@@ -74,9 +89,8 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
     let mut conn = db.pool.get().await.unwrap();
     let make_spec = |version| {
         CreateJob::new(
-            JobName::try_from("snapshot").unwrap(),
+            TaskName::try_from("snapshot").unwrap(),
             CronExpression::parse("*/5 * * * *").unwrap(),
-            LeaseDuration::try_from(StdDuration::from_secs(60)).unwrap(),
             MaxAttempts::try_from(3).unwrap(),
             JobLifecycle::Active,
             serde_json::json!({ "version": version }),
@@ -84,13 +98,10 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
         .unwrap()
     };
     let job = jobs::create(&mut conn, make_spec(1)).await.unwrap();
-    jobs::reschedule(
-        &mut conn,
-        job.id,
-        ScheduleUpdate::SetNextRunAt(Utc::now() - Duration::seconds(1)),
-    )
-    .await
-    .unwrap();
+    let due = Utc::now() - Duration::seconds(1);
+    jobs::reschedule(&mut conn, job.id, ScheduleUpdate::SetNextRunAt(due))
+        .await
+        .unwrap();
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
     jobs::ensure_job(&mut conn, make_spec(2)).await.unwrap();
     assert_eq!(
@@ -98,15 +109,91 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
         jobs::Applied::Changed
     );
 
-    let claimed = store::claim_one(
+    let ids = db.task_ids(job.id.0).await;
+    assert_eq!(ids.len(), 1);
+    let task = store::task(&mut conn, TaskId(ids[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.task_key.as_str(),
+        occurrence_key(job.id.0, db_time(&due))
+    );
+    assert_eq!(task.payload["version"], 1);
+    db.cleanup().await;
+}
+
+/// Postgres stores microseconds; truncate the host timestamp the same way.
+fn db_time(t: &DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(t.timestamp_micros()).unwrap()
+}
+
+#[tokio::test]
+async fn rematerializing_same_occurrence_creates_one_task() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = db
+        .insert_job("again", "*/5 * * * *", Utc::now() + Duration::hours(1))
+        .await;
+    let t = Utc::now() - Duration::minutes(2);
+    // The second pass finds the occurrence already present and inserts nothing.
+    for expected in [1, 0] {
+        jobs::reschedule(
+            &mut conn,
+            pg_task_scheduler::JobId(job),
+            ScheduleUpdate::SetNextRunAt(t),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store::materialize_due_jobs(&mut conn).await.unwrap(),
+            expected
+        );
+    }
+    let ids = db.task_ids(job).await;
+    assert_eq!(ids.len(), 1);
+    let task = store::task(&mut conn, TaskId(ids[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.task_key.as_str(), occurrence_key(job, db_time(&t)));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn materialized_task_uses_the_job_queue() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = jobs::create(
         &mut conn,
-        &WorkerId::try_from("worker").unwrap(),
-        &["snapshot".into()],
+        CreateJob::new(
+            TaskName::try_from("bulk-job").unwrap(),
+            CronExpression::parse("*/1 * * * *").unwrap(),
+            MaxAttempts::try_from(3u32).unwrap(),
+            JobLifecycle::Active,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .queue(QueueName::try_from("bulk").unwrap()),
     )
     .await
-    .unwrap()
     .unwrap();
-    assert_eq!(claimed.job_id, Some(JobId(job.id.0)));
-    assert_eq!(claimed.job_args["version"], 1);
+    {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(
+            "UPDATE scheduler_jobs SET next_run_at = now() - interval '1 minute' WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let runs = db.task_ids(job.id.0).await;
+    let task = store::task(&mut conn, TaskId(runs[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.queue.as_str(), "bulk");
     db.cleanup().await;
 }
