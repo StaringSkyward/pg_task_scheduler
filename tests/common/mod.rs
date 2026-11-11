@@ -112,6 +112,10 @@ impl TestDb {
     }
 
     pub async fn cleanup(&self) {
+        // Drop the idle pooled connections first. One left idle in a transaction (a dropped
+        // handler or transaction future) would hold its locks, and DROP SCHEMA would wait on
+        // them forever.
+        self.pool.close();
         if let Ok(mut admin) = AsyncPgConnection::establish(&database_url()).await {
             let _ = diesel::sql_query(format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema))
                 .execute(&mut admin)
