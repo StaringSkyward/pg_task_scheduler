@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
+
 use argon2::{ARGON2ID_IDENT, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::Router;
 use axum::extract::{Request, State};
@@ -50,6 +52,9 @@ struct Users {
     hashes: HashMap<String, String>,
     /// Verified for unknown names, so the response time does not reveal which exist.
     dummy: String,
+    /// One permit per verify in flight. Each verify holds ~19 MiB and a core for tens
+    /// of milliseconds, and anyone can trigger one, so this caps that at one per CPU.
+    verifies: Arc<Semaphore>,
 }
 
 /// Require HTTP basic auth against `users`; the user name becomes the [`Operator`].
@@ -67,7 +72,13 @@ pub fn with_basic_auth(router: Router, users: Vec<BasicUser>) -> Result<Router, 
     // ponytail: a user hashed with custom parameters verifies at a different cost than
     // unknown names; derive the dummy from that user's parameters if that ever matters.
     let dummy = hash_password("");
-    let users = Arc::new(Users { hashes, dummy });
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let verifies = Arc::new(Semaphore::new(cpus));
+    let users = Arc::new(Users {
+        hashes,
+        dummy,
+        verifies,
+    });
     Ok(router.layer(middleware::from_fn_with_state(users, basic)))
 }
 
@@ -75,8 +86,8 @@ async fn basic(State(users): State<Arc<Users>>, mut req: Request, next: Next) ->
     let Some((name, password)) = credentials(req.headers()) else {
         return challenge();
     };
-    // argon2 takes tens of milliseconds of CPU: keep it off the async workers.
-    let verified = tokio::task::spawn_blocking(move || {
+    let limit = users.verifies.clone();
+    let verified = limited(limit, move || {
         let (hash, known) = match users.hashes.get(&name) {
             Some(h) => (h, true),
             None => (&users.dummy, false),
@@ -88,12 +99,29 @@ async fn basic(State(users): State<Arc<Users>>, mut req: Request, next: Next) ->
     })
     .await;
     match verified {
-        Ok(Some(name)) => {
+        Some(Some(name)) => {
             req.extensions_mut().insert(Operator(name));
             next.run(req).await
         }
         _ => challenge(),
     }
+}
+
+/// Run `f` on the blocking pool (argon2 would stall the async workers) once `limit`
+/// grants a permit; callers queue for one. The permit moves into the blocking task, so
+/// a request dropped mid-verify (client gone) does not free its slot early. `None` if
+/// `f` panicked.
+async fn limited<R: Send + 'static>(
+    limit: Arc<Semaphore>,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    let permit = limit.acquire_owned().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .ok()
 }
 
 /// `(user, password)` from `Authorization: Basic base64(user:password)`.
@@ -140,4 +168,48 @@ async fn trusted(State(header): State<HeaderName>, mut req: Request, next: Next)
     };
     req.extensions_mut().insert(Operator(name));
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
+
+    use super::*;
+
+    /// At most `N` verifies run at once, even when callers give up mid-verify.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verifies_are_bounded_even_when_callers_give_up() {
+        const N: usize = 2;
+        let limit = Arc::new(Semaphore::new(N));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let job = || {
+            let (running, peak) = (running.clone(), peak.clone());
+            move || {
+                peak.fetch_max(running.fetch_add(1, SeqCst) + 1, SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                running.fetch_sub(1, SeqCst);
+            }
+        };
+        // Callers that are dropped while their verify runs, like a closed connection.
+        let quitters: Vec<_> = (0..8)
+            .map(|_| tokio::spawn(limited(limit.clone(), job())))
+            .collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while running.load(SeqCst) < N {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("no verify started");
+        quitters.iter().for_each(|q| q.abort());
+        let stayers: Vec<_> = (0..8)
+            .map(|_| tokio::spawn(limited(limit.clone(), job())))
+            .collect();
+        for s in stayers {
+            s.await.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(SeqCst), N);
+    }
 }
