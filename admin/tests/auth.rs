@@ -67,10 +67,10 @@ async fn every_route_401_without_operator() {
     let db = TestDb::new().await;
     let id = enqueue_one(&db).await;
     let app = router(db.pool.clone(), AdminConfig::default());
-    #[cfg_attr(not(feature = "cron"), allow(unused_mut))]
     let get = |uri: &str| (Method::GET, uri.to_owned());
     let post = |uri: &str| (Method::POST, uri.to_owned());
     // Every route, so one added outside the operator check fails here.
+    #[cfg_attr(not(feature = "cron"), allow(unused_mut))]
     let mut routes = vec![
         get("/"),
         get("/overview"),
