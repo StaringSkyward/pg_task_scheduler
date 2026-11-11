@@ -411,6 +411,7 @@ pub struct Job {
     pub name: TaskName,
     pub cron: CronExpression,
     pub max_attempts: MaxAttempts,
+    pub queue: QueueName,
     pub lifecycle: JobLifecycle,
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -433,6 +434,7 @@ impl TryFrom<SchedulerJob> for Job {
             name: row.name,
             cron,
             max_attempts,
+            queue: row.queue,
             lifecycle: JobLifecycle::from_paused(row.is_paused),
             next_run_at: row.next_run_at,
             created_at: row.created_at,
@@ -453,6 +455,7 @@ pub struct SchedulerJob {
     pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
     pub max_attempts: i32,
+    pub queue: QueueName,
     pub is_paused: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -467,6 +470,7 @@ pub struct NewJob {
     pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
     pub max_attempts: i32,
+    pub queue: QueueName,
     pub is_paused: bool,
 }
 

@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::store;
-use pg_task_scheduler::{CronExpression, JobLifecycle, MaxAttempts, TaskId, TaskName};
+use pg_task_scheduler::{CronExpression, JobLifecycle, MaxAttempts, QueueName, TaskId, TaskName};
 
 fn occurrence_key(job: impl std::fmt::Display, at: DateTime<Utc>) -> String {
     format!(
@@ -157,5 +157,43 @@ async fn rematerializing_same_occurrence_creates_one_task() {
         .unwrap()
         .unwrap();
     assert_eq!(task.task_key.as_str(), occurrence_key(job, db_time(&t)));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn materialized_task_uses_the_job_queue() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = jobs::create(
+        &mut conn,
+        CreateJob::new(
+            TaskName::try_from("bulk-job").unwrap(),
+            CronExpression::parse("*/1 * * * *").unwrap(),
+            MaxAttempts::try_from(3u32).unwrap(),
+            JobLifecycle::Active,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .queue(QueueName::try_from("bulk").unwrap()),
+    )
+    .await
+    .unwrap();
+    {
+        use diesel_async::RunQueryDsl;
+        diesel::sql_query(
+            "UPDATE scheduler_jobs SET next_run_at = now() - interval '1 minute' WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let runs = db.task_ids(job.id.0).await;
+    let task = store::task(&mut conn, TaskId(runs[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.queue.as_str(), "bulk");
     db.cleanup().await;
 }

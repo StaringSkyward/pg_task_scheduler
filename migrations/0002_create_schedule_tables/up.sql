@@ -8,6 +8,7 @@ CREATE TABLE scheduler_jobs (
     job_args        JSONB NOT NULL DEFAULT '{}'::jsonb,
     next_run_at     TIMESTAMPTZ NOT NULL,
     max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
+    queue           TEXT NOT NULL DEFAULT 'default',
     is_paused       BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()

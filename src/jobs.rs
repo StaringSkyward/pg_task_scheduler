@@ -14,7 +14,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
-use crate::ids::{JobId, TaskName};
+use crate::ids::{JobId, QueueName, TaskName};
 use crate::models::{Job, JobLifecycle, MaxAttempts, NewJob, SchedulerJob};
 use crate::schema::scheduler_jobs::dsl as j;
 
@@ -25,6 +25,7 @@ pub struct CreateJob {
     args: serde_json::Value,
     max_attempts: MaxAttempts,
     lifecycle: JobLifecycle,
+    queue: QueueName,
 }
 
 impl CreateJob {
@@ -45,8 +46,15 @@ impl CreateJob {
             cron,
             max_attempts,
             lifecycle,
+            queue: QueueName::default(),
             args: serde_json::to_value(args)?, // SchedulerError::Serde on failure
         })
+    }
+
+    /// The queue for the tasks this schedule produces (default `default`).
+    pub fn queue(mut self, queue: QueueName) -> Self {
+        self.queue = queue;
+        self
     }
 }
 
@@ -95,6 +103,7 @@ fn new_job(spec: &CreateJob, db_now: DateTime<Utc>) -> Result<NewJob, SchedulerE
         job_args: spec.args.clone(),
         next_run_at: spec.cron.next_after(db_now)?,
         max_attempts: spec.max_attempts.to_i32(),
+        queue: spec.queue.clone(),
         is_paused: spec.lifecycle.is_paused(),
     })
 }
@@ -118,7 +127,7 @@ pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job
 
 /// Idempotent declarative registration. Inserts the job if its name is new (the
 /// cursor computed from `db_now`); on conflict reconciles config columns (cron,
-/// args, max_attempts) but PRESERVES the existing `next_run_at` and
+/// args, max_attempts, queue) but PRESERVES the existing `next_run_at` and
 /// `is_paused`. Because the cursor is never advanced here, ensure-on-startup can
 /// never skip a due occurrence, and a redeploy can never resurrect a job an
 /// operator paused. Use [`reschedule`] to move the cursor explicitly.
@@ -141,6 +150,7 @@ pub async fn ensure_job(
                     j::cron_expression.eq(&row.cron_expression),
                     j::job_args.eq(&row.job_args),
                     j::max_attempts.eq(row.max_attempts),
+                    j::queue.eq(&row.queue),
                     j::updated_at.eq(db_now),
                 ))
                 .returning(SchedulerJob::as_returning())

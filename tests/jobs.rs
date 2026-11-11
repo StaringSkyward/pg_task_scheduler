@@ -5,8 +5,8 @@ use chrono::Utc;
 use common::TestDb;
 use pg_task_scheduler::jobs::{self, Applied, CreateJob, ScheduleUpdate};
 use pg_task_scheduler::{
-    CorruptJobRow, CronExpression, JobId, JobLifecycle, MaxAttempts, SchedulerError, TaskName,
-    store,
+    CorruptJobRow, CronExpression, JobId, JobLifecycle, MaxAttempts, QueueName, SchedulerError,
+    TaskName, store,
 };
 
 fn spec(name: &str, cron: &str) -> CreateJob {
@@ -265,5 +265,21 @@ async fn pause_resume_delete_missing_is_not_found() {
         jobs::delete(&mut conn, missing).await.unwrap(),
         Applied::NotFound
     );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn ensure_job_reconciles_queue() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let a = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(a.queue, QueueName::default());
+    let bulk = QueueName::try_from("bulk").unwrap();
+    let b = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *").queue(bulk))
+        .await
+        .unwrap();
+    assert_eq!(b.queue.as_str(), "bulk");
     db.cleanup().await;
 }

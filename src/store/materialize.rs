@@ -22,17 +22,19 @@ struct DueJob {
     job_args: serde_json::Value,
     #[diesel(sql_type = sql_types::Integer)]
     max_attempts: i32,
+    #[diesel(sql_type = sql_types::Text)]
+    queue: String,
 }
 
 const SELECT_DUE: &str = "\
     SELECT id, next_run_at, cron_expression, now() AS db_now, name, job_args, \
-           max_attempts \
+           max_attempts, queue \
     FROM scheduler_jobs \
     WHERE next_run_at <= now() AND is_paused = false \
     ORDER BY next_run_at ASC FOR UPDATE SKIP LOCKED LIMIT 1";
 const INSERT_TASK: &str = "\
-    INSERT INTO queue_tasks (task_key, task_name, payload, due_at, max_attempts) \
-    VALUES ($1, $2, $3, $4, $5) \
+    INSERT INTO queue_tasks (task_key, task_name, payload, due_at, max_attempts, queue) \
+    VALUES ($1, $2, $3, $4, $5, $6) \
     ON CONFLICT (task_key) DO NOTHING";
 const NOTIFY: &str = "SELECT pg_notify('queue_available', '')";
 const ADVANCE: &str =
@@ -100,6 +102,7 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, 
                     .bind::<sql_types::Jsonb, _>(job.job_args)
                     .bind::<sql_types::Timestamptz, _>(job.next_run_at)
                     .bind::<sql_types::Integer, _>(job.max_attempts)
+                    .bind::<sql_types::Text, _>(job.queue)
                     .execute(c)
                     .await?;
                 if inserted == 1 {

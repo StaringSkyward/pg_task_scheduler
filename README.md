@@ -342,7 +342,8 @@ re-materialized occurrence never creates a second task. Every running scheduler
 materializes due schedules at most once per `max_poll_interval`, so an occurrence
 becomes a task within `max_poll_interval` of its time. Deleting or editing a
 schedule does not change tasks it already created. After downtime, one
-occurrence is created for the missed slot (`run_once`).
+occurrence is created for the missed slot (`run_once`). `CreateJob::queue(..)`
+picks the queue for the tasks a schedule produces (default `default`).
 
 ## Feature Flags
 
