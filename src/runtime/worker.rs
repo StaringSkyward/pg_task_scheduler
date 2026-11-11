@@ -198,8 +198,10 @@ impl<P: SchedulerPool> Scheduler<P> {
             }
         }
         in_flight.shutdown().await;
-        // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`, so its `stopping` write cannot
-        // land after the delete below.
+        // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`. That bounds shutdown, not the
+        // server: a periodic upsert cut off by `cancel`, or a `stopping` write that timed out,
+        // may still execute after the delete below and re-create the row, which then reads
+        // live until its `lost_after` (AdminUI §6.11).
         if let Err(error) = registration.await {
             tracing::error!(%error, "registry task panicked");
         }
