@@ -2,6 +2,7 @@ mod common;
 
 use common::TestDb;
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
+use pg_task_scheduler::store;
 
 #[derive(diesel::QueryableByName)]
 struct PlanLine {
@@ -140,7 +141,9 @@ async fn cleanup_cancelled_uses_terminal_index() {
     .collect::<Vec<_>>()
     .join("\n");
     assert!(
-        plan.contains("queue_tasks_terminal_cleanup_idx")
+        // `queue_tasks_failed_idx` (added with the admin UI) serves it equally well.
+        (plan.contains("queue_tasks_terminal_cleanup_idx")
+            || plan.contains("queue_tasks_failed_idx"))
             && plan
                 .lines()
                 .any(|l| l.contains("Index Cond:") && l.contains("completed_at")),
@@ -179,5 +182,136 @@ async fn replay_matching_uses_failed_name_index() {
         plan.contains("queue_tasks_failed_name_idx") && !plan.contains("Seq Scan on queue_tasks"),
         "unexpected query plan:\n{plan}"
     );
+    db.cleanup().await;
+}
+
+fn browse_plan(rows: Vec<PlanLine>, index: &str) -> String {
+    let plan = rows
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains(index) && !plan.contains("Seq Scan on queue_tasks"),
+        "unexpected query plan:\n{plan}"
+    );
+    plan
+}
+
+async fn seqscan_off_conn(
+    db: &TestDb,
+) -> diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection> {
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    conn
+}
+
+#[tokio::test]
+async fn queued_page_uses_claim_and_due_indexes() {
+    use diesel::sql_types::{BigInt, Text, Timestamptz};
+    let db = TestDb::new().await;
+    let mut conn = seqscan_off_conn(&db).await;
+    let now = chrono::Utc::now();
+    let due = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_DUE))
+        .bind::<Text, _>("default")
+        .bind::<BigInt, _>(5_i64)
+        .bind::<Timestamptz, _>(now)
+        .bind::<BigInt, _>(7_i64)
+        .bind::<BigInt, _>(51_i64)
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(due, "queue_tasks_claim_idx");
+    let future = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_FUTURE))
+        .bind::<Text, _>("default")
+        .bind::<Timestamptz, _>(now)
+        .bind::<BigInt, _>(7_i64)
+        .bind::<BigInt, _>(51_i64)
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(future, "queue_tasks_due_idx");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn running_page_uses_lease_index() {
+    use diesel::sql_types::{BigInt, Timestamptz};
+    let db = TestDb::new().await;
+    let mut conn = seqscan_off_conn(&db).await;
+    let plan = diesel::sql_query(format!("EXPLAIN {}", store::RUNNING))
+        .bind::<Timestamptz, _>(chrono::Utc::now())
+        .bind::<BigInt, _>(7_i64)
+        .bind::<BigInt, _>(51_i64)
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(plan, "queue_tasks_expired_lease_idx");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn done_page_uses_terminal_index() {
+    use diesel::sql_types::{BigInt, Timestamptz};
+    let db = TestDb::new().await;
+    let mut conn = seqscan_off_conn(&db).await;
+    let plan = diesel::sql_query(format!("EXPLAIN {}", store::DONE))
+        .bind::<Timestamptz, _>(chrono::Utc::now())
+        .bind::<BigInt, _>(7_i64)
+        .bind::<BigInt, _>(51_i64)
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(plan, "queue_tasks_terminal_cleanup_idx");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_page_uses_failed_index() {
+    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    let db = TestDb::new().await;
+    let mut conn = seqscan_off_conn(&db).await;
+    let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED))
+        .bind::<Text, _>("dead")
+        .bind::<Nullable<Text>, _>(Some("boom"))
+        .bind::<Timestamptz, _>(chrono::Utc::now())
+        .bind::<BigInt, _>(7_i64)
+        .bind::<BigInt, _>(51_i64)
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(plan, "queue_tasks_failed_idx");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_page_by_name_uses_failed_name_index() {
+    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    let db = TestDb::new().await;
+    // With real statistics, the selective task_name wins over the status-only index.
+    let mut setup = db.pool.get().await.unwrap();
+    setup
+        .batch_execute(
+            "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+             SELECT 'k' || g, 'name' || (g % 50), 'dead', now() - g * interval '1 second' \
+             FROM generate_series(1, 5000) g; ANALYZE queue_tasks",
+        )
+        .await
+        .unwrap();
+    drop(setup);
+    let mut conn = seqscan_off_conn(&db).await;
+    let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED_BY_NAME))
+        .bind::<Text, _>("dead")
+        .bind::<Nullable<Text>, _>(None::<&str>)
+        .bind::<Timestamptz, _>(chrono::Utc::now())
+        .bind::<BigInt, _>(7_i64)
+        .bind::<BigInt, _>(51_i64)
+        .bind::<Text, _>("email")
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(plan, "queue_tasks_failed_name_idx");
     db.cleanup().await;
 }

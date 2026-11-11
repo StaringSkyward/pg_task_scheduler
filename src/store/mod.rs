@@ -1,6 +1,7 @@
 //! Store operations on the queue tables (added task by task).
 
 mod admin;
+mod browse;
 mod claim;
 mod inspect;
 mod maintenance;
@@ -15,6 +16,12 @@ pub use admin::{
     AdminAction, AdminActionKind, BULK_BATCH, BULK_BUDGET, BulkFilter, BulkOutcome, CancelOutcome,
     QueuePause, admin_actions, cancel, cancel_matching, count_cancellable, count_replayable,
     pause_queue, paused_queues, replay_matching, resume_queue, task_actions,
+};
+#[doc(hidden)]
+pub use browse::{DONE, FAILED, FAILED_BY_NAME, QUEUED_DUE, QUEUED_FUTURE, RUNNING};
+pub use browse::{
+    FailedFilter, FailedStatus, FinishedCursor, Page, QueuedCursor, RunningCursor, TaskDetail,
+    TaskRow, done_page, failed_page, queued_page, running_page, task_detail,
 };
 pub use claim::{claim, next_due_in};
 pub use inspect::{attempts, queue_stats, task};

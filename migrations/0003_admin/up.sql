@@ -73,3 +73,9 @@ CREATE TABLE queue_workers (
     queues       JSONB NOT NULL,
     task_names   TEXT[] NOT NULL
 );
+
+-- 6. the failed/cancelled browser lists newest first without a task_name filter. Partial like
+-- section 3's index, so enqueue, claim and completion never maintain it.
+CREATE INDEX queue_tasks_failed_idx
+    ON queue_tasks (status, completed_at DESC, id DESC)
+    WHERE status IN ('dead', 'cancelled');
