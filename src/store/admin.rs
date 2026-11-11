@@ -1,4 +1,6 @@
-//! Admin action audit: `queue_admin_actions` rows and their queries.
+//! Admin operations and their audit: single-task cancel, `queue_admin_actions` rows and queries.
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use diesel::sql_types;
@@ -124,4 +126,95 @@ pub async fn task_actions(
     .into_iter()
     .map(AdminAction::try_from)
     .collect()
+}
+
+/// How long a single cancel retries a row another transaction holds before reporting `Busy`.
+const CANCEL_WAIT: Duration = Duration::from_secs(2);
+const CANCEL_RETRY: Duration = Duration::from_millis(100);
+
+/// What `cancel` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled,
+    /// Already terminal, or no such task.
+    NotCancellable,
+    /// Another transaction held the row (for example a handler inside `lock_owned`) for the
+    /// whole wait; try again.
+    Busy,
+}
+
+// One statement, never waiting on a row lock (SKIP LOCKED). `busy` reads the statement's
+// snapshot without a lock: queued or running there means the row was skipped (or changed
+// after the snapshot), so the caller retries.
+// The attempt is closed by upsert, not UPDATE: a claim that committed after this statement's
+// snapshot, but before the row lock, inserted an attempt the snapshot cannot see; ON CONFLICT
+// still finds it. A running task always has its attempt (the claim inserts both at once).
+const CANCEL: &str = r#"
+    WITH target AS (
+        SELECT id, task_name, queue, status, attempts, lock_token, locked_by FROM queue_tasks
+        WHERE id = $1 AND status IN ('queued', 'running')
+        FOR UPDATE SKIP LOCKED
+    ), act AS (
+        INSERT INTO queue_admin_actions
+            (action, task_id, task_name, queue, affected, operator, reason)
+        SELECT 'cancel', id, task_name, queue, 1, $2, $3 FROM target
+        RETURNING id
+    ), closed AS (
+        INSERT INTO queue_task_attempts
+            (task_id, attempt_no, lock_token, worker_id, finished_at, outcome, error)
+        SELECT id, attempts, lock_token, locked_by, now(), 'cancelled', 'cancelled by operator'
+        FROM target WHERE status = 'running'
+        ON CONFLICT (task_id, lock_token) DO UPDATE
+        SET finished_at = excluded.finished_at, outcome = excluded.outcome,
+            error = excluded.error
+        WHERE queue_task_attempts.finished_at IS NULL
+    ), cancelled AS (
+        UPDATE queue_tasks t
+        SET status = 'cancelled', locked_by = NULL, locked_until = NULL, completed_at = now(),
+            updated_at = now(), admin_action_id = act.id
+        FROM target, act
+        WHERE t.id = target.id
+        RETURNING t.id
+    )
+    SELECT EXISTS (SELECT 1 FROM cancelled) AS cancelled,
+           EXISTS (SELECT 1 FROM queue_tasks WHERE id = $1 AND status IN ('queued', 'running'))
+               AS busy
+"#;
+
+#[derive(diesel::QueryableByName)]
+struct CancelRow {
+    #[diesel(sql_type = sql_types::Bool)]
+    cancelled: bool,
+    #[diesel(sql_type = sql_types::Bool)]
+    busy: bool,
+}
+
+/// Cancel a queued or running task and audit it. A running task's attempt closes with outcome
+/// `cancelled`, and its worker loses the lease at its next heartbeat. Never blocks on a row
+/// lock: a row held elsewhere is retried every 100 ms for up to 2 s, then reported `Busy`.
+pub async fn cancel(
+    conn: &mut AsyncPgConnection,
+    id: TaskId,
+    operator: &str,
+    reason: &str,
+) -> Result<CancelOutcome, SchedulerError> {
+    let deadline = tokio::time::Instant::now() + CANCEL_WAIT;
+    loop {
+        let row = diesel::sql_query(CANCEL)
+            .bind::<sql_types::BigInt, _>(id)
+            .bind::<sql_types::Text, _>(operator)
+            .bind::<sql_types::Text, _>(reason)
+            .get_result::<CancelRow>(conn)
+            .await?;
+        if row.cancelled {
+            return Ok(CancelOutcome::Cancelled);
+        }
+        if !row.busy {
+            return Ok(CancelOutcome::NotCancellable);
+        }
+        if tokio::time::Instant::now() + CANCEL_RETRY > deadline {
+            return Ok(CancelOutcome::Busy);
+        }
+        tokio::time::sleep(CANCEL_RETRY).await;
+    }
 }

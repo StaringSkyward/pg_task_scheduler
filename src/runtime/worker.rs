@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::error::{SchedulerError, TaskError};
 use crate::ids::QueueName;
-use crate::models::{ClaimedTask, RetryOutcome, TaskLease};
+use crate::models::{ClaimedTask, RetryOutcome, TaskLease, TaskStatus};
 use crate::pool::SchedulerPool;
 use crate::runtime::builder::{Config, Scheduler};
 use crate::runtime::context::TaskContext;
@@ -463,17 +463,15 @@ fn dispatch<P: SchedulerPool>(
             () = keep_lease(&pool, &task.lease, &config, &name, deadline) => {
                 drop(cancel_on_drop); // cancel now, not after the check below
                 // A DB-contained handler may have committed its own completion while a
-                // heartbeat waited on the row lock; that heartbeat then matches no row.
-                // Bounded, so a database outage cannot hold the permit here.
-                let completed = async {
-                    store::completed_by(&mut *acquire(&pool).await?, &task.lease).await
+                // heartbeat waited on the row lock, or an operator cancelled the task; the
+                // heartbeat then matches no row. Bounded, so a database outage cannot hold
+                // the permit here.
+                let ended = async {
+                    let mut conn = acquire(&pool).await.ok()?;
+                    Some(ended_elsewhere(&mut conn, &task.lease, &name).await)
                 };
-                let completed = tokio::time::timeout(config.heartbeat_interval, completed).await;
-                if matches!(completed, Ok(Ok(true))) {
-                    metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name)
-                        .increment(1);
-                    tracing::debug!("handler completed the task itself");
-                } else {
+                let ended = tokio::time::timeout(config.heartbeat_interval, ended).await;
+                if !matches!(ended, Ok(Some(true))) {
                     metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
                         .increment(1);
                     tracing::warn!("lease lost; handler dropped");
@@ -553,24 +551,16 @@ async fn finish<P: SchedulerPool>(
     };
     let error = match result {
         Ok(()) => {
-            let completed = match timed("complete", store::complete(&mut conn, lease)).await {
-                Ok(()) => Ok(true),
-                // Benign when a DB-contained handler completed the task itself.
-                Err(SchedulerError::LostOwnership(_)) => store::completed_by(&mut conn, lease)
-                    .await
-                    .inspect(|&by_handler| {
-                        if by_handler {
-                            tracing::debug!("handler completed the task itself");
-                        }
-                    }),
-                Err(error) => Err(error),
-            };
-            match completed {
-                Ok(true) => {
+            match timed("complete", store::complete(&mut conn, lease)).await {
+                Ok(()) => {
                     metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name)
                         .increment(1);
                 }
-                Ok(false) => tracing::warn!("lost ownership before completion"),
+                Err(SchedulerError::LostOwnership(_)) => {
+                    if !ended_elsewhere(&mut conn, lease, &name).await {
+                        tracing::warn!("lost ownership before completion");
+                    }
+                }
                 Err(error) => tracing::error!(%error, "completion failed"),
             }
             return;
@@ -605,7 +595,10 @@ async fn finish<P: SchedulerPool>(
             tracing::error!(classification, error = %message, "task failed; marked dead");
         }
         Err(store_error) => {
-            tracing::warn!(classification, error = %message, %store_error, "task failed; result not recorded");
+            let lost = matches!(store_error, SchedulerError::LostOwnership(_));
+            if !(lost && ended_elsewhere(&mut conn, lease, &name).await) {
+                tracing::warn!(classification, error = %message, %store_error, "task failed; result not recorded");
+            }
         }
     }
 }
@@ -613,20 +606,51 @@ async fn finish<P: SchedulerPool>(
 /// Return the task to `queued` at shutdown without counting the attempt. On failure it stays
 /// `running` until the reaper recovers it after the lease, and that attempt counts.
 async fn release<P: SchedulerPool>(pool: &P, lease: &TaskLease, name: String) {
-    let released = async {
-        let mut conn = acquire(pool).await?;
-        timed("release", store::release(&mut conn, lease)).await
-    }
-    .await;
+    let released = match acquire(pool).await {
+        Ok(mut conn) => match timed("release", store::release(&mut conn, lease)).await {
+            Err(SchedulerError::LostOwnership(_)) => {
+                if !ended_elsewhere(&mut conn, lease, &name).await {
+                    tracing::warn!("lost ownership before release");
+                }
+                return;
+            }
+            released => released,
+        },
+        Err(error) => Err(error),
+    };
     match released {
         Ok(()) => {
             metrics::counter!("pg_task_scheduler_tasks_released_total", "task_name" => name)
                 .increment(1);
             tracing::info!("task released at shutdown; attempt not counted");
         }
-        Err(SchedulerError::LostOwnership(_)) => tracing::warn!("lost ownership before release"),
         Err(error) => {
             tracing::error!(%error, "release failed; the reaper recovers the task after the lease");
+        }
+    }
+}
+
+/// After a heartbeat or transition matched no row: if the task under this lease was completed
+/// by its own handler or cancelled by an operator, count that and return `true`. `false` means
+/// the lease was lost (or the check failed); the caller reports that its own way.
+async fn ended_elsewhere(conn: &mut AsyncPgConnection, lease: &TaskLease, name: &str) -> bool {
+    match store::lease_status(conn, lease).await {
+        Ok(Some(TaskStatus::Done)) => {
+            metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name.to_owned())
+                .increment(1);
+            tracing::debug!("handler completed the task itself");
+            true
+        }
+        Ok(Some(TaskStatus::Cancelled)) => {
+            metrics::counter!("pg_task_scheduler_tasks_cancelled_total", "task_name" => name.to_owned())
+                .increment(1);
+            tracing::info!("task cancelled by an operator; handler dropped");
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(%error, "lease check failed");
+            false
         }
     }
 }

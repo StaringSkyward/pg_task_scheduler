@@ -365,6 +365,17 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
   or `cancelled` task back to `queued` with the same `task_key`, resets `attempts`, and bumps
   `lock_token`. Each replay is recorded in `queue_admin_actions` and linked from the task's `admin_action_id`. Enqueue a new
   `task_key` instead if you want a new external effect.
+- **Cancel:** `store::cancel(conn, task_id, operator, reason)` moves a `queued`
+  or `running` task to `cancelled`, recorded in `queue_admin_actions`. A running
+  task's attempt closes with outcome `cancelled`. Its worker's next heartbeat
+  (within `heartbeat_interval`) finds the lease gone: `ctx.cancellation` fires,
+  the handler is dropped, and anything it already did stays done. The worker
+  counts this in `tasks_cancelled_total`, not `leases_lost_total`. The call
+  never waits on a row lock. It returns `NotCancellable` for a terminal or
+  missing task, and `Busy` when another transaction (for example a handler
+  inside `lock_owned`) still holds the row after 2 s of retries. A cancelled
+  task keeps its `task_key` until retention deletes it (after `Retention.dead`),
+  so enqueueing that key again does not run it; replay does.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
   (counts by status, due count, oldest due age, depth by queue, name and
   priority with due count and oldest due age, and outbox backlog).
@@ -411,6 +422,7 @@ them:
 | `pg_task_scheduler_tasks_retried_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_dead_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_released_total` | counter | `task_name` (released at shutdown; the attempt is not counted) |
+| `pg_task_scheduler_tasks_cancelled_total` | counter | `task_name` (an operator cancelled the running task; seen by its worker) |
 | `pg_task_scheduler_leases_lost_total` | counter | `task_name` |
 | `pg_task_scheduler_heartbeat_failures_total` | counter | `task_name` |
 | `pg_task_scheduler_leases_expired_total` | counter | (none; reaper) |

@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use diesel::sql_types;
+use diesel::{OptionalExtension, sql_types};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::error::SchedulerError;
-use crate::models::{OutboxCommand, RetryOutcome, TaskLease, pg_interval};
+use crate::models::{OutboxCommand, RetryOutcome, TaskLease, TaskStatus, pg_interval};
 
 // Ownership guard shared by every worker-owned mutation. Binds: $1 task id, $2 worker, $3 token.
 macro_rules! owned {
@@ -79,6 +79,14 @@ const CLOSE_ATTEMPT: &str = "UPDATE queue_task_attempts \
 
 const COMPLETED_BY: &str = "SELECT EXISTS (SELECT 1 FROM queue_tasks \
     WHERE id = $1 AND status = 'done' AND lock_token = $2) AS done";
+
+const LEASE_STATUS: &str = "SELECT status FROM queue_tasks WHERE id = $1 AND lock_token = $2";
+
+#[derive(diesel::QueryableByName)]
+struct StatusRow {
+    #[diesel(sql_type = sql_types::Text)]
+    status: String,
+}
 
 #[derive(diesel::QueryableByName)]
 struct IdRow {
@@ -299,4 +307,25 @@ pub async fn completed_by(
         .get_result::<DoneRow>(conn)
         .await?
         .done)
+}
+
+/// The task's status while `lease`'s token still holds it, else `None` (claimed again, replayed,
+/// or deleted). After a transition reports `LostOwnership`, `Done` means the handler completed
+/// the task itself and `Cancelled` that an operator cancelled it.
+pub async fn lease_status(
+    conn: &mut AsyncPgConnection,
+    lease: &TaskLease,
+) -> Result<Option<TaskStatus>, SchedulerError> {
+    diesel::sql_query(LEASE_STATUS)
+        .bind::<sql_types::BigInt, _>(&lease.task_id)
+        .bind::<sql_types::BigInt, _>(&lease.lock_token)
+        .get_result::<StatusRow>(conn)
+        .await
+        .optional()?
+        .map(|r| {
+            r.status
+                .parse()
+                .map_err(|_| SchedulerError::Invariant("unknown task status"))
+        })
+        .transpose()
 }
