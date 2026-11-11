@@ -435,10 +435,12 @@ async fn aborted_run_stops_maintenance_and_unlistens() {
         .unwrap()
         .build()
         .unwrap();
+    let health = scheduler.health();
     let Worker { cancel, handle } = start(scheduler);
     tokio::time::sleep(ms(300)).await; // idle and listening
     handle.abort();
     assert!(handle.await.unwrap_err().is_cancelled());
+    assert_eq!(health.borrow().status, HealthStatus::Stopped);
 
     // A detached maintenance task would reap this within one 50 ms interval.
     db.expire_lease(other).await;
@@ -452,9 +454,41 @@ async fn aborted_run_stops_maintenance_and_unlistens() {
         TaskStatus::Running,
         "maintenance outlived the run"
     );
+    assert_pool_not_listening(&db).await;
+    drop(cancel);
+    db.cleanup().await;
+}
 
-    // Wait for every pooled connection to be idle in the pool (the spawned UNLISTEN holds
-    // the listener until it is done), then check that none of them is still listening.
+/// Dropping the run future from a thread outside the runtime (e.g. a future polled by
+/// `block_on` and dropped afterwards) must still UNLISTEN the pooled connection.
+#[test]
+fn run_dropped_outside_runtime_still_unlistens() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = rt.block_on(TestDb::new());
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let health = scheduler.health();
+    let mut run = Box::pin(scheduler.run_until_shutdown(CancellationToken::new()));
+    rt.block_on(async {
+        tokio::select! {
+            _ = &mut run => panic!("run ended without cancellation"),
+            () = tokio::time::sleep(ms(300)) => {} // idle and listening
+        }
+    });
+    drop(run); // outside any runtime context
+    assert_eq!(health.borrow().status, HealthStatus::Stopped);
+    rt.block_on(async {
+        assert_pool_not_listening(&db).await;
+        db.cleanup().await;
+    });
+}
+
+/// Wait for every pooled connection to be idle in the pool (a spawned UNLISTEN holds the
+/// listener until it is done), then check that none of them is still listening.
+async fn assert_pool_not_listening(db: &TestDb) {
     let start = Instant::now();
     while db.pool.status().available < db.pool.status().size {
         assert!(
@@ -475,8 +509,6 @@ async fn aborted_run_stops_maintenance_and_unlistens() {
             .n;
         assert_eq!(listening, 0, "a pooled connection is still LISTENing");
     }
-    drop((conns, cancel));
-    db.cleanup().await;
 }
 
 /// A retention backlog must not hold up lease recovery: the reaper runs between cleanup
@@ -490,7 +522,7 @@ async fn cleanup_backlog_does_not_starve_reaper() {
         .unwrap()
         .batch_execute(
             "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
-             SELECT 'old-' || i, 'job', 'done', now() - interval '8 days' \
+             SELECT 'old-' || i, 'job', 'done', now() - interval '31 days' \
              FROM generate_series(1, 20000) AS i",
         )
         .await

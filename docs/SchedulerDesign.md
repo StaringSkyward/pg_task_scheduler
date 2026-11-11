@@ -155,8 +155,9 @@ dispatch: run the handler and the lease keeper concurrently
           permanent → fail_permanently
 shutdown: stop maintenance; UNLISTEN; drain handlers until shutdown_timeout; abort the rest
 dropped:  if the run future is dropped instead (aborted, or a failed try_join! sibling),
-          maintenance stops, handlers are aborted, and the LISTEN connection runs
-          UNLISTEN on a spawned task before it returns to the pool
+          maintenance stops, handlers are aborted, health becomes Stopped, and the
+          LISTEN connection runs UNLISTEN on a task spawned on the worker's runtime
+          (even if the drop happens off-runtime) before it returns to the pool
 ```
 
 The lease keeper is a separate future, not a `select!` arm body. A DB-contained
@@ -186,7 +187,7 @@ recovers it after the lease expires.
 | `base_retry_delay` / `max_retry_delay` / `retry_jitter` | 1 s / 5 min / 1 s |
 | `reaper_interval` / `reaper_batch_size` | 20 s / 100 |
 | `crash_retry_delay` | 10 s |
-| `retention` | done 7 d, dead 30 d, idempotency horizon 7 d, published outbox 7 d, batch 1000 |
+| `retention` | done 30 d, dead 30 d, idempotency horizon 7 d, published outbox 7 d, batch 1000 |
 | `shutdown_timeout` | 25 s |
 
 `build()` rejects zero intervals, `heartbeat_interval > lease_duration / 3`,

@@ -222,7 +222,7 @@ async fn cleanup_deletes_only_eligible_terminal_rows_in_batches() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     for i in 0..3 {
-        insert_terminal(&mut conn, &format!("done-old-{i}"), "done", "8 days").await;
+        insert_terminal(&mut conn, &format!("done-old-{i}"), "done", "31 days").await;
     }
     insert_terminal(&mut conn, "done-new", "done", "1 day").await;
     insert_terminal(&mut conn, "dead-8", "dead", "8 days").await;

@@ -169,7 +169,7 @@ impl Default for Retention {
     fn default() -> Self {
         const DAY: u64 = 86_400;
         Self {
-            done: Duration::from_secs(7 * DAY),
+            done: Duration::from_secs(30 * DAY),
             dead: Duration::from_secs(30 * DAY),
             idempotency_horizon: Duration::from_secs(7 * DAY),
             outbox_published: Duration::from_secs(7 * DAY),

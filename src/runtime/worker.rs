@@ -35,11 +35,16 @@ impl<P: SchedulerPool> Scheduler<P> {
             config,
             health_tx,
         } = self;
+        let health = StoppedOnDrop(health_tx);
         let config = Arc::new(config);
         let names = registry.names();
         let semaphore = Arc::new(Semaphore::new(config.max_concurrency.get()));
         let mut in_flight = JoinSet::new();
-        let mut listener = Listener::<P>(None);
+        let runtime = tokio::runtime::Handle::current();
+        let mut listener = Listener::<P> {
+            conn: None,
+            runtime: runtime.clone(),
+        };
         let mut failures = 0u64;
         // A child token: cancelled together with `cancel`, or by the guard if this future is
         // dropped (aborted, or a failed `try_join!` sibling) so maintenance never outlives it.
@@ -53,12 +58,14 @@ impl<P: SchedulerPool> Scheduler<P> {
             // At most once per `max_poll_interval`; the wait below wakes for it, so a due
             // schedule is materialized within `max_poll_interval`.
             #[cfg(feature = "cron")]
-            if Instant::now() >= next_materialize {
+            let materialized_now = Instant::now() >= next_materialize;
+            #[cfg(feature = "cron")]
+            if materialized_now {
                 next_materialize = Instant::now() + config.max_poll_interval;
                 materialized = materialize(&pool).await;
             }
-            if listener.0.is_none() {
-                listener.0 = listen(&pool).await;
+            if listener.conn.is_none() {
+                listener.conn = listen(&pool).await;
             }
             let want = semaphore
                 .available_permits()
@@ -76,12 +83,16 @@ impl<P: SchedulerPool> Scheduler<P> {
                         want,
                     )
                     .await;
-                    // The last materialization's failure degrades health but never stops claiming.
+                    // The last materialization's failure keeps health degraded but never stops
+                    // claiming; it counts as one failure per failed run, not per claim cycle.
                     #[cfg(feature = "cron")]
-                    let failed = cycle.as_ref().err().or(materialized.as_ref().err());
+                    let (failed, fresh) = (
+                        cycle.as_ref().err().or(materialized.as_ref().err()),
+                        cycle.is_err() || (materialized_now && materialized.is_err()),
+                    );
                     #[cfg(not(feature = "cron"))]
-                    let failed = cycle.as_ref().err();
-                    report(&health_tx, &mut failures, failed);
+                    let (failed, fresh) = (cycle.as_ref().err(), true);
+                    report(&health.0, &mut failures, failed, fresh);
                     match cycle {
                         Ok(Some(wait)) => wait,
                         Ok(None) => continue, // full batch: more work is likely due
@@ -98,9 +109,12 @@ impl<P: SchedulerPool> Scheduler<P> {
                 biased;
                 () = cancel.cancelled() => break,
                 Some(joined) = in_flight.join_next() => log_join(joined),
-                listening = notified(&mut listener.0) => if !listening {
+                listening = notified(&mut listener.conn) => if !listening {
                     tracing::warn!("LISTEN connection failed; re-listening");
-                    listener = Listener(None);
+                    listener = Listener {
+                        conn: None,
+                        runtime: runtime.clone(),
+                    };
                 },
                 () = tokio::time::sleep(wait) => {}
             }
@@ -109,7 +123,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         if let Err(error) = maintenance.await {
             tracing::error!(%error, "maintenance task panicked");
         }
-        if let Some(conn) = listener.0.take() {
+        if let Some(conn) = listener.conn.take() {
             unlisten(conn).await;
         }
         let drain = async {
@@ -124,8 +138,7 @@ impl<P: SchedulerPool> Scheduler<P> {
             tracing::warn!("shutdown timeout: aborting running handlers");
         }
         in_flight.shutdown().await;
-        health_tx.send_modify(|h| h.status = HealthStatus::Stopped);
-        Ok(())
+        Ok(()) // `health` reports Stopped as it drops
     }
 }
 
@@ -179,15 +192,27 @@ async fn listen<P: SchedulerPool>(pool: &P) -> Option<P::Conn> {
 /// dropped, or the connection failed), it runs `UNLISTEN *` on a spawned task before the
 /// connection returns to the pool: a pooled connection left listening buffers every
 /// `queue_available` notification in the database, unbounded, for as long as it lives.
-struct Listener<P: SchedulerPool>(Option<P::Conn>);
+/// The runtime handle is captured at start, so this also works when the run future is
+/// dropped from a thread outside the runtime.
+struct Listener<P: SchedulerPool> {
+    conn: Option<P::Conn>,
+    runtime: tokio::runtime::Handle,
+}
 
 impl<P: SchedulerPool> Drop for Listener<P> {
     fn drop(&mut self) {
-        if let Some(conn) = self.0.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            runtime.spawn(unlisten(conn));
+        if let Some(conn) = self.conn.take() {
+            self.runtime.spawn(unlisten(conn));
         }
+    }
+}
+
+/// Reports `Stopped` when the run future ends, whether it returned or was dropped.
+struct StoppedOnDrop(watch::Sender<WorkerHealth>);
+
+impl Drop for StoppedOnDrop {
+    fn drop(&mut self) {
+        self.0.send_modify(|h| h.status = HealthStatus::Stopped);
     }
 }
 
@@ -268,14 +293,18 @@ async fn claim_cycle<P: SchedulerPool>(
     Ok(Some(next.unwrap_or(max).max(MIN_WAIT).min(max)))
 }
 
+/// Publish health. `fresh` is whether `error` happened in this cycle; a standing error
+/// carried over from an earlier cycle (a failed materialization) does not count again.
 fn report(
     health: &watch::Sender<WorkerHealth>,
     failures: &mut u64,
     error: Option<&SchedulerError>,
+    fresh: bool,
 ) {
-    *failures = match error {
-        Some(_) => failures.saturating_add(1),
-        None => 0,
+    *failures = match (error, fresh) {
+        (None, _) => 0,
+        (Some(_), true) => failures.saturating_add(1),
+        (Some(_), false) => *failures,
     };
     let next = WorkerHealth {
         status: match error {

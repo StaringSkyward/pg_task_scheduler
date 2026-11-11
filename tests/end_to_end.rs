@@ -157,6 +157,8 @@ async fn materialize_failure_degrades_health_without_slowing_claims() {
     }
     let h = health.borrow().clone();
     assert_eq!(h.status, HealthStatus::Degraded);
+    // One failed materialization is one failure, however many claim cycles follow it.
+    assert_eq!(h.consecutive_failures, 1, "{h:?}");
     assert!(
         h.last_error
             .as_deref()
