@@ -38,12 +38,12 @@ done | dead  ⇔ completed_at is set
 `lock_token` is never cleared. It increments on every claim and on every replay,
 so it identifies one ownership generation.
 
-Indexes follow §4.2:
+Indexes follow §4.2, with `queue` as the leading column of the claim and due indexes:
 
 | Index | Serves |
 | --- | --- |
 | `queue_tasks_claim_idx (queue, priority DESC, due_at, id) WHERE queued` | claim |
-| `queue_tasks_due_idx (queue, due_at, id) WHERE queued` | next-due wakeup, due counts |
+| `queue_tasks_due_idx (queue, due_at, id) WHERE queued` | next-due wakeup (the global due counts in `queue_stats` are a full scan) |
 | `queue_tasks_expired_lease_idx (locked_until, id) WHERE running` | reaper |
 | `queue_tasks_terminal_cleanup_idx (completed_at, id) WHERE done/dead` | retention |
 
@@ -79,7 +79,7 @@ cursor. It is not part of the queue protocol.
 | --- | --- | --- |
 | attempts PK `(task_id, attempt_no)` | PK `(task_id, lock_token)` plus an index on `(task_id, attempt_no)` | §18 replay resets `attempts`, so the next claim would reuse `attempt_no = 1` and violate the PK. `lock_token` never repeats. |
 | claim selects any due task | adds `task_name = ANY($registered)` | a worker claims only names it can execute |
-| §4.1 has no queue | `queue` column; claims filter one queue; per-queue worker limits | §16 "separate logical queues/worker pools" against starvation |
+| §4.1 has no queue | `queue` column; claims filter one queue; per-queue worker limits; claim and due indexes lead with `queue` | §16 "separate logical queues/worker pools" against starvation |
 | replay "SHOULD be audited" | `queue_task_replays` table | durable audit with operator and reason |
 | enqueue always notifies | notifies only when a row was inserted | a duplicate adds no work |
 | no cancel transition | none provided | §5 defines no cancel transition |
@@ -236,7 +236,7 @@ set per task at enqueue (default 3).
   a cleanup backlog never delays lease recovery.
 - `store::queue_stats` scans retained rows for its status counts. Poll it at a
   modest interval.
-- The claim index is the spec's default. Benchmark it against realistic
+- The claim index is the spec's default with `queue` as its leading column. Benchmark it against realistic
   scheduled-task and priority distributions before tuning (§4.2).
 
 ## Testing Contract (§27)

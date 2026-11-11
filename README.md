@@ -186,6 +186,27 @@ more. A task whose release fails (for example, the database is unreachable)
 stays `running` until the reaper recovers it after the lease, and that attempt
 counts.
 
+Releases do not count attempts and have no limit, so `max_attempts` does not
+bound a task that hangs (for example, stuck on a remote call with no timeout):
+it is released and reclaimed at every deploy and never reaches `dead`. Put
+timeouts on a handler's own awaits.
+
+```rust,no_run
+use std::time::Duration;
+use pg_task_scheduler::TaskError;
+# use pg_task_scheduler::TaskContext;
+# async fn work(_args: &serde_json::Value) -> Result<(), TaskError> { Ok(()) }
+# async fn handler(ctx: TaskContext, args: serde_json::Value) -> Result<(), TaskError> {
+tokio::select! {
+    _ = ctx.cancellation.cancelled() => Err(TaskError::interrupted()),
+    done = tokio::time::timeout(Duration::from_secs(300), work(&args)) => match done {
+        Ok(result) => result,
+        Err(_elapsed) => Err(TaskError::retry("work timed out")),
+    },
+}
+# }
+```
+
 Set the orchestrator's grace period (for example Kubernetes
 `terminationGracePeriodSeconds`) above `shutdown_timeout + 5 s`. A released task
 starts again from the beginning, so make long tasks resumable: keep their
@@ -300,11 +321,12 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
 
 | Signal | Meaning | Action |
 | --- | --- | --- |
-| `QueueDepth.oldest_due_age` above the queue's latency target | under capacity, or no worker serves the queue | check a worker serves it, then add capacity |
+| `QueueDepth.oldest_due_age` above the queue's latency target | under capacity, or no worker serves the queue | check a worker serves it and registers a handler for the task name, then add capacity |
 | `due` growing steadily | arrivals exceed capacity | add instances or raise the limit |
 | p95 of `claim_latency_seconds{queue}` | the worker-side view of the same thing | same as above |
 | `tasks_dead_total`, `leases_lost_total`, `leases_expired_total` | handler bugs, or a lease too short for the work | fix the handler or raise `lease_duration` |
 | `tasks_released_total` | rises at deploys, which is expected | outside deploys, look for restart loops |
+| one task name released at every deploy, with `running` above zero between deploys | probably hung: releases never count attempts | add a timeout in the handler |
 
 ### Deploys and shutdown
 
@@ -313,6 +335,9 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
   that process serves.
 - Long handlers should watch `ctx.cancellation`, save progress keyed by
   `task_key`, and return `TaskError::interrupted()`.
+- Releases do not count attempts and have no limit, so `max_attempts` does not
+  bound a task that hangs. Handlers must put timeouts on their own awaits (for
+  example `tokio::time::timeout`).
 - **Returning `Ok(())` after cancellation marks the task done.** Do not swallow
   cancellation.
 - A task that has not stopped by the deadline is dropped mid-await. Anything it

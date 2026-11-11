@@ -99,7 +99,10 @@ ownership, and host clocks never decide validity.
 keeper gives up, or when the dispatch ends. A handler that stops early because
 shutdown began should return `TaskError::interrupted()`; its task is then
 released without counting the attempt. Shutdown drops handlers still running at
-`shutdown_timeout` and releases their tasks the same way.
+`shutdown_timeout` and releases their tasks the same way. A release does not
+count the attempt and has no limit, so `max_attempts` does not bound a handler
+that hangs: it is released at every deploy and never reaches `dead`. Handlers
+must put timeouts on their own awaits.
 
 Cancellation is cooperative. Async code stops when its future is dropped or when
 it observes the token. Blocking code, independently spawned work, and remote

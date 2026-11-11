@@ -182,7 +182,7 @@ impl Default for Retention {
     }
 }
 
-/// Queued tasks of one name and priority.
+/// Queued tasks of one queue, name and priority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueDepth {
     pub queue: QueueName,
