@@ -271,6 +271,48 @@ async fn replay_route_requeues_dead_task_and_409s_otherwise() {
     db.cleanup().await;
 }
 
+/// Like the forms, the JSON replay requires a reason: blank is 400 and changes nothing; the
+/// audit records it trimmed.
+#[tokio::test]
+async fn replay_route_requires_reason() {
+    let db = TestDb::new().await;
+    let id = enqueue_one(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query(format!(
+            "UPDATE queue_tasks SET status = 'dead', attempts = max_attempts, \
+             last_error = 'boom', completed_at = now() WHERE id = {}",
+            id.0
+        )),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let uri = format!("/api/tasks/{}/replay", id.0);
+    for reason in ["", "   "] {
+        let req = serde_json::json!({ "reason": reason });
+        let (status, body) = send(app(&db), Method::POST, uri.clone(), Some(req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reason:?}");
+        assert_eq!(body, b"a reason is required");
+    }
+    let t = pg_task_scheduler::store::task(&mut conn, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.status, pg_task_scheduler::TaskStatus::Dead);
+    let req = serde_json::json!({ "reason": "  fixed  " });
+    let (status, _) = send(app(&db), Method::POST, uri, Some(req)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let reasons = db
+        .scalar(
+            "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' \
+             AND reason = 'fixed'",
+        )
+        .await;
+    assert_eq!(reasons, 1);
+    db.cleanup().await;
+}
+
 #[derive(diesel::QueryableByName)]
 struct Setting {
     #[diesel(sql_type = diesel::sql_types::Text)]

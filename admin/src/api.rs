@@ -170,8 +170,13 @@ async fn replay_task<P: SchedulerPool>(
     Path(id): Path<i64>,
     Json(req): Json<ReplayRequest>,
 ) -> Result<StatusCode, ApiError> {
+    // Trimmed and required, like the forms.
+    let reason = match req.reason.trim() {
+        "" => return Err((StatusCode::BAD_REQUEST, "a reason is required".to_owned())),
+        r => r,
+    };
     let mut c = acquire(&s.pool).await?;
-    if queue::replay(&mut c, TaskId(id), &operator, &req.reason)
+    if queue::replay(&mut c, TaskId(id), &operator, reason)
         .await
         .map_err(error)?
     {
