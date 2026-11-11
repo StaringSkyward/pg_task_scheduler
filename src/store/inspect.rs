@@ -4,7 +4,7 @@ use diesel::sql_types;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::error::SchedulerError;
-use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
+use crate::ids::{LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
 use crate::models::{Attempt, QueueDepth, QueueStats, TaskView, interval_to_duration};
 
 #[derive(diesel::QueryableByName)]
@@ -15,6 +15,8 @@ struct TaskRow {
     task_key: TaskKey,
     #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
+    #[diesel(sql_type = sql_types::Text)]
+    queue: QueueName,
     #[diesel(sql_type = sql_types::Jsonb)]
     payload: serde_json::Value,
     #[diesel(sql_type = sql_types::Text)]
@@ -67,7 +69,7 @@ pub async fn task(
     id: TaskId,
 ) -> Result<Option<TaskView>, SchedulerError> {
     let row = diesel::sql_query(
-        "SELECT id, task_key, task_name, payload, status, priority, due_at, attempts, \
+        "SELECT id, task_key, task_name, queue, payload, status, priority, due_at, attempts, \
          max_attempts, locked_by, lock_token, locked_until, last_error, created_at, \
          updated_at, completed_at FROM queue_tasks WHERE id = $1",
     )
@@ -80,6 +82,7 @@ pub async fn task(
             id: r.id,
             task_key: r.task_key,
             task_name: r.task_name,
+            queue: r.queue,
             payload: r.payload,
             status: r
                 .status
@@ -151,11 +154,17 @@ struct CountsRow {
 #[derive(diesel::QueryableByName)]
 struct DepthRow {
     #[diesel(sql_type = sql_types::Text)]
+    queue: QueueName,
+    #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Integer)]
     priority: i32,
     #[diesel(sql_type = sql_types::BigInt)]
     queued: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    due: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
+    oldest_due_age: Option<PgInterval>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -182,8 +191,11 @@ pub async fn queue_stats(conn: &mut AsyncPgConnection) -> Result<QueueStats, Sch
     .get_result::<CountsRow>(conn)
     .await?;
     let depth = diesel::sql_query(
-        "SELECT task_name, priority, count(*) AS queued FROM queue_tasks \
-         WHERE status = 'queued' GROUP BY task_name, priority ORDER BY task_name, priority DESC",
+        "SELECT queue, task_name, priority, count(*) AS queued, \
+                count(*) FILTER (WHERE due_at <= now()) AS due, \
+                now() - min(due_at) FILTER (WHERE due_at <= now()) AS oldest_due_age \
+         FROM queue_tasks WHERE status = 'queued' \
+         GROUP BY queue, task_name, priority ORDER BY queue, task_name, priority DESC",
     )
     .get_results::<DepthRow>(conn)
     .await?;
@@ -203,9 +215,12 @@ pub async fn queue_stats(conn: &mut AsyncPgConnection) -> Result<QueueStats, Sch
         depth: depth
             .into_iter()
             .map(|r| QueueDepth {
+                queue: r.queue,
                 task_name: r.task_name,
                 priority: r.priority,
                 queued: r.queued,
+                due: r.due,
+                oldest_due_age: r.oldest_due_age.map(interval_to_duration),
             })
             .collect(),
         outbox_unpublished: o.unpublished,

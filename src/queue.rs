@@ -6,7 +6,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::de::DeserializeOwned;
 
 use crate::error::SchedulerError;
-use crate::ids::{TaskId, TaskKey, TaskName};
+use crate::ids::{QueueName, TaskId, TaskKey, TaskName};
 use crate::models::{MaxAttempts, TaskStatus};
 
 /// Connects a stable queue name to its serialized argument type. The same type is
@@ -14,6 +14,9 @@ use crate::models::{MaxAttempts, TaskStatus};
 /// normal Rust use.
 pub trait Task: Send + Sync + 'static {
     const NAME: &'static str;
+    /// Queue this task type is enqueued to unless [`EnqueueOptions::queue`] overrides it.
+    /// Workers serve it only if they run that queue.
+    const QUEUE: &'static str = "default";
     type Args: serde::Serialize + DeserializeOwned + Send + 'static;
 }
 
@@ -38,6 +41,7 @@ pub struct EnqueueOptions {
     due_at: Option<DateTime<Utc>>,
     priority: Priority,
     max_attempts: MaxAttempts,
+    queue: Option<QueueName>,
 }
 
 impl Default for EnqueueOptions {
@@ -46,6 +50,7 @@ impl Default for EnqueueOptions {
             due_at: None,
             priority: Priority::NORMAL,
             max_attempts: MaxAttempts::default_value(),
+            queue: None,
         }
     }
 }
@@ -69,6 +74,12 @@ impl EnqueueOptions {
 
     pub fn max_attempts(mut self, max_attempts: MaxAttempts) -> Self {
         self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Enqueue to `queue` instead of `Task::QUEUE`.
+    pub fn queue(mut self, queue: QueueName) -> Self {
+        self.queue = Some(queue);
         self
     }
 }
@@ -120,8 +131,8 @@ impl EnqueuedRow {
 }
 
 const INSERT: &str = r#"
-    INSERT INTO queue_tasks (task_key, task_name, payload, priority, due_at, max_attempts)
-    VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6)
+    INSERT INTO queue_tasks (task_key, task_name, payload, priority, due_at, max_attempts, queue)
+    VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6, $7)
     ON CONFLICT (task_key) DO NOTHING
     RETURNING id, status, due_at
 "#;
@@ -136,7 +147,8 @@ const EXISTING: &str = r#"
 /// Enqueue a task on the caller's connection. If that connection is in a
 /// transaction, the task (and its notification) commit or roll back with the
 /// caller's data. Re-enqueueing the same `key` with the same task name and payload
-/// returns the existing task; different content is an `IdempotencyConflict`.
+/// returns the existing task; different content is an `IdempotencyConflict`. The queue
+/// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
 pub async fn enqueue<T: Task>(
     conn: &mut AsyncPgConnection,
     key: TaskKey,
@@ -144,6 +156,10 @@ pub async fn enqueue<T: Task>(
     options: EnqueueOptions,
 ) -> Result<Enqueued, SchedulerError> {
     let name = TaskName::try_from(T::NAME)?;
+    let queue = match options.queue {
+        Some(q) => q,
+        None => QueueName::try_from(T::QUEUE)?,
+    };
     let payload = serde_json::to_value(args)?;
 
     let inserted = diesel::sql_query(INSERT)
@@ -153,6 +169,7 @@ pub async fn enqueue<T: Task>(
         .bind::<sql_types::Integer, _>(options.priority.get())
         .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(options.due_at)
         .bind::<sql_types::Integer, _>(options.max_attempts.to_i32())
+        .bind::<sql_types::Text, _>(&queue)
         .get_results::<EnqueuedRow>(conn)
         .await?
         .pop();

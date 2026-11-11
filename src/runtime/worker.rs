@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::error::{SchedulerError, TaskError};
+use crate::ids::QueueName;
 use crate::models::{ClaimedTask, RetryOutcome, TaskLease};
 use crate::pool::SchedulerPool;
 use crate::runtime::builder::{Config, Scheduler};
@@ -278,6 +279,7 @@ async fn claim_cycle<P: SchedulerPool>(
         store::claim(
             &mut conn,
             &config.worker_id,
+            &QueueName::default(),
             names,
             want,
             config.lease_duration,
@@ -313,7 +315,7 @@ async fn claim_cycle<P: SchedulerPool>(
     if full {
         return Ok(None);
     }
-    let next = store::next_due_in(&mut conn, names).await?;
+    let next = store::next_due_in(&mut conn, &[QueueName::default()], names).await?;
     let max = config.max_poll_interval;
     Ok(Some(next.unwrap_or(max).max(MIN_WAIT).min(max)))
 }

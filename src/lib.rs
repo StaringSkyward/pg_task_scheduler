@@ -17,7 +17,7 @@ mod schema;
 pub mod store;
 
 pub use crate::error::{DuplicateTaskName, RegisterError, SchedulerError, TaskError};
-pub use crate::ids::{IdentifierError, LockToken, TaskId, TaskKey, TaskName, WorkerId};
+pub use crate::ids::{IdentifierError, LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
 pub use crate::models::{
     Attempt, AttemptOutcome, ClaimedTask, CleanupSummary, MaxAttempts, MaxAttemptsError,
     OutboxCommand, ParseEnumError, QueueDepth, QueueStats, ReapSummary, Retention, RetryOutcome,

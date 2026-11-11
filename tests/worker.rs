@@ -420,6 +420,7 @@ async fn claim_elsewhere(db: &TestDb, name: &str) -> TaskId {
     store::claim(
         &mut conn,
         &WorkerId::generate(),
+        &pg_task_scheduler::QueueName::default(),
         &[name.to_owned()],
         NonZeroUsize::MIN,
         Duration::from_secs(60),

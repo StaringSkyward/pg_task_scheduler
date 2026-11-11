@@ -6,7 +6,7 @@ use diesel::sql_types;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::error::SchedulerError;
-use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
+use crate::ids::{LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
 use crate::models::{ClaimedTask, TaskLease, interval_to_duration, pg_interval};
 
 #[derive(diesel::QueryableByName)]
@@ -17,6 +17,8 @@ struct ClaimedRow {
     task_key: TaskKey,
     #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
+    #[diesel(sql_type = sql_types::Text)]
+    queue: QueueName,
     #[diesel(sql_type = sql_types::Jsonb)]
     payload: serde_json::Value,
     #[diesel(sql_type = sql_types::Integer)]
@@ -38,7 +40,7 @@ const CLAIM: &str = r#"
     WITH candidate AS (
         SELECT id FROM queue_tasks
         WHERE status = 'queued' AND due_at <= now() AND attempts < max_attempts
-          AND task_name = ANY($1)
+          AND queue = $5 AND task_name = ANY($1)
         ORDER BY priority DESC, due_at ASC, id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
@@ -48,7 +50,7 @@ const CLAIM: &str = r#"
             lock_token = q.lock_token + 1,
             locked_until = clock_timestamp() + $4::interval, updated_at = now()
         FROM candidate AS c WHERE q.id = c.id
-        RETURNING q.id, q.task_key, q.task_name, q.payload, q.attempts, q.max_attempts,
+        RETURNING q.id, q.task_key, q.task_name, q.queue, q.payload, q.attempts, q.max_attempts,
                   q.lock_token, q.locked_until, q.due_at
     ), recorded AS (
         INSERT INTO queue_task_attempts (task_id, attempt_no, lock_token, worker_id)
@@ -60,11 +62,12 @@ const CLAIM: &str = r#"
     ORDER BY id
 "#;
 
-/// Atomically claim up to `limit` due tasks whose name is in `task_names`,
+/// Atomically claim up to `limit` due tasks of `queue` whose name is in `task_names`,
 /// leasing each for `lease` of PostgreSQL time.
 pub async fn claim(
     conn: &mut AsyncPgConnection,
     worker: &WorkerId,
+    queue: &QueueName,
     task_names: &[String],
     limit: NonZeroUsize,
     lease: Duration,
@@ -75,6 +78,7 @@ pub async fn claim(
         .bind::<sql_types::BigInt, _>(limit)
         .bind::<sql_types::Text, _>(worker)
         .bind::<sql_types::Interval, _>(pg_interval(lease))
+        .bind::<sql_types::Text, _>(queue)
         .get_results::<ClaimedRow>(conn)
         .await?;
     Ok(rows
@@ -88,6 +92,7 @@ pub async fn claim(
             },
             task_key: r.task_key,
             task_name: r.task_name,
+            queue: r.queue,
             payload: r.payload,
             max_attempts: r.max_attempts,
             due_at: r.due_at,
@@ -103,17 +108,27 @@ struct WaitRow {
     wait: Option<diesel::pg::data_types::PgInterval>,
 }
 
-// Bare `min(due_at)` lets PostgreSQL use queue_tasks_due_idx (an expression inside min() would scan
-// every queued row). NULL on no rows is preserved; `interval_to_duration` clamps overdue to zero.
-/// Time until the earliest queued task for `task_names` is due (zero if one
-/// already is), or `None` if there is none.
+// Bare `min(due_at)` per queue lets PostgreSQL use queue_tasks_due_idx (an expression inside min()
+// would scan every queued row, and `queue = ANY(..)` would scan every row of those queues). NULL on
+// no rows is preserved; `interval_to_duration` clamps overdue to zero.
+/// Time until the earliest queued task in `queues` for `task_names` is due (zero if
+/// one already is), or `None` if there is none.
 pub async fn next_due_in(
     conn: &mut AsyncPgConnection,
+    queues: &[QueueName],
     task_names: &[String],
 ) -> Result<Option<Duration>, SchedulerError> {
     let row = diesel::sql_query(
-        "SELECT min(due_at) - now() AS wait FROM queue_tasks \
-         WHERE status = 'queued' AND attempts < max_attempts AND task_name = ANY($1)",
+        "SELECT min(next.due_at) - now() AS wait \
+         FROM unnest($1::text[]) AS q(queue) \
+         CROSS JOIN LATERAL ( \
+             SELECT min(due_at) AS due_at FROM queue_tasks \
+             WHERE status = 'queued' AND queue = q.queue \
+               AND attempts < max_attempts AND task_name = ANY($2) \
+         ) AS next",
+    )
+    .bind::<sql_types::Array<sql_types::Text>, _>(
+        queues.iter().map(QueueName::as_str).collect::<Vec<_>>(),
     )
     .bind::<sql_types::Array<sql_types::Text>, _>(task_names)
     .get_result::<WaitRow>(conn)

@@ -22,7 +22,8 @@ Producers are:
 ### `queue_tasks` (§4.1)
 
 There is one row per logical task. It holds the identity (`id`, `task_key`), the
-immutable content (`task_name`, `payload`), the scheduling fields (`priority`,
+immutable content (`task_name`, `payload`), the logical `queue` (default
+`'default'`; workers run each queue with its own concurrency), the scheduling fields (`priority`,
 `due_at`), the attempt budget (`attempts`, `max_attempts`), the ownership fields
 (`locked_by`, `lock_token`, `locked_until`), `last_error`, and timestamps.
 
@@ -41,8 +42,8 @@ Indexes follow §4.2:
 
 | Index | Serves |
 | --- | --- |
-| `queue_tasks_claim_idx (priority DESC, due_at, id) WHERE queued` | claim |
-| `queue_tasks_due_idx (due_at, id) WHERE queued` | next-due wakeup, due counts |
+| `queue_tasks_claim_idx (queue, priority DESC, due_at, id) WHERE queued` | claim |
+| `queue_tasks_due_idx (queue, due_at, id) WHERE queued` | next-due wakeup, due counts |
 | `queue_tasks_expired_lease_idx (locked_until, id) WHERE running` | reaper |
 | `queue_tasks_terminal_cleanup_idx (completed_at, id) WHERE done/dead` | retention |
 
@@ -108,8 +109,8 @@ transaction (nested transactions become savepoints).
 
 | Operation | Function | Spec | Notes |
 | --- | --- | --- | --- |
-| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | §6 | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison (JSONB equality ignores key order). A mismatch returns `SchedulerError::IdempotencyConflict`. |
-| Claim | `store::claim(conn, worker, names, limit, lease)` | §7.3–7.4 | One writable CTE: `SKIP LOCKED` candidates → `running`, `attempts + 1`, `lock_token + 1`, `locked_until = clock_timestamp() + lease` → attempt rows inserted → typed claims returned. |
+| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | §6 | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison (JSONB equality ignores key order). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. |
+| Claim | `store::claim(conn, worker, queue, names, limit, lease)` | §7.3–7.4 | One writable CTE: `SKIP LOCKED` candidates → `running`, `attempts + 1`, `lock_token + 1`, `locked_until = clock_timestamp() + lease` → attempt rows inserted → typed claims returned. |
 | Heartbeat | `store::heartbeat(conn, lease, duration)` | §9 | Extends `locked_until` from `clock_timestamp()`. |
 | Lock for DB work | `store::lock_owned(conn, lease)` | §10.2 | `SELECT … FOR UPDATE` with the ownership predicate. |
 | Complete | `store::complete(conn, lease)` | §10.1 | Task → `done`, attempt → `done`. |

@@ -26,7 +26,7 @@ impl From<std::convert::Infallible> for IdentifierError {
     }
 }
 
-/// The crate-owned identifier policy for [`TaskName`], [`TaskKey`] and [`WorkerId`].
+/// The crate-owned identifier policy for [`TaskName`], [`TaskKey`], [`QueueName`] and [`WorkerId`].
 ///
 /// Non-empty, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
 /// The queue tables carry no SQL CHECKs for this: only validated identifiers are
@@ -108,6 +108,17 @@ validated_string!(
     WorkerId
 );
 
+validated_string!(
+    /// Logical queue of a task (`queue_tasks.queue`).
+    QueueName
+);
+
+impl Default for QueueName {
+    fn default() -> Self {
+        Self("default".to_owned())
+    }
+}
+
 impl WorkerId {
     /// A fresh random identity (UUID v4 string).
     pub fn generate() -> Self {
@@ -117,8 +128,14 @@ impl WorkerId {
 
 #[cfg(test)]
 mod identifier_tests {
-    use super::{IdentifierError, TaskKey, TaskName, WorkerId};
+    use super::{IdentifierError, QueueName, TaskKey, TaskName, WorkerId};
     use std::str::FromStr;
+
+    #[test]
+    fn queue_name_defaults_to_default_and_rejects_empty() {
+        assert_eq!(QueueName::default().as_str(), "default");
+        assert_eq!(QueueName::try_from(""), Err(IdentifierError::Empty));
+    }
 
     #[test]
     fn empty_is_rejected() {

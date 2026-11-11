@@ -162,6 +162,7 @@ async fn task_route_returns_view_and_404() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["id"], id.0);
     assert_eq!(v["task_name"], "admin-task");
+    assert_eq!(v["queue"], "default");
     assert_eq!(v["status"], "queued");
     assert_eq!(v["attempts"], 0);
     assert!(v["locked_by"].is_null() && v["last_error"].is_null() && v["completed_at"].is_null());

@@ -72,7 +72,10 @@ if !task.inserted {
 ```
 
 `EnqueueOptions::at(timestamp)` schedules the task for later. `.priority(..)`
-(higher runs first) and `.max_attempts(..)` (default 3) tune it. When the
+(higher runs first) and `.max_attempts(..)` (default 3) tune it. A task goes to
+`Task::QUEUE` (default `"default"`) unless `.queue(QueueName)` overrides it. The
+queue is not part of idempotency equality: re-enqueueing a key with another queue
+returns the existing task. When the
 connection is inside a transaction, the task and its `queue_available`
 notification commit with the caller's data. Run producers at `READ COMMITTED`.
 
@@ -214,7 +217,7 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
   `lock_token`. Each replay is recorded in `queue_task_replays`. Enqueue a new
   `task_key` instead if you want a new external effect.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
-  (counts by status, due count, oldest due age, depth by name and priority, and
+  (counts by status, due count, oldest due age, depth by queue, name and priority with due count and oldest due age, and
   outbox backlog).
 - **Health:** `Scheduler::health()` reports starting, healthy, degraded, or
   stopped. Claim errors (and, with `cron`, materialize errors) set degraded;

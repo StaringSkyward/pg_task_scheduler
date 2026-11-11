@@ -5,7 +5,7 @@ use diesel::pg::data_types::PgInterval;
 
 use chrono::{DateTime, Utc};
 
-use crate::ids::{LockToken, TaskId, TaskKey, TaskName, WorkerId};
+use crate::ids::{LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
 #[cfg(feature = "cron")]
 use {
     crate::cron::CronExpression, crate::error::SchedulerError, crate::ids::JobId,
@@ -71,6 +71,7 @@ text_enum!(AttemptOutcome, "attempt outcome", {
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
     pub lease: TaskLease,
+    pub queue: QueueName,
     pub task_key: TaskKey,
     pub task_name: TaskName,
     pub payload: serde_json::Value,
@@ -104,6 +105,7 @@ pub struct TaskView {
     pub id: TaskId,
     pub task_key: TaskKey,
     pub task_name: TaskName,
+    pub queue: QueueName,
     pub payload: serde_json::Value,
     pub status: TaskStatus,
     pub priority: i32,
@@ -183,9 +185,14 @@ impl Default for Retention {
 /// Queued tasks of one name and priority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueDepth {
+    pub queue: QueueName,
     pub task_name: TaskName,
     pub priority: i32,
     pub queued: i64,
+    /// Of `queued`, those whose `due_at` has passed.
+    pub due: i64,
+    /// Age of the oldest due task; `None` if none is due.
+    pub oldest_due_age: Option<Duration>,
 }
 
 /// Point-in-time queue health from `store::queue_stats`.

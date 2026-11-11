@@ -26,6 +26,7 @@ async fn claim_one(conn: &mut AsyncPgConnection) -> Option<ClaimedTask> {
     store::claim(
         conn,
         &WorkerId::generate(),
+        &pg_task_scheduler::QueueName::default(),
         &names(),
         NonZeroUsize::new(1).unwrap(),
         Duration::from_secs(60),
@@ -200,6 +201,7 @@ async fn stale_token_cannot_complete_after_reclaim() {
     let new = store::claim(
         &mut conn,
         &old.lease.worker_id,
+        &pg_task_scheduler::QueueName::default(),
         &names(),
         NonZeroUsize::new(1).unwrap(),
         Duration::from_secs(60),

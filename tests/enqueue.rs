@@ -6,7 +6,10 @@ use chrono::{SubsecRound, Utc};
 use common::TestDb;
 use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
 use futures::StreamExt;
-use pg_task_scheduler::{EnqueueOptions, SchedulerError, Task, TaskKey, TaskStatus, enqueue};
+use pg_task_scheduler::{
+    EnqueueOptions, IdentifierError, QueueName, SchedulerError, Task, TaskKey, TaskStatus, enqueue,
+    store,
+};
 use serde_json::json;
 
 struct Email;
@@ -18,6 +21,20 @@ impl Task for Email {
 struct Sms;
 impl Task for Sms {
     const NAME: &'static str = "sms";
+    type Args = serde_json::Value;
+}
+
+struct Bulk;
+impl Task for Bulk {
+    const NAME: &'static str = "bulk-email";
+    const QUEUE: &'static str = "bulk";
+    type Args = serde_json::Value;
+}
+
+struct BadQueue;
+impl Task for BadQueue {
+    const NAME: &'static str = "bad";
+    const QUEUE: &'static str = "";
     type Args = serde_json::Value;
 }
 
@@ -218,5 +235,67 @@ async fn enqueue_notifies_queue_available() {
         .unwrap();
     assert_eq!(n.channel, "queue_available");
     assert_eq!(n.payload, "");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn queue_comes_from_task_type_unless_overridden() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let a = enqueue::<Email>(&mut conn, key("a"), json!({}), EnqueueOptions::immediate())
+        .await
+        .unwrap();
+    let b = enqueue::<Bulk>(&mut conn, key("b"), json!({}), EnqueueOptions::immediate())
+        .await
+        .unwrap();
+    let c = enqueue::<Email>(
+        &mut conn,
+        key("c"),
+        json!({}),
+        EnqueueOptions::immediate().queue(QueueName::try_from("urgent").unwrap()),
+    )
+    .await
+    .unwrap();
+    for (e, want) in [(a, "default"), (b, "bulk"), (c, "urgent")] {
+        let t = store::task(&mut conn, e.id).await.unwrap().unwrap();
+        assert_eq!(t.queue.as_str(), want);
+    }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn same_key_in_another_queue_returns_the_existing_task() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let first = enqueue::<Email>(&mut conn, key("k"), json!({}), EnqueueOptions::immediate())
+        .await
+        .unwrap();
+    let second = enqueue::<Email>(
+        &mut conn,
+        key("k"),
+        json!({}),
+        EnqueueOptions::immediate().queue(QueueName::try_from("bulk").unwrap()),
+    )
+    .await
+    .unwrap();
+    assert!(!second.inserted);
+    assert_eq!(second.id, first.id);
+    let t = store::task(&mut conn, first.id).await.unwrap().unwrap();
+    assert_eq!(t.queue.as_str(), "default");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn invalid_task_queue_is_rejected() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let err = enqueue::<BadQueue>(&mut conn, key("k"), json!({}), EnqueueOptions::immediate())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SchedulerError::Identifier(IdentifierError::Empty)
+    ));
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
     db.cleanup().await;
 }

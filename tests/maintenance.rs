@@ -7,8 +7,8 @@ use common::TestDb;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use pg_task_scheduler::store;
 use pg_task_scheduler::{
-    AttemptOutcome, ClaimedTask, EnqueueOptions, LockToken, MaxAttempts, QueueDepth, ReapSummary,
-    Retention, SchedulerError, Task, TaskKey, TaskStatus, WorkerId, enqueue, replay,
+    AttemptOutcome, ClaimedTask, EnqueueOptions, LockToken, MaxAttempts, ReapSummary, Retention,
+    SchedulerError, Task, TaskKey, TaskStatus, WorkerId, enqueue, replay,
 };
 use serde_json::json;
 
@@ -41,6 +41,7 @@ async fn claim_lease(conn: &mut AsyncPgConnection, lease: Duration) -> Option<Cl
     store::claim(
         conn,
         &WorkerId::generate(),
+        &pg_task_scheduler::QueueName::default(),
         &["email".to_owned()],
         nz(1),
         lease,
@@ -399,14 +400,12 @@ async fn queue_stats_reports_counts_depth_and_outbox() {
         (s.queued, s.running, s.done, s.dead, s.due),
         (2, 1, 1, 1, 1)
     );
-    assert_eq!(
-        s.depth,
-        vec![QueueDepth {
-            task_name: "email".try_into().unwrap(),
-            priority: 0,
-            queued: 2
-        }]
-    );
+    assert_eq!(s.depth.len(), 1);
+    let d = &s.depth[0];
+    assert_eq!(d.queue, pg_task_scheduler::QueueName::default());
+    assert_eq!(d.task_name.as_str(), "email");
+    assert_eq!((d.priority, d.queued, d.due), (0, 2, 1));
+    assert!(d.oldest_due_age.is_some());
     assert_eq!(s.outbox_unpublished, 1);
     assert!(s.oldest_due_age.is_some());
     assert!(s.oldest_unpublished_age.is_some());

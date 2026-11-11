@@ -6,6 +6,9 @@ CREATE TABLE queue_tasks (
 
     -- Handler/type name and immutable input payload.
     task_name TEXT NOT NULL,
+
+    -- Logical queue; workers run each queue with its own concurrency.
+    queue TEXT NOT NULL DEFAULT 'default',
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     status TEXT NOT NULL DEFAULT 'queued'
@@ -60,11 +63,11 @@ CREATE TABLE queue_tasks (
 );
 
 CREATE INDEX queue_tasks_claim_idx
-    ON queue_tasks (priority DESC, due_at ASC, id ASC)
+    ON queue_tasks (queue, priority DESC, due_at ASC, id ASC)
     WHERE status = 'queued';
 
 CREATE INDEX queue_tasks_due_idx
-    ON queue_tasks (due_at ASC, id ASC)
+    ON queue_tasks (queue, due_at ASC, id ASC)
     WHERE status = 'queued';
 
 CREATE INDEX queue_tasks_expired_lease_idx
