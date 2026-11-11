@@ -86,6 +86,11 @@ impl<P: SchedulerPool> Scheduler<P> {
         let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
         while !cancel.is_cancelled() {
+            // The wait below collects at most one finished dispatch per wake, and a full batch
+            // skips it entirely; collect them all here so the set stays bounded by the permits.
+            while let Some(joined) = in_flight.try_join_next() {
+                log_join(joined);
+            }
             // At most once per `max_poll_interval`; the wait below wakes for it, so a due
             // schedule is materialized within `max_poll_interval`.
             #[cfg(feature = "cron")]
