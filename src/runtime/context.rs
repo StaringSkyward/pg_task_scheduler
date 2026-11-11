@@ -8,6 +8,7 @@ pub struct TaskContext {
     pub task_key: TaskKey,
     pub task_name: TaskName,
     pub max_attempts: i32,
+    /// Lease expiry as of claim; not updated by heartbeats.
     pub locked_until: DateTime<Utc>,
     /// Cancelled when heartbeat proves that this worker no longer owns the
     /// task, or when worker shutdown aborts the handler.

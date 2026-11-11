@@ -245,7 +245,7 @@ impl MaxAttempts {
         Self(NonZeroI32::new(3).unwrap())
     }
     /// Read boundary: parse the stored signed count. Rejects `<= 0`.
-    #[allow(dead_code)] // used by the store tasks that follow
+    #[cfg_attr(not(feature = "cron"), allow(dead_code))]
     pub(crate) fn from_db_i32(i: i32) -> Result<Self, MaxAttemptsError> {
         NonZeroI32::new(i)
             .filter(|n| n.get() > 0)
