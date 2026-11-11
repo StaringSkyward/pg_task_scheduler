@@ -284,6 +284,9 @@ async fn claim_cycle<P: SchedulerPool>(
     let mut conn = acquire(pool).await?;
     let mut full = false;
     for queue in queues {
+        if shutdown.begun.is_cancelled() {
+            return Ok(Some(config.max_poll_interval));
+        }
         let free = queue.permits.available_permits();
         let Some(want) = NonZeroUsize::new(free.min(config.claim_batch_size.get())) else {
             continue;
@@ -301,7 +304,7 @@ async fn claim_cycle<P: SchedulerPool>(
             ),
         )
         .await?;
-        full |= claimed.len() == want.get();
+        let full_batch = claimed.len() == want.get();
         for task in claimed {
             let name = task.task_name.as_str().to_owned();
             let queue_label = queue.name.as_str().to_owned();
@@ -328,6 +331,8 @@ async fn claim_cycle<P: SchedulerPool>(
                 shutdown.clone(),
             ));
         }
+        // A full batch only means "loop now" if this queue can still take more.
+        full |= full_batch && queue.permits.available_permits() > 0;
     }
     if full {
         return Ok(None);
