@@ -31,8 +31,8 @@ async fn overview_of_empty_install() {
     assert!(o.queues.is_empty() && o.workers.is_empty() && o.paused.is_empty());
     assert!(o.failure_groups.is_empty() && o.no_handler.is_empty() && o.recent_actions.is_empty());
     assert_eq!(
-        (o.done_covered, o.dead_covered, o.window),
-        (p.window, p.window, p.window)
+        (o.done_covered, o.dead_covered, o.attempts_covered, o.window),
+        (p.window, p.window, p.window, p.window)
     );
     db.cleanup().await;
 }
@@ -123,6 +123,45 @@ async fn overview_groups_failures() {
         ("send", "smtp refused")
     );
     assert_eq!((g.dead, g.failed_attempts), (c(1, false), c(2, false)));
+    db.cleanup().await;
+}
+
+/// The failed-attempt groups read the newest `count_cap` attempts that started in the window,
+/// failed or not. When that scan is full, each group's count is a lower bound and
+/// `attempts_covered` is the span the scan reached.
+#[tokio::test]
+async fn overview_caps_failed_attempts() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+           VALUES ('k1', 'send', 'done', now()); \
+         INSERT INTO queue_task_attempts \
+           (task_id, attempt_no, lock_token, worker_id, started_at, finished_at, outcome, error) \
+           SELECT (SELECT id FROM queue_tasks), g, g, 'w', now() - g * interval '1 minute', \
+                  now() - g * interval '1 minute', \
+                  CASE WHEN g = 1 THEN 'done' ELSE 'retry' END, \
+                  CASE WHEN g = 1 THEN NULL ELSE 'smtp refused' END \
+           FROM generate_series(1, 8) g",
+    )
+    .await;
+    let p = OverviewParams {
+        count_cap: 5,
+        ..Default::default()
+    };
+    let o = overview(&db, &p).await;
+    // The newest five attempts: one done, four retries.
+    assert_eq!(o.failure_groups.len(), 1);
+    assert_eq!(o.failure_groups[0].failed_attempts, c(4, true));
+    assert!(
+        o.attempts_covered < p.window && o.attempts_covered >= Duration::from_secs(300),
+        "{:?}",
+        o.attempts_covered
+    );
+    // Below the cap the count is exact and the whole window is covered.
+    let o = overview(&db, &OverviewParams::default()).await;
+    assert_eq!(o.failure_groups[0].failed_attempts, c(7, false));
+    assert_eq!(o.attempts_covered, o.window);
     db.cleanup().await;
 }
 

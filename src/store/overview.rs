@@ -82,6 +82,9 @@ pub struct Overview {
     /// cut the scan short.
     pub done_covered: Duration,
     pub dead_covered: Duration,
+    /// How far back the failure groups' failed-attempt counts reach: `window`, or less when
+    /// the newest `count_cap` attempts started within a shorter span.
+    pub attempts_covered: Duration,
     pub queues: Vec<QueueOverview>,
     pub workers: Vec<WorkerView>,
     pub paused: Vec<QueuePause>,
@@ -146,13 +149,24 @@ pub const DEAD_GROUPS: &str = "\
         WHERE status = 'dead' AND completed_at > now() - $1 \
         ORDER BY completed_at DESC, id DESC LIMIT $2) s GROUP BY 1, 2";
 
+// Binds: $1 window, $2 count_cap. The newest `count_cap` attempts started in the window,
+// failed or not, through queue_task_attempts_started_idx (no index on outcome or finished_at:
+// it would stop attempt closes from being HOT updates). The failed ones are grouped. Every
+// row carries the scan's size and oldest start, and one row with NULL groups comes back when
+// nothing failed, so the covered span is known either way.
 #[doc(hidden)]
 pub const OVERVIEW_FAILED_ATTEMPTS: &str = "\
-    SELECT t.task_name, coalesce(a.error, '') AS error, count(*) AS n FROM (\
-        SELECT task_id, error FROM queue_task_attempts \
-        WHERE outcome IN ('retry', 'lease_expired') AND finished_at > now() - $1 \
-        ORDER BY finished_at DESC LIMIT $2) a \
-    JOIN queue_tasks t ON t.id = a.task_id GROUP BY 1, 2";
+    WITH a AS (\
+        SELECT task_id, outcome, error, started_at FROM queue_task_attempts \
+        WHERE started_at >= now() - $1 ORDER BY started_at DESC LIMIT $2\
+    ), g AS (\
+        SELECT t.task_name, coalesce(a.error, '') AS error, count(*) AS n \
+        FROM a JOIN queue_tasks t ON t.id = a.task_id \
+        WHERE a.outcome IN ('retry', 'lease_expired') GROUP BY 1, 2\
+    ) \
+    SELECT g.task_name, g.error, g.n, s.scanned, s.oldest \
+    FROM (SELECT count(*) AS scanned, min(started_at) AS oldest FROM a) s \
+    LEFT JOIN g ON true";
 
 // Binds: $1 queue names, $2 probe size: the oldest due rows of each.
 #[doc(hidden)]
@@ -215,6 +229,20 @@ struct GroupRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct AttemptGroupRow {
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    task_name: Option<TaskName>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    error: Option<String>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::BigInt>)]
+    n: Option<i64>,
+    #[diesel(sql_type = sql_types::BigInt)]
+    scanned: i64,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
+    oldest: Option<DateTime<Utc>>,
+}
+
+#[derive(diesel::QueryableByName)]
 struct NameRow {
     #[diesel(sql_type = sql_types::Text)]
     queue: QueueName,
@@ -233,6 +261,19 @@ struct Window {
     covered: Duration,
 }
 
+/// The span a window scan reached: `window`, unless it was cut short by the cap.
+fn covered(
+    p: &OverviewParams,
+    now: DateTime<Utc>,
+    capped: bool,
+    oldest: Option<DateTime<Utc>>,
+) -> Duration {
+    match oldest {
+        Some(oldest) if capped => (now - oldest).to_std().unwrap_or_default().min(p.window),
+        _ => p.window,
+    }
+}
+
 async fn window_counts(
     conn: &mut AsyncPgConnection,
     sql: &str,
@@ -245,10 +286,7 @@ async fn window_counts(
         .get_results::<WindowRow>(conn)
         .await?;
     let capped = rows.iter().map(|r| r.n).sum::<i64>() >= p.count_cap;
-    let covered = match rows.iter().map(|r| r.oldest).min() {
-        Some(oldest) if capped => (now - oldest).to_std().unwrap_or_default().min(p.window),
-        _ => p.window,
-    };
+    let covered = covered(p, now, capped, rows.iter().map(|r| r.oldest).min());
     Ok(Window {
         per_queue: rows.into_iter().map(|r| (r.queue, r.n)).collect(),
         capped,
@@ -256,38 +294,62 @@ async fn window_counts(
     })
 }
 
-/// Dead tasks and failed attempts by `(task_name, error)`, worst first.
+/// Dead tasks and failed attempts by `(task_name, error)`, worst first, and the span the
+/// failed-attempt counts cover.
 async fn failure_groups(
     conn: &mut AsyncPgConnection,
     p: &OverviewParams,
-) -> Result<Vec<FailureGroup>, SchedulerError> {
+    now: DateTime<Utc>,
+) -> Result<(Vec<FailureGroup>, Duration), SchedulerError> {
+    let dead = diesel::sql_query(DEAD_GROUPS)
+        .bind::<sql_types::Interval, _>(pg_interval(p.window))
+        .bind::<sql_types::BigInt, _>(p.count_cap)
+        .get_results::<GroupRow>(conn)
+        .await?;
+    let dead_capped = dead.iter().map(|r| r.n).sum::<i64>() >= p.count_cap;
+    let attempts = diesel::sql_query(OVERVIEW_FAILED_ATTEMPTS)
+        .bind::<sql_types::Interval, _>(pg_interval(p.window))
+        .bind::<sql_types::BigInt, _>(p.count_cap)
+        .get_results::<AttemptGroupRow>(conn)
+        .await?;
+    // Every row repeats the scan's size and oldest start; there is always at least one.
+    let (scanned, oldest) = match attempts.as_slice() {
+        [r, ..] => (r.scanned, r.oldest),
+        [] => (0, None),
+    };
+    let attempts_capped = scanned >= p.count_cap;
+    let attempts_covered = covered(p, now, attempts_capped, oldest);
+    let attempts = attempts.into_iter().filter_map(|r| {
+        Some(GroupRow {
+            task_name: r.task_name?,
+            error: r.error?,
+            n: r.n?,
+        })
+    });
+
     let mut merged: HashMap<(TaskName, String), FailureGroup> = HashMap::new();
-    for (sql, dead) in [(DEAD_GROUPS, true), (OVERVIEW_FAILED_ATTEMPTS, false)] {
-        let rows = diesel::sql_query(sql)
-            .bind::<sql_types::Interval, _>(pg_interval(p.window))
-            .bind::<sql_types::BigInt, _>(p.count_cap)
-            .get_results::<GroupRow>(conn)
-            .await?;
-        let capped = rows.iter().map(|r| r.n).sum::<i64>() >= p.count_cap;
-        for r in rows {
-            let zero = Count {
-                value: 0,
-                capped: false,
-            };
-            let g = merged
-                .entry((r.task_name.clone(), r.error.clone()))
-                .or_insert(FailureGroup {
-                    task_name: r.task_name,
-                    error: r.error,
-                    dead: zero,
-                    failed_attempts: zero,
-                });
-            let count = Count { value: r.n, capped };
-            if dead {
-                g.dead = count;
-            } else {
-                g.failed_attempts = count;
-            }
+    let tagged = dead
+        .into_iter()
+        .map(|r| (r, true, dead_capped))
+        .chain(attempts.map(|r| (r, false, attempts_capped)));
+    for (r, dead, capped) in tagged {
+        let zero = Count {
+            value: 0,
+            capped: false,
+        };
+        let g = merged
+            .entry((r.task_name.clone(), r.error.clone()))
+            .or_insert(FailureGroup {
+                task_name: r.task_name,
+                error: r.error,
+                dead: zero,
+                failed_attempts: zero,
+            });
+        let count = Count { value: r.n, capped };
+        if dead {
+            g.dead = count;
+        } else {
+            g.failed_attempts = count;
         }
     }
     let mut groups: Vec<_> = merged.into_values().collect();
@@ -299,7 +361,7 @@ async fn failure_groups(
             .then_with(|| a.error.cmp(&b.error))
     });
     groups.truncate(p.failure_groups.max(0) as usize);
-    Ok(groups)
+    Ok((groups, attempts_covered))
 }
 
 /// Due names no live worker of the queue lists. Queues nobody serves are skipped: the health
@@ -410,13 +472,15 @@ pub async fn overview(
         })
         .collect();
 
+    let (failure_groups, attempts_covered) = failure_groups(conn, p, generated_at).await?;
     Ok(Overview {
         generated_at,
         window: p.window,
         done_covered: done.covered,
         dead_covered: dead.covered,
+        attempts_covered,
         queues,
-        failure_groups: failure_groups(conn, p).await?,
+        failure_groups,
         no_handler: no_handler(conn, p, &due_queues, &workers).await?,
         recent_actions: admin_actions(conn, None, p.recent_actions).await?,
         workers,

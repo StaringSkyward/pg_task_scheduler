@@ -409,3 +409,33 @@ async fn task_data_is_escaped() {
     }
     db.cleanup().await;
 }
+
+/// The failure groups' "Failed attempts" header names the span its capped scan covered.
+#[tokio::test]
+async fn failed_attempts_header_shows_covered_span() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+           VALUES ('k1', 'send', 'done', now()); \
+         INSERT INTO queue_task_attempts \
+           (task_id, attempt_no, lock_token, worker_id, started_at, finished_at, outcome, error) \
+           SELECT (SELECT id FROM queue_tasks), g, g, 'w', now() - g * interval '1 minute', \
+                  now(), 'retry', 'boom' \
+           FROM generate_series(1, 3) g",
+    )
+    .await;
+    let (_, _, body) = get(app(&db), "/").await;
+    assert!(body.contains("<th>Failed attempts (1h)</th>"), "{body}");
+    let config = AdminConfig {
+        overview: pg_task_scheduler::store::OverviewParams {
+            count_cap: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let capped = router(db.pool.clone(), config).layer(Extension(Operator("ops@example".into())));
+    let (_, _, body) = get(capped, "/").await;
+    assert!(body.contains("<th>Failed attempts (last 2m"), "{body}");
+    db.cleanup().await;
+}

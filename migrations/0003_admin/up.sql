@@ -80,8 +80,7 @@ CREATE INDEX queue_tasks_failed_idx
     ON queue_tasks (status, completed_at DESC, id DESC)
     WHERE status IN ('dead', 'cancelled');
 
--- 7. the overview's failed-attempt groups read the newest failed attempts. Partial, so it holds
--- only attempts that failed and the done path never maintains it.
-CREATE INDEX queue_task_attempts_failed_idx
-    ON queue_task_attempts (finished_at)
-    WHERE outcome IN ('retry', 'dead', 'lease_expired');
+-- No index on queue_task_attempts: closing an attempt sets finished_at, outcome and error, and
+-- an index on any of them (key or predicate) would make every close a non-HOT update that
+-- writes all of the table's indexes. The overview's failed-attempt groups read the newest
+-- attempts through queue_task_attempts_started_idx instead.

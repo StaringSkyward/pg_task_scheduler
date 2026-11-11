@@ -52,7 +52,7 @@
 <p>No failures in the window.</p>
 {% else %}
 <table>
-<thead><tr><th>Task</th><th>Error</th><th>Dead</th><th>Failed attempts</th><th></th></tr></thead>
+<thead><tr><th>Task</th><th>Error</th><th>Dead</th><th>{{ attempts_header }}</th><th></th></tr></thead>
 <tbody>
 {% for g in groups %}
 <tr><td><a href="{{ g.link }}">{{ g.task_name }}</a></td><td>{{ g.error }}</td><td>{{ g.dead }}</td><td>{{ g.attempts }}</td><td><a href="{{ g.replay_link }}">Replay all…</a></td></tr>

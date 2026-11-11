@@ -90,6 +90,7 @@ struct OverviewPage {
     rows: Vec<Row>,
     done_header: String,
     dead_header: String,
+    attempts_header: String,
     groups: Vec<Group>,
     no_handler: Vec<(String, String)>,
     actions: Vec<ActionRow>,
@@ -246,6 +247,7 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
         rows,
         done_header: windowed_header("Done", o.done_covered, o.window),
         dead_header: windowed_header("Dead", o.dead_covered, o.window),
+        attempts_header: windowed_header("Failed attempts", o.attempts_covered, o.window),
         groups: o
             .failure_groups
             .iter()

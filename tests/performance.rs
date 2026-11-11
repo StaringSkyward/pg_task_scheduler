@@ -384,12 +384,12 @@ async fn overview_dead_window_uses_failed_index() {
 }
 
 #[tokio::test]
-async fn overview_failed_attempts_uses_failed_attempts_index() {
+async fn overview_failed_attempts_use_started_index() {
     use diesel::pg::data_types::PgInterval;
     use diesel::sql_types::{BigInt, Interval};
     overview_plan(
         store::OVERVIEW_FAILED_ATTEMPTS,
-        "queue_task_attempts_failed_idx",
+        "queue_task_attempts_started_idx",
         |q| {
             q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
                 .bind::<BigInt, _>(10_000_i64)
@@ -542,6 +542,41 @@ async fn count_replayable_uses_failed_name_index() {
                 && !plan.contains("Seq Scan on queue_tasks"),
             "unexpected query plan:\n{plan}"
         );
+    }
+    db.cleanup().await;
+}
+
+#[derive(diesel::QueryableByName)]
+struct IndexDef {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    def: String,
+}
+
+/// Closing an attempt sets `finished_at`, `outcome` and `error`. An index whose key, INCLUDE
+/// list or predicate names one of them makes every close a non-HOT update that writes every
+/// attempts index, so completions would tax the hot path (spec §3).
+#[tokio::test]
+async fn attempt_close_stays_hot_eligible() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let defs = diesel::sql_query(
+        "SELECT pg_get_indexdef(indexrelid) AS def FROM pg_index \
+         WHERE indrelid = 'queue_task_attempts'::regclass",
+    )
+    .get_results::<IndexDef>(&mut conn)
+    .await
+    .unwrap();
+    assert!(
+        defs.len() >= 3,
+        "{:?}",
+        defs.iter().map(|d| &d.def).collect::<Vec<_>>()
+    );
+    for IndexDef { def } in defs {
+        // Everything after the index and table names: method, key, INCLUDE, predicate.
+        let (_, body) = def.split_once(" USING ").unwrap();
+        for column in ["finished_at", "outcome", "error"] {
+            assert!(!body.contains(column), "{def} references {column}");
+        }
     }
     db.cleanup().await;
 }
