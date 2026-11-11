@@ -68,10 +68,29 @@ async fn every_route_401_without_operator() {
     let id = enqueue_one(&db).await;
     let app = router(db.pool.clone(), AdminConfig::default());
     #[cfg_attr(not(feature = "cron"), allow(unused_mut))]
+    let get = |uri: &str| (Method::GET, uri.to_owned());
+    let post = |uri: &str| (Method::POST, uri.to_owned());
+    // Every route, so one added outside the operator check fails here.
     let mut routes = vec![
-        (Method::GET, "/".to_owned()),
-        (Method::GET, format!("/api/tasks/{id}")),
-        (Method::POST, format!("/api/tasks/{id}/replay")),
+        get("/"),
+        get("/overview"),
+        get("/workers"),
+        get("/queued?queue=x"),
+        get("/running"),
+        get("/completed"),
+        get("/failed"),
+        get("/cancelled"),
+        get(&format!("/tasks/{id}")),
+        get("/assets/admin.css"),
+        get("/assets/admin.js"),
+        get("/bulk?action=cancel&task_name=admin-task"),
+        post(&format!("/tasks/{id}/cancel")),
+        post(&format!("/tasks/{id}/replay")),
+        post("/queues/pause"),
+        post("/queues/resume"),
+        post("/bulk"),
+        get(&format!("/api/tasks/{id}")),
+        post(&format!("/api/tasks/{id}/replay")),
     ];
     #[cfg(feature = "cron")]
     {
