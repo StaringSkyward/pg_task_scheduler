@@ -22,6 +22,29 @@ async fn id_of(db: &TestDb, key: &str) -> TaskId {
     )
 }
 
+/// Collect ids across pages, failing (not hanging) if the cursor never ends.
+macro_rules! walk {
+    ($cursor:ident => $call:expr) => {{
+        let mut seen = Vec::new();
+        let mut next = None;
+        let mut finished = false;
+        for _ in 0..20 {
+            let page = {
+                let $cursor = next.as_ref();
+                $call.await.unwrap()
+            };
+            seen.extend(ids(&page.items));
+            next = page.next;
+            if next.is_none() {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "cursor still Some after 20 pages; seen {seen:?}");
+        seen
+    }};
+}
+
 fn ids(rows: &[store::TaskRow]) -> Vec<TaskId> {
     rows.iter().map(|r| r.id).collect()
 }
@@ -222,18 +245,7 @@ async fn queued_page_resumes_inside_equal_priority_group() {
     ];
     let mut conn = db.pool.get().await.unwrap();
     let q = QueueName::default();
-    let mut seen = Vec::new();
-    let mut cursor = None;
-    loop {
-        let p = store::queued_page(&mut conn, &q, cursor.as_ref(), 1)
-            .await
-            .unwrap();
-        seen.extend(ids(&p.items));
-        match p.next {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
+    let seen = walk!(cursor => store::queued_page(&mut conn, &q, cursor, 1));
     assert_eq!(seen, want);
     db.cleanup().await;
 }
@@ -252,18 +264,7 @@ async fn queued_page_breaks_ties_by_id() {
     .await;
     let mut conn = db.pool.get().await.unwrap();
     let q = QueueName::default();
-    let mut seen = Vec::new();
-    let mut cursor = None;
-    loop {
-        let p = store::queued_page(&mut conn, &q, cursor.as_ref(), 2)
-            .await
-            .unwrap();
-        seen.extend(ids(&p.items));
-        match p.next {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
+    let seen = walk!(cursor => store::queued_page(&mut conn, &q, cursor, 2));
     let mut sorted = seen.clone();
     sorted.sort_by_key(|i| i.0);
     sorted.dedup();
@@ -285,34 +286,12 @@ async fn done_and_failed_pages_break_completed_at_ties_by_id() {
     )
     .await;
     let mut conn = db.pool.get().await.unwrap();
-    let mut done = Vec::new();
-    let mut cursor = None;
-    loop {
-        let p = store::done_page(&mut conn, cursor.as_ref(), 2)
-            .await
-            .unwrap();
-        done.extend(ids(&p.items));
-        match p.next {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
+    let done = walk!(cursor => store::done_page(&mut conn, cursor, 2));
     let f = FailedFilter {
         task_name: Some(TaskName::try_from("a").unwrap()),
         last_error: None,
     };
-    let mut dead = Vec::new();
-    let mut cursor = None;
-    loop {
-        let p = store::failed_page(&mut conn, FailedStatus::Dead, &f, cursor.as_ref(), 2)
-            .await
-            .unwrap();
-        dead.extend(ids(&p.items));
-        match p.next {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
+    let dead = walk!(cursor => store::failed_page(&mut conn, FailedStatus::Dead, &f, cursor, 2));
     for seen in [done, dead] {
         let mut want = seen.clone();
         want.sort_by_key(|i| std::cmp::Reverse(i.0));
