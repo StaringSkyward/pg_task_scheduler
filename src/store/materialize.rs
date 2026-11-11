@@ -52,13 +52,9 @@ pub(crate) fn schedule_task_key(
     ))
 }
 
-enum Tick {
-    Processed,
-    Idle,
-}
-
 /// Materialize all due jobs, one transaction per job. Returns the number of
-/// jobs processed (an occurrence already present as a task still counts).
+/// tasks inserted: an occurrence already present as a task, or a job paused for
+/// a corrupt cron, counts nothing.
 ///
 /// Each job is handled in its own transaction so a single bad row cannot block
 /// the rest. For a due job, the occurrence for its *current* `next_run_at` (the
@@ -70,28 +66,29 @@ enum Tick {
 /// create), the job is paused and the error logged; it is never silently
 /// advanced.
 pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize, SchedulerError> {
-    let mut count = 0;
-    while count < 100 {
+    let mut inserted = 0;
+    for _ in 0..100 {
         match materialize_one(conn).await? {
-            Tick::Idle => break,
-            Tick::Processed => count += 1,
+            Some(n) => inserted += n,
+            None => break,
         }
     }
-    Ok(count)
+    Ok(inserted)
 }
 
-async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Tick, SchedulerError> {
-    conn.transaction::<Tick, SchedulerError, _>(async |c| {
+/// Process the earliest due job: `None` when none is due, else the tasks inserted (0 or 1).
+async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, SchedulerError> {
+    conn.transaction::<_, SchedulerError, _>(async |c| {
         let Some(job) = diesel::sql_query(SELECT_DUE)
             .get_results::<DueJob>(c)
             .await?
             .into_iter()
             .next()
         else {
-            return Ok(Tick::Idle);
+            return Ok(None);
         };
 
-        match CronExpression::parse(&job.cron_expression) {
+        let inserted = match CronExpression::parse(&job.cron_expression) {
             Ok(cron) => {
                 // Base the next run on the DB clock, never the Rust clock.
                 let next = cron.next_after(job.db_now)?;
@@ -113,6 +110,7 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Tick, Scheduler
                     .bind::<sql_types::Uuid, _>(job.id)
                     .execute(c)
                     .await?;
+                inserted
             }
             Err(e) => {
                 tracing::error!(job_id = %job.id, error = %e, "corrupt cron; pausing job");
@@ -120,9 +118,10 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Tick, Scheduler
                     .bind::<sql_types::Uuid, _>(job.id)
                     .execute(c)
                     .await?;
+                0
             }
-        }
-        Ok(Tick::Processed)
+        };
+        Ok(Some(inserted))
     })
     .await
 }

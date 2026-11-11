@@ -77,7 +77,8 @@ async fn pauses_job_with_uncorrupted_cron_left_intact() {
             .unwrap();
     }
     let mut conn = db.pool.get().await.unwrap();
-    let _ = store::materialize_due_jobs(&mut conn).await.unwrap();
+    // A paused job inserts no task.
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 0);
     assert!(db.is_paused(job).await, "bad cron pauses the job");
     db.cleanup().await;
 }
@@ -135,7 +136,8 @@ async fn rematerializing_same_occurrence_creates_one_task() {
         .insert_job("again", "*/5 * * * *", Utc::now() + Duration::hours(1))
         .await;
     let t = Utc::now() - Duration::minutes(2);
-    for _ in 0..2 {
+    // The second pass finds the occurrence already present and inserts nothing.
+    for expected in [1, 0] {
         jobs::reschedule(
             &mut conn,
             pg_task_scheduler::JobId(job),
@@ -143,7 +145,10 @@ async fn rematerializing_same_occurrence_creates_one_task() {
         )
         .await
         .unwrap();
-        assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+        assert_eq!(
+            store::materialize_due_jobs(&mut conn).await.unwrap(),
+            expected
+        );
     }
     let ids = db.task_ids(job).await;
     assert_eq!(ids.len(), 1);
