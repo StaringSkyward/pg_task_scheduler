@@ -1100,6 +1100,7 @@ dependencies = [
  "pg_task_scheduler",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "thiserror 2.0.18",
  "tokio",
  "tower",

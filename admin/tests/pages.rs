@@ -146,3 +146,209 @@ async fn overview_requires_operator() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     db.cleanup().await;
 }
+
+/// The `href` values on a page, with HTML entities of `&` undone.
+fn hrefs(body: &str) -> Vec<String> {
+    body.split("href=\"")
+        .skip(1)
+        .map(|p| p.split('"').next().unwrap().replace("&amp;", "&"))
+        .collect()
+}
+
+/// Every `<td>` cell text of the first `<td>` column, in row order (ids here).
+fn first_cells(body: &str, nth: usize) -> Vec<String> {
+    body.split("<tr")
+        .skip(2)
+        .map(|r| {
+            r.split("<td")
+                .nth(nth + 1)
+                .unwrap_or("")
+                .trim_start_matches(|c| c != '>')[1..]
+                .split("</td>")
+                .next()
+                .unwrap()
+                .trim()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn queued_page_lists_in_dequeue_order_with_next_link() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, priority, due_at) \
+         SELECT 'k' || g, 'n', 'q', CASE WHEN g = 60 THEN 9 ELSE 0 END, \
+                now() - interval '1 hour' + g * interval '1 second' \
+         FROM generate_series(1, 60) g",
+    )
+    .await;
+    let (status, _, body) = get(app(&db), "/queued?queue=q").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = first_cells(&body, 1);
+    assert_eq!(ids.len(), 50, "{body}");
+    // The highest priority task (last inserted) comes first.
+    assert!(ids[0].contains(">60<"), "{ids:?}");
+    let next = hrefs(&body)
+        .into_iter()
+        .find(|h| h.contains("position="))
+        .expect("next link");
+    let (status, _, body2) = get(app(&db), &next).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first_cells(&body2, 1).len(), 10, "{body2}");
+    assert!(!hrefs(&body2).iter().any(|h| h.contains("position=")));
+    // A malformed cursor is a 400.
+    let (status, _, _) = get(app(&db), "/queued?queue=q&id=x&position=1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn queued_without_queue_offers_known_queues() {
+    let db = TestDb::new().await;
+    sql(&db, DUE_EMAIL).await;
+    let (status, _, body) = get(app(&db), "/queued").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(hrefs(&body).contains(&"/queued?queue=email".to_owned()));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn all_list_routes_resolve() {
+    let db = TestDb::new().await;
+    for p in [
+        "/workers",
+        "/running",
+        "/completed",
+        "/failed",
+        "/cancelled",
+    ] {
+        let (status, _, _) = get(app(&db), p).await;
+        assert_eq!(status, StatusCode::OK, "{p}");
+    }
+    db.cleanup().await;
+}
+
+const DEAD: &str = "INSERT INTO queue_tasks (task_key, task_name, queue, status, last_error, completed_at) \
+    VALUES ('d1', 'a', 'q', 'dead', 'boom', now()), ('d2', 'b', 'q', 'dead', 'boom', now()), \
+           ('d3', 'a', 'q', 'dead', 'other', now()), \
+           ('c1', 'a', 'q', 'cancelled', NULL, now())";
+
+#[tokio::test]
+async fn failed_page_filters_by_group() {
+    let db = TestDb::new().await;
+    sql(&db, DEAD).await;
+    let (_, _, body) = get(app(&db), "/failed").await;
+    assert_eq!(first_cells(&body, 0).len(), 3, "{body}");
+    let (_, _, body) = get(app(&db), "/failed?task_name=a&error=boom").await;
+    assert_eq!(first_cells(&body, 0).len(), 1, "{body}");
+    let (_, _, body) = get(app(&db), "/cancelled").await;
+    assert_eq!(first_cells(&body, 0).len(), 1, "{body}");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn task_page_shows_attempts_and_404s() {
+    let db = TestDb::new().await;
+    sql(&db, DEAD).await;
+    sql(
+        &db,
+        "INSERT INTO queue_task_attempts (task_id, attempt_no, lock_token, worker_id, finished_at, outcome, error) \
+         SELECT id, 1, 1, 'worker-7', now(), 'dead', 'boom' FROM queue_tasks WHERE task_key = 'd1'",
+    )
+    .await;
+    let (status, _, body) = get(app(&db), "/tasks/1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("<td>worker-7</td>"), "{body}");
+    assert!(body.contains("<pre>"), "{body}");
+    let (status, _, _) = get(app(&db), "/tasks/99999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn names_with_url_characters_round_trip() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, due_at) \
+         VALUES ('u1', 'a&b=c', 'eu/bulk & co #1', now() - interval '1 minute'), \
+                ('u2', 'other', 'plain', now() - interval '1 minute')",
+    )
+    .await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, status, last_error, completed_at) \
+         VALUES ('u3', 'a&b=c', 'q', 'dead', 'x&y', now()), \
+                ('u4', 'a&b=c', 'q', 'dead', 'x', now())",
+    )
+    .await;
+    let (_, _, body) = get(app(&db), "/").await;
+    let links = hrefs(&body);
+    let q = links
+        .iter()
+        .find(|h| h.contains("queued?queue=eu"))
+        .expect("queue link");
+    let (status, _, page) = get(app(&db), q).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first_cells(&page, 1).len(), 1, "{page}");
+    assert!(page.contains("a&amp;b=c"), "{page}");
+    // The failure group for error `x&y` lists exactly that task.
+    let g = links
+        .iter()
+        .find(|h| h.contains("failed?task_name=") && h.contains("x%26y"))
+        .expect("group link");
+    let (status, _, page) = get(app(&db), g).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first_cells(&page, 0).len(), 1, "{page}");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn task_data_is_escaped() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, status, payload, last_error, completed_at) \
+         VALUES ('x1', 'n', 'q', 'dead', '{\"x\":\"<script>alert(1)</script>\"}', '<b>boom</b>', now())",
+    )
+    .await;
+    sql(
+        &db,
+        "INSERT INTO queue_admin_actions (action, task_id, affected, operator, reason) \
+         SELECT 'cancel', id, 1, 'op', '<i>r</i>' FROM queue_tasks",
+    )
+    .await;
+    sql(
+        &db,
+        "INSERT INTO queue_workers (worker_id, label, lost_after, status, queues, task_names) \
+         VALUES ('w1', '<u>w</u>', now() + interval '1 minute', 'healthy', '[]', '{}')",
+    )
+    .await;
+    for (path, want, raw) in [
+        (
+            "/tasks/1",
+            ["&lt;script&gt;", "&lt;b&gt;boom", "&lt;i&gt;r"],
+            ["<script>", "<b>boom", "<i>r"],
+        ),
+        (
+            "/workers",
+            ["&lt;u&gt;w", "&lt;u&gt;w", "&lt;u&gt;w"],
+            ["<u>w", "<u>w", "<u>w"],
+        ),
+        (
+            "/failed",
+            ["&lt;b&gt;boom", "&lt;b&gt;boom", "&lt;b&gt;boom"],
+            ["<b>boom", "<b>boom", "<b>boom"],
+        ),
+    ] {
+        let (status, _, body) = get(app(&db), path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        for (w, r) in want.iter().zip(raw) {
+            assert!(body.contains(w), "{path} {w}\n{body}");
+            assert!(!body.contains(r), "{path} {r}\n{body}");
+        }
+    }
+    db.cleanup().await;
+}

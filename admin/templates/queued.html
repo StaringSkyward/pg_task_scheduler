@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Queued{% endblock %}
+{% block content %}
+{% if queue.is_empty() %}
+<h2>Queued: pick a queue</h2>
+{% if queues.is_empty() %}
+<p>No known queues.</p>
+{% else %}
+<ul>
+{% for (name, link) in queues %}
+  <li><a href="{{ link }}">{{ name }}</a></li>
+{% endfor %}
+</ul>
+{% endif %}
+{% else %}
+<h2>Queued in <code>{{ queue }}</code></h2>
+{% if rows.is_empty() %}
+<p>Nothing queued.</p>
+{% else %}
+<table>
+<thead><tr><th>#</th><th>Id</th><th>Task</th><th>Priority</th><th>Waiting</th><th>Attempts</th><th>Last error</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td>{{ r.position }}</td><td><a href="{{ base }}/tasks/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.task_name }}</td><td>{{ r.priority }}</td><td>{{ r.wait }}</td><td>{{ r.attempts }}</td><td>{{ r.last_error }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% if let Some(n) = next %}<p><a href="{{ n }}">Next</a></p>{% endif %}
+{% endif %}
+{% endblock %}

@@ -32,7 +32,7 @@
 <tbody>
 {% for r in rows %}
 <tr>
-  <td>{{ r.name }}</td>
+  <td><a href="{{ r.link }}">{{ r.name }}</a></td>
   <td><span class="status {{ r.status }}">{{ r.status }}</span>{% if !r.reason.is_empty() %} <small>{{ r.reason }}</small>{% endif %}</td>
   <td>{{ r.workers }}</td><td>{{ r.slots }}</td><td>{{ r.due }}</td><td>{{ r.oldest }}</td>
   <td>{{ r.done }}</td><td>{{ r.dead }}</td>
@@ -50,7 +50,7 @@
 <thead><tr><th>Task</th><th>Error</th><th>Dead</th><th>Failed attempts</th></tr></thead>
 <tbody>
 {% for g in groups %}
-<tr><td>{{ g.task_name }}</td><td>{{ g.error }}</td><td>{{ g.dead }}</td><td>{{ g.attempts }}</td></tr>
+<tr><td><a href="{{ g.link }}">{{ g.task_name }}</a></td><td>{{ g.error }}</td><td>{{ g.dead }}</td><td>{{ g.attempts }}</td></tr>
 {% endfor %}
 </tbody>
 </table>

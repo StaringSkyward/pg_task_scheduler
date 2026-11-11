@@ -20,6 +20,7 @@ mod cache;
 mod csrf;
 pub mod db;
 pub mod health;
+mod lists;
 mod pages;
 
 /// The authenticated identity, inserted as a request extension by the auth layer.

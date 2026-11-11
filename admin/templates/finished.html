@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h2>{{ title }}{% if !task_name.is_empty() %} <small>task <code>{{ task_name }}</code></small>{% endif %}{% if !error.is_empty() %} <small>error <code>{{ error }}</code></small>{% endif %}</h2>
+{% if rows.is_empty() %}
+<p>None.</p>
+{% else %}
+<table>
+<thead><tr><th>Id</th><th>Task</th><th>Queue</th><th>Finished</th><th>Last run time</th><th>Total time</th>{% if show_error %}<th>Last error</th>{% endif %}</tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td><a href="{{ base }}/tasks/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.task_name }}</td><td>{{ r.queue }}</td><td>{{ r.at }}</td><td>{{ r.last_run }}</td><td>{{ r.total }}</td>{% if show_error %}<td>{{ r.error }}</td>{% endif %}</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% if let Some(n) = next %}<p><a href="{{ n }}">Next</a></p>{% endif %}
+{% endblock %}

@@ -1,6 +1,7 @@
 //! Server-rendered pages. Templates live in `admin/templates/`; askama escapes every
 //! interpolated value.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use askama::Template;
 use axum::Router;
@@ -21,6 +22,7 @@ pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
         // Home link target: axum's `nest("/admin", ..)` mounts `/` at `/admin` only, so
         // `{base}/` would 404 under a prefix.
         .route("/overview", get(overview::<P>))
+        .merge(crate::lists::routes())
         .route(
             "/assets/admin.css",
             get(|| async {
@@ -43,6 +45,7 @@ pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
 
 struct Row {
     name: String,
+    link: String,
     status: &'static str,
     reason: String,
     workers: usize,
@@ -54,6 +57,7 @@ struct Row {
 }
 
 struct Group {
+    link: String,
     task_name: String,
     error: String,
     dead: String,
@@ -89,10 +93,11 @@ struct OverviewPage {
 
 #[derive(Template)]
 #[template(path = "error.html")]
-struct ErrorPage {
-    base: String,
-    refresh: u64,
-    error: String,
+pub(crate) struct ErrorPage {
+    pub title: &'static str,
+    pub base: String,
+    pub refresh: u64,
+    pub error: String,
 }
 
 fn count(c: Count) -> String {
@@ -190,6 +195,11 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
             .map(|wq| wq.limit)
             .sum();
         rows.push(Row {
+            link: format!(
+                "{}/queued?{}",
+                config.base_path,
+                serde_urlencoded::to_string([("queue", name)]).unwrap_or_default()
+            ),
             name: name.to_string(),
             status: v.status.label(),
             reason: v.reason,
@@ -234,6 +244,15 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
             .failure_groups
             .iter()
             .map(|g| Group {
+                link: format!(
+                    "{}/failed?{}",
+                    config.base_path,
+                    serde_urlencoded::to_string([
+                        ("task_name", g.task_name.as_str()),
+                        ("error", g.error.as_str())
+                    ])
+                    .unwrap_or_default()
+                ),
                 task_name: g.task_name.as_str().into(),
                 error: g.error.clone(),
                 dead: count(g.dead),
@@ -262,19 +281,19 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
     }
 }
 
-fn render(t: impl Template, status: StatusCode) -> Response {
+pub(crate) fn render(t: impl Template, status: StatusCode) -> Response {
     match t.render() {
         Ok(html) => (status, Html(html)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-async fn overview<P: SchedulerPool>(State(state): State<AppState<P>>) -> Response {
-    let config = &state.config;
-    let params = config.overview.clone();
-    let timeout = config.statement_timeout;
+/// The shared, cached overview (also the source of the known queue names).
+pub(crate) async fn cached_overview<P: SchedulerPool>(state: &AppState<P>) -> crate::cache::Cached {
+    let params = state.config.overview.clone();
+    let timeout = state.config.statement_timeout;
     let pool = &state.pool;
-    let result = state
+    state
         .cache
         .get(async {
             db::read(pool, timeout, move |c| {
@@ -283,16 +302,58 @@ async fn overview<P: SchedulerPool>(State(state): State<AppState<P>>) -> Respons
             .await
             .map_err(|e| e.to_string())
         })
-        .await;
+        .await
+}
+
+pub(crate) fn unavailable(
+    title: &'static str,
+    config: &crate::AdminConfig,
+    error: String,
+) -> Response {
+    render(
+        ErrorPage {
+            title,
+            base: config.base_path.clone(),
+            refresh: config.refresh_seconds,
+            error,
+        },
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
+async fn overview<P: SchedulerPool>(State(state): State<AppState<P>>) -> Response {
+    let config = &state.config;
+    let result: Arc<_> = cached_overview(&state).await;
     match &*result {
         Ok(o) => render(build(o, config), StatusCode::OK),
-        Err(error) => render(
-            ErrorPage {
-                base: config.base_path.clone(),
-                refresh: config.refresh_seconds,
-                error: error.clone(),
-            },
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error) => unavailable("Overview unavailable", config, error.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn c(value: i64, capped: bool) -> Count {
+        Count { value, capped }
+    }
+
+    #[test]
+    fn count_is_exact_below_cap_and_marks_capped() {
+        assert_eq!(count(c(999, false)), "999");
+        assert_eq!(count(c(1234, false)), "1,234");
+        assert_eq!(count(c(10_000, true)), "10,000+");
+    }
+
+    #[test]
+    fn windowed_header_shows_covered_span_only_when_short() {
+        let w = Duration::from_secs(3600);
+        assert_eq!(
+            windowed_header("Done", Duration::from_secs(420), w),
+            "Done (last 7m)"
+        );
+        assert_eq!(windowed_header("Done", w, w), "Done (1h)");
     }
 }
