@@ -118,6 +118,12 @@ CREATE INDEX queue_outbox_unpublished_idx
     ON queue_outbox (id)
     WHERE published_at IS NULL;
 
+-- Retention cleanup of published rows: `published_at < cutoff` is an index condition, so a
+-- backlog of unpublished rows is never walked.
+CREATE INDEX queue_outbox_published_idx
+    ON queue_outbox (published_at, id)
+    WHERE published_at IS NOT NULL;
+
 -- Audit of administrative replays. No FK: the audit outlives task retention.
 CREATE TABLE queue_task_replays (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

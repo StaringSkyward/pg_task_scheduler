@@ -67,7 +67,7 @@ const CLEANUP_OUTBOX: &str = r#"
     WITH doomed AS (
         SELECT id FROM queue_outbox
         WHERE published_at < now() - $1::interval
-        ORDER BY id
+        ORDER BY published_at ASC, id ASC
         LIMIT $2
         FOR UPDATE SKIP LOCKED
     )

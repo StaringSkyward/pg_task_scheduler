@@ -60,6 +60,9 @@ task is deleted by retention.
 Commands emitted by a successful completion. `(task_key, effect_name)` is unique,
 so a retry cannot emit the same effect twice. `command_key` is globally unique, so
 a cross-task key collision fails instead of silently deduplicating.
+`queue_outbox_unpublished_idx (id) WHERE published_at IS NULL` serves a relay, and
+`queue_outbox_published_idx (published_at, id) WHERE published_at IS NOT NULL`
+serves retention cleanup, so a backlog of unpublished rows never slows it.
 
 ### `queue_task_replays`
 

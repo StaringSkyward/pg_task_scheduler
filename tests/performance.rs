@@ -79,3 +79,37 @@ async fn next_due_in_uses_due_index() {
     );
     db.cleanup().await;
 }
+
+/// Published-outbox cleanup reaches eligible rows through an index condition on
+/// `published_at`, so a backlog of old unpublished rows is never walked.
+#[tokio::test]
+async fn outbox_cleanup_uses_published_index() {
+    // The query below mirrors CLEANUP_OUTBOX's selection in src/store/maintenance.rs.
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let plan = diesel::sql_query(
+        "EXPLAIN SELECT id FROM queue_outbox \
+         WHERE published_at < now() - interval '7 days' \
+         ORDER BY published_at, id LIMIT 1000 FOR UPDATE SKIP LOCKED",
+    )
+    .get_results::<PlanLine>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.line)
+    .collect::<Vec<_>>()
+    .join("\n");
+    // An ordered Index Scan or a Bitmap Index Scan (the planner's pick on a small table)
+    // both qualify: either way `published_at` bounds the scan.
+    assert!(
+        plan.contains("queue_outbox_published_idx")
+            && plan
+                .lines()
+                .any(|l| l.contains("Index Cond:") && l.contains("published_at")),
+        "unexpected query plan:\n{plan}"
+    );
+    db.cleanup().await;
+}
