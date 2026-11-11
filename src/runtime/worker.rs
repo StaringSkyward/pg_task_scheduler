@@ -91,21 +91,25 @@ impl<P: SchedulerPool> Scheduler<P> {
             while let Some(joined) = in_flight.try_join_next() {
                 log_join(joined);
             }
-            // At most once per `max_poll_interval`; the wait below wakes for it, so a due
-            // schedule is materialized within `max_poll_interval`.
-            #[cfg(feature = "cron")]
-            let materialized_now = Instant::now() >= next_materialize;
-            #[cfg(feature = "cron")]
-            if materialized_now {
-                next_materialize = Instant::now() + config.max_poll_interval;
-                materialized = materialize(&pool).await;
-            }
-            if listener.conn.is_none() {
-                listener.conn = listen(&pool).await;
-            }
-            let wait = if queues.iter().all(|q| q.permits.available_permits() == 0) {
-                config.max_poll_interval
-            } else {
+            // Every pool and query await races shutdown, so a stalled database cannot hold it
+            // past its bound. A claim cut off after it committed leaves its tasks `running`
+            // until the reaper recovers them, as when a claim's response is lost.
+            let step = async {
+                // At most once per `max_poll_interval`; the wait below wakes for it, so a due
+                // schedule is materialized within `max_poll_interval`.
+                #[cfg(feature = "cron")]
+                let materialized_now = Instant::now() >= next_materialize;
+                #[cfg(feature = "cron")]
+                if materialized_now {
+                    next_materialize = Instant::now() + config.max_poll_interval;
+                    materialized = materialize(&pool).await;
+                }
+                if listener.conn.is_none() {
+                    listen(&pool, &mut listener).await;
+                }
+                if queues.iter().all(|q| q.permits.available_permits() == 0) {
+                    return Some(config.max_poll_interval);
+                }
                 let cycle = claim_cycle(
                     &pool,
                     &registry,
@@ -126,14 +130,15 @@ impl<P: SchedulerPool> Scheduler<P> {
                 #[cfg(not(feature = "cron"))]
                 let (failed, fresh) = (cycle.as_ref().err(), true);
                 report(&health.0, &mut failures, failed, fresh);
-                match cycle {
-                    Ok(Some(wait)) => wait,
-                    Ok(None) => continue, // full batch: more work is likely due
-                    Err(error) => {
-                        tracing::error!(%error, "claim failed");
-                        config.max_poll_interval
-                    }
-                }
+                cycle.unwrap_or_else(|error| {
+                    tracing::error!(%error, "claim failed");
+                    Some(config.max_poll_interval)
+                })
+            };
+            let wait = match cancel.run_until_cancelled(step).await {
+                None => break,
+                Some(None) => continue, // full batch: more work is likely due
+                Some(Some(wait)) => wait,
             };
             #[cfg(feature = "cron")]
             let wait = wait.min(next_materialize.saturating_duration_since(Instant::now()));
@@ -155,9 +160,9 @@ impl<P: SchedulerPool> Scheduler<P> {
         if let Err(error) = maintenance.await {
             tracing::error!(%error, "maintenance task panicked");
         }
-        if let Some(conn) = listener.conn.take() {
-            unlisten(conn).await;
-        }
+        // The guard runs UNLISTEN on a spawned task, so a stalled connection cannot delay the
+        // drain; the connection returns to the pool only once UNLISTEN completes.
+        drop(listener);
         // `true` once every dispatch has ended within `limit`.
         let mut drain = async |limit| {
             let all = async {
@@ -209,24 +214,27 @@ async fn materialize<P: SchedulerPool>(pool: &P) -> Result<(), SchedulerError> {
     Ok(())
 }
 
-/// A pooled connection listening on `queue_available`, or `None` on failure (the worker
-/// then only polls, and retries on the next loop).
-async fn listen<P: SchedulerPool>(pool: &P) -> Option<P::Conn> {
-    let listening: Result<P::Conn, SchedulerError> = async {
-        let mut conn = acquire(pool).await?;
+/// Fill `listener` with a pooled connection listening on `queue_available`. The guard holds
+/// the connection before `LISTEN` is sent, so a future dropped mid-`LISTEN` (shutdown, or
+/// the run future dropped) still UNLISTENs it. On failure the listener stays empty: the
+/// worker only polls, and retries on the next loop.
+async fn listen<P: SchedulerPool>(pool: &P, listener: &mut Listener<P>) {
+    let listening: Result<(), SchedulerError> = async {
+        let conn = listener.conn.insert(acquire(pool).await?);
         diesel::sql_query("LISTEN queue_available")
-            .execute(&mut *conn)
+            .execute(&mut **conn)
             .await?;
-        Ok(conn)
+        Ok(())
     }
     .await;
-    listening
-        .inspect_err(|error| tracing::warn!(%error, "LISTEN failed; polling only"))
-        .ok()
+    if let Err(error) = listening {
+        tracing::warn!(%error, "LISTEN failed; polling only");
+        listener.conn = None; // a failed LISTEN is not in effect: return the connection as is
+    }
 }
 
 /// The `LISTEN` connection, if any. Dropped while still holding one (the run future was
-/// dropped, or the connection failed), it runs `UNLISTEN *` on a spawned task before the
+/// dropped, the connection failed, or shutdown), it runs `UNLISTEN *` on a spawned task before the
 /// connection returns to the pool: a pooled connection left listening buffers every
 /// `queue_available` notification in the database, unbounded, for as long as it lives.
 /// The runtime handle is captured at start, so this also works when the run future is

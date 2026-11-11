@@ -372,3 +372,37 @@ async fn shutdown_with_row_lock_held_returns_in_bounded_time() {
     db.pool.close();
     db.cleanup().await;
 }
+
+/// A pool whose `acquire` never completes, standing in for a stalled database.
+#[derive(Clone)]
+struct StalledPool;
+
+impl pg_task_scheduler::SchedulerPool for StalledPool {
+    type Conn = Box<AsyncPgConnection>;
+
+    async fn acquire(&self) -> Result<Self::Conn, pg_task_scheduler::PoolError> {
+        std::future::pending().await
+    }
+}
+
+/// The loop's pool and query awaits race the shutdown token, so a stalled database cannot
+/// hold shutdown past its bound.
+#[tokio::test]
+async fn shutdown_returns_when_the_pool_stalls() {
+    let scheduler = Scheduler::builder(StalledPool)
+        .max_poll_interval(ms(50))
+        .shutdown_timeout(ms(200))
+        .register_task::<Blocker, _, _>(|_ctx, _a| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
+    tokio::time::sleep(ms(100)).await; // the loop is now waiting on the pool
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("shutdown hung behind a stalled pool")
+        .unwrap()
+        .unwrap();
+}

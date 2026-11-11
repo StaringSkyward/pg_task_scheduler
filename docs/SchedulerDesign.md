@@ -163,7 +163,8 @@ dispatch: run the handler and the lease keeper concurrently
           retry   → retry with exponential backoff + jitter
           interrupted → release during shutdown, otherwise retry
           permanent → fail_permanently
-shutdown: stop claiming and maintenance; cancel every ctx.cancellation; UNLISTEN;
+shutdown: stop claiming and maintenance, abandoning any pool or query wait in the loop;
+          cancel every ctx.cancellation; UNLISTEN on a spawned task (never delays the drain);
           drain handlers until shutdown_timeout; then drop the rest and release
           their tasks, waiting up to 5 s (RELEASE_TIMEOUT); abort what remains
           (the reaper recovers those tasks after the lease)
