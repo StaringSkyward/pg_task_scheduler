@@ -89,6 +89,9 @@ impl TestDb {
         let up = include_str!("../../migrations/0001_create_queue_tables/up.sql");
         let mut conn = pool.get().await.expect("conn");
         conn.batch_execute(up).await.expect("install schema");
+        conn.batch_execute(include_str!("../../migrations/0003_admin/up.sql"))
+            .await
+            .expect("install admin schema");
         #[cfg(feature = "cron")]
         conn.batch_execute(include_str!(
             "../../migrations/0002_create_schedule_tables/up.sql"

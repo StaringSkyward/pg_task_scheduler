@@ -411,3 +411,45 @@ async fn queue_stats_reports_counts_depth_and_outbox() {
     assert!(s.oldest_unpublished_age.is_some());
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn cleanup_deletes_expired_cancelled_tasks() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    insert_terminal(&mut conn, "cancelled-31", "cancelled", "31 days").await;
+    insert_terminal(&mut conn, "cancelled-1", "cancelled", "1 day").await;
+    let s = store::cleanup(&mut conn, &Retention::default())
+        .await
+        .unwrap();
+    assert_eq!(s.tasks, 1);
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM queue_tasks WHERE task_key = 'cancelled-1'")
+            .await,
+        1
+    );
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancelled_rows_obey_terminal_check() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let err = diesel::sql_query(
+        "INSERT INTO queue_tasks (task_key, task_name, status) VALUES ('c', 'email', 'cancelled')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::CheckViolation,
+                _
+            )
+        ),
+        "{err:?}"
+    );
+    db.cleanup().await;
+}

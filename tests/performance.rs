@@ -113,3 +113,36 @@ async fn outbox_cleanup_uses_published_index() {
     );
     db.cleanup().await;
 }
+
+/// Cancelled-task cleanup reaches eligible rows through an index condition on `completed_at`.
+#[tokio::test]
+async fn cleanup_cancelled_uses_terminal_index() {
+    use diesel::pg::data_types::PgInterval;
+    use diesel::sql_types::{BigInt, Interval};
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let plan = diesel::sql_query(format!(
+        "EXPLAIN {}",
+        pg_task_scheduler::store::CLEANUP_CANCELLED
+    ))
+    .bind::<Interval, _>(PgInterval::new(0, 30, 0))
+    .bind::<BigInt, _>(1000_i64)
+    .get_results::<PlanLine>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.line)
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        plan.contains("queue_tasks_terminal_cleanup_idx")
+            && plan
+                .lines()
+                .any(|l| l.contains("Index Cond:") && l.contains("completed_at")),
+        "unexpected query plan:\n{plan}"
+    );
+    db.cleanup().await;
+}

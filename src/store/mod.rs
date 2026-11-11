@@ -9,6 +9,8 @@ mod transitions;
 
 pub use claim::{claim, next_due_in};
 pub use inspect::{attempts, queue_stats, task};
+#[doc(hidden)]
+pub use maintenance::CLEANUP_CANCELLED;
 pub use maintenance::{cleanup, reap_expired};
 #[cfg(feature = "cron")]
 pub use materialize::materialize_due_jobs;

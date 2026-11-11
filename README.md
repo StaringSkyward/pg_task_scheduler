@@ -41,6 +41,7 @@ Include it in the host application's migrations before starting workers:
 | --- | --- |
 | `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox`, `queue_task_replays` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
+| `migrations/0003_admin/up.sql` | `cancelled` task status and its retention index; later admin tables |
 
 ## Enqueue
 
