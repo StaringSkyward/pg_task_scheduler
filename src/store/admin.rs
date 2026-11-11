@@ -218,3 +218,269 @@ pub async fn cancel(
         tokio::time::sleep(CANCEL_RETRY).await;
     }
 }
+
+/// Rows one bulk batch locks and changes.
+pub const BULK_BATCH: i64 = 500;
+/// How long a bulk call keeps starting batches.
+pub const BULK_BUDGET: Duration = Duration::from_secs(10);
+
+/// Which tasks a bulk action targets.
+#[derive(Debug, Clone)]
+pub struct BulkFilter {
+    pub task_name: TaskName,
+    /// Any queue when `None`.
+    pub queue: Option<QueueName>,
+}
+
+/// What one bulk call did. `more_remain`: the budget ran out after a full batch; call again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkOutcome {
+    pub action_id: i64,
+    pub affected: i64,
+    pub more_remain: bool,
+}
+
+#[derive(diesel::QueryableByName)]
+struct NewAction {
+    #[diesel(sql_type = sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = sql_types::BigInt)]
+    max_task_id: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct N {
+    #[diesel(sql_type = sql_types::BigInt)]
+    n: i64,
+}
+
+// Binds: $1 task_name, $2 queue (NULL = any), $3 max_task_id, $4 action id, $5 batch size.
+// One statement per batch: lock, transition, and bump the action's count together, so the
+// count never drifts from what was applied. Same transition as `CANCEL`, including the
+// attempt upsert (only for rows that are running after the lock; a claim may have committed
+// between the snapshot and the lock).
+// ponytail: the queued-row scan by task_name has no index, because §3 forbids an index
+// enqueue must maintain; it scans the queue's queued rows. Add one only if enqueue can afford it.
+const CANCEL_BATCH: &str = r#"
+    WITH target AS (
+        SELECT id, status, attempts, lock_token, locked_by FROM queue_tasks
+        WHERE id <= $3 AND task_name = $1 AND ($2::text IS NULL OR queue = $2)
+          AND status IN ('queued', 'running')
+        LIMIT $5
+        FOR UPDATE SKIP LOCKED
+    ), closed AS (
+        INSERT INTO queue_task_attempts
+            (task_id, attempt_no, lock_token, worker_id, finished_at, outcome, error)
+        SELECT id, attempts, lock_token, locked_by, now(), 'cancelled', 'cancelled by operator'
+        FROM target WHERE status = 'running'
+        ON CONFLICT (task_id, lock_token) DO UPDATE
+        SET finished_at = excluded.finished_at, outcome = excluded.outcome,
+            error = excluded.error
+        WHERE queue_task_attempts.finished_at IS NULL
+    ), cancelled AS (
+        UPDATE queue_tasks t
+        SET status = 'cancelled', locked_by = NULL, locked_until = NULL, completed_at = now(),
+            updated_at = now(), admin_action_id = $4
+        FROM target
+        WHERE t.id = target.id
+        RETURNING t.id
+    ), bump AS (
+        UPDATE queue_admin_actions SET affected = affected + (SELECT count(*) FROM cancelled)
+        WHERE id = $4
+    )
+    SELECT count(*) AS n FROM cancelled
+"#;
+
+// Binds: $1 task_name, $2 queue, $3 last_error (NULL = any), $4 max_task_id, $5 action id,
+// $6 batch size. Mirrors `queue::REPLAY`'s column updates.
+#[doc(hidden)]
+pub const REPLAY_BATCH: &str = r#"
+    WITH target AS (
+        SELECT id FROM queue_tasks
+        WHERE id <= $4 AND task_name = $1 AND ($2::text IS NULL OR queue = $2)
+          AND status IN ('dead', 'cancelled') AND ($3::text IS NULL OR last_error = $3)
+        LIMIT $6
+        FOR UPDATE SKIP LOCKED
+    ), replayed AS (
+        UPDATE queue_tasks t
+        SET status = 'queued', attempts = 0, due_at = now(), locked_by = NULL,
+            lock_token = lock_token + 1, locked_until = NULL, last_error = NULL,
+            completed_at = NULL, updated_at = now(), admin_action_id = $5
+        FROM target
+        WHERE t.id = target.id
+        RETURNING t.id
+    ), bump AS (
+        UPDATE queue_admin_actions SET affected = affected + (SELECT count(*) FROM replayed)
+        WHERE id = $5
+    )
+    SELECT count(*) AS n FROM replayed
+"#;
+
+async fn start_action(
+    conn: &mut AsyncPgConnection,
+    action: AdminActionKind,
+    filter: &BulkFilter,
+    last_error: Option<&str>,
+    operator: &str,
+    reason: &str,
+) -> Result<NewAction, SchedulerError> {
+    Ok(diesel::sql_query(
+        "INSERT INTO queue_admin_actions \
+             (action, task_name, queue, last_error_filter, max_task_id, operator, reason) \
+         SELECT $1, $2, $3, $4, coalesce(max(id), 0), $5, $6 FROM queue_tasks \
+         RETURNING id, max_task_id",
+    )
+    .bind::<sql_types::Text, _>(action.as_str())
+    .bind::<sql_types::Text, _>(&filter.task_name)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(last_error)
+    .bind::<sql_types::Text, _>(operator)
+    .bind::<sql_types::Text, _>(reason)
+    .get_result::<NewAction>(conn)
+    .await?)
+}
+
+/// Cancel queued and running tasks of `filter`, in batches of [`BULK_BATCH`], for at most
+/// `budget` (checked after each full batch). Only tasks that existed when it started are
+/// touched. Rows locked elsewhere are skipped, so concurrent calls split the work.
+pub async fn cancel_matching(
+    conn: &mut AsyncPgConnection,
+    filter: &BulkFilter,
+    operator: &str,
+    reason: &str,
+    budget: Duration,
+) -> Result<BulkOutcome, SchedulerError> {
+    let act = start_action(
+        conn,
+        AdminActionKind::Cancel,
+        filter,
+        None,
+        operator,
+        reason,
+    )
+    .await?;
+    let started = tokio::time::Instant::now();
+    let mut affected = 0;
+    loop {
+        let n = diesel::sql_query(CANCEL_BATCH)
+            .bind::<sql_types::Text, _>(&filter.task_name)
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+            .bind::<sql_types::BigInt, _>(act.max_task_id)
+            .bind::<sql_types::BigInt, _>(act.id)
+            .bind::<sql_types::BigInt, _>(BULK_BATCH)
+            .get_result::<N>(conn)
+            .await?
+            .n;
+        affected += n;
+        if n < BULK_BATCH {
+            return Ok(BulkOutcome {
+                action_id: act.id,
+                affected,
+                more_remain: false,
+            });
+        }
+        if started.elapsed() >= budget {
+            return Ok(BulkOutcome {
+                action_id: act.id,
+                affected,
+                more_remain: true,
+            });
+        }
+    }
+}
+
+/// Requeue dead and cancelled tasks of `filter` (with `last_error` equal to the given text,
+/// when given), same budget rules as [`cancel_matching`]. Each non-empty batch notifies workers.
+pub async fn replay_matching(
+    conn: &mut AsyncPgConnection,
+    filter: &BulkFilter,
+    last_error: Option<&str>,
+    operator: &str,
+    reason: &str,
+    budget: Duration,
+) -> Result<BulkOutcome, SchedulerError> {
+    let act = start_action(
+        conn,
+        AdminActionKind::Replay,
+        filter,
+        last_error,
+        operator,
+        reason,
+    )
+    .await?;
+    let started = tokio::time::Instant::now();
+    let mut affected = 0;
+    loop {
+        let n = diesel::sql_query(REPLAY_BATCH)
+            .bind::<sql_types::Text, _>(&filter.task_name)
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(last_error)
+            .bind::<sql_types::BigInt, _>(act.max_task_id)
+            .bind::<sql_types::BigInt, _>(act.id)
+            .bind::<sql_types::BigInt, _>(BULK_BATCH)
+            .get_result::<N>(conn)
+            .await?
+            .n;
+        if n > 0 {
+            diesel::sql_query("SELECT pg_notify('queue_available', '')")
+                .execute(conn)
+                .await?;
+        }
+        affected += n;
+        if n < BULK_BATCH {
+            return Ok(BulkOutcome {
+                action_id: act.id,
+                affected,
+                more_remain: false,
+            });
+        }
+        if started.elapsed() >= budget {
+            return Ok(BulkOutcome {
+                action_id: act.id,
+                affected,
+                more_remain: true,
+            });
+        }
+    }
+}
+
+/// How many tasks `cancel_matching` would match, counting at most `cap`.
+pub async fn count_cancellable(
+    conn: &mut AsyncPgConnection,
+    filter: &BulkFilter,
+    cap: i64,
+) -> Result<i64, SchedulerError> {
+    Ok(diesel::sql_query(
+        "SELECT count(*) AS n FROM (SELECT 1 FROM queue_tasks \
+         WHERE task_name = $1 AND ($2::text IS NULL OR queue = $2) \
+           AND status IN ('queued', 'running') LIMIT $3) s",
+    )
+    .bind::<sql_types::Text, _>(&filter.task_name)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+    .bind::<sql_types::BigInt, _>(cap)
+    .get_result::<N>(conn)
+    .await?
+    .n)
+}
+
+/// How many tasks `replay_matching` would match, counting at most `cap`.
+pub async fn count_replayable(
+    conn: &mut AsyncPgConnection,
+    filter: &BulkFilter,
+    last_error: Option<&str>,
+    cap: i64,
+) -> Result<i64, SchedulerError> {
+    Ok(diesel::sql_query(
+        "SELECT count(*) AS n FROM (SELECT 1 FROM queue_tasks \
+         WHERE task_name = $1 AND ($2::text IS NULL OR queue = $2) \
+           AND status IN ('dead', 'cancelled') AND ($3::text IS NULL OR last_error = $3) \
+         LIMIT $4) s",
+    )
+    .bind::<sql_types::Text, _>(&filter.task_name)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(last_error)
+    .bind::<sql_types::BigInt, _>(cap)
+    .get_result::<N>(conn)
+    .await?
+    .n)
+}

@@ -44,3 +44,9 @@ INSERT INTO queue_admin_actions (action, task_id, affected, operator, reason, at
 SELECT 'replay', task_id, 1, operator, reason, replayed_at
 FROM queue_task_replays ORDER BY id;
 DROP TABLE queue_task_replays;
+
+-- 3. bulk replay and the failed-task browser find dead/cancelled rows by name. Partial, so
+-- enqueue, claim and completion never maintain it.
+CREATE INDEX queue_tasks_failed_name_idx
+    ON queue_tasks (task_name, status, completed_at DESC, id DESC)
+    WHERE status IN ('dead', 'cancelled');

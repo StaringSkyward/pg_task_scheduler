@@ -376,6 +376,14 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
   inside `lock_owned`) still holds the row after 2 s of retries. A cancelled
   task keeps its `task_key` until retention deletes it (after `Retention.dead`),
   so enqueueing that key again does not run it; replay does.
+- **Bulk:** `store::cancel_matching` (queued and running) and `store::replay_matching`
+  (dead and cancelled, optionally only those with an exact `last_error`) act on a task name
+  (and optionally a queue) in batches of 500, one statement each, until a batch comes back
+  short or the budget (10 s by default) runs out after a full batch (`more_remain`: call
+  again). Each call records one `queue_admin_actions` row, and only tasks that existed when
+  it started are touched. Rows locked elsewhere are skipped, so concurrent calls split the
+  work. `count_cancellable` and `count_replayable` count up to a cap. Cancel by name scans
+  the queue's queued rows: an index there would tax every enqueue.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
   (counts by status, due count, oldest due age, depth by queue, name and
   priority with due count and oldest due age, and outbox backlog).

@@ -8,7 +8,13 @@ mod maintenance;
 mod materialize;
 mod transitions;
 
-pub use admin::{AdminAction, AdminActionKind, CancelOutcome, admin_actions, cancel, task_actions};
+#[doc(hidden)]
+pub use admin::REPLAY_BATCH;
+pub use admin::{
+    AdminAction, AdminActionKind, BULK_BATCH, BULK_BUDGET, BulkFilter, BulkOutcome, CancelOutcome,
+    admin_actions, cancel, cancel_matching, count_cancellable, count_replayable, replay_matching,
+    task_actions,
+};
 pub use claim::{claim, next_due_in};
 pub use inspect::{attempts, queue_stats, task};
 #[doc(hidden)]

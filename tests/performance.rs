@@ -146,3 +146,36 @@ async fn cleanup_cancelled_uses_terminal_index() {
     );
     db.cleanup().await;
 }
+
+/// A bulk replay batch finds dead and cancelled rows by name through the failed-name index.
+#[tokio::test]
+async fn replay_matching_uses_failed_name_index() {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .unwrap();
+    let plan = diesel::sql_query(format!(
+        "EXPLAIN {}",
+        pg_task_scheduler::store::REPLAY_BATCH
+    ))
+    .bind::<Text, _>("a")
+    .bind::<Nullable<Text>, _>(None::<String>)
+    .bind::<Nullable<Text>, _>(None::<String>)
+    .bind::<BigInt, _>(1000_i64)
+    .bind::<BigInt, _>(1_i64)
+    .bind::<BigInt, _>(500_i64)
+    .get_results::<PlanLine>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.line)
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        plan.contains("queue_tasks_failed_name_idx") && !plan.contains("Seq Scan on queue_tasks"),
+        "unexpected query plan:\n{plan}"
+    );
+    db.cleanup().await;
+}
