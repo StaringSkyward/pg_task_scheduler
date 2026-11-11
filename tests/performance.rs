@@ -192,7 +192,9 @@ fn browse_plan(rows: Vec<PlanLine>, index: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        plan.contains(index) && !plan.contains("Seq Scan on queue_tasks"),
+        plan.contains(index)
+            && !plan.contains("Seq Scan on queue_tasks")
+            && !plan.contains("Seq Scan on queue_task_attempts"),
         "unexpected query plan:\n{plan}"
     );
     plan

@@ -198,3 +198,127 @@ async fn task_detail_has_attempts_and_actions() {
     );
     db.cleanup().await;
 }
+
+/// Page boundaries fall inside a same-priority group: the `priority = p` keyset branch.
+#[tokio::test]
+async fn queued_page_resumes_inside_equal_priority_group() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, priority, due_at) VALUES \
+         ('a', 'job', 10, now() - interval '5 min'), \
+         ('b', 'job', 10, now() - interval '4 min'), \
+         ('c', 'job', 10, now() - interval '3 min'), \
+         ('d', 'job', 10, now() - interval '2 min'), \
+         ('low', 'job', 0, now() - interval '9 min')",
+    )
+    .await;
+    let want = [
+        id_of(&db, "a").await,
+        id_of(&db, "b").await,
+        id_of(&db, "c").await,
+        id_of(&db, "d").await,
+        id_of(&db, "low").await,
+    ];
+    let mut conn = db.pool.get().await.unwrap();
+    let q = QueueName::default();
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let p = store::queued_page(&mut conn, &q, cursor.as_ref(), 1)
+            .await
+            .unwrap();
+        seen.extend(ids(&p.items));
+        match p.next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seen, want);
+    db.cleanup().await;
+}
+
+/// Equal priority and due_at: the id tiebreak decides, and no row is skipped or repeated.
+#[tokio::test]
+async fn queued_page_breaks_ties_by_id() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, priority, due_at) \
+         SELECT 't' || g, 'job', 10, '2020-01-01' FROM generate_series(1, 5) g; \
+         INSERT INTO queue_tasks (task_key, task_name, due_at) \
+         SELECT 'f' || g, 'job', '2999-01-01' FROM generate_series(1, 3) g",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let q = QueueName::default();
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let p = store::queued_page(&mut conn, &q, cursor.as_ref(), 2)
+            .await
+            .unwrap();
+        seen.extend(ids(&p.items));
+        match p.next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_by_key(|i| i.0);
+    sorted.dedup();
+    assert_eq!(seen.len(), 8);
+    // Due group (ids ascending), then the future group (ids ascending).
+    assert_eq!(seen, sorted);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn done_and_failed_pages_break_completed_at_ties_by_id() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         SELECT 'd' || g, 'a', 'done', '2020-01-01' FROM generate_series(1, 5) g; \
+         INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         SELECT 'x' || g, 'a', 'dead', '2020-01-01' FROM generate_series(1, 5) g",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let mut done = Vec::new();
+    let mut cursor = None;
+    loop {
+        let p = store::done_page(&mut conn, cursor.as_ref(), 2)
+            .await
+            .unwrap();
+        done.extend(ids(&p.items));
+        match p.next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    let f = FailedFilter {
+        task_name: Some(TaskName::try_from("a").unwrap()),
+        last_error: None,
+    };
+    let mut dead = Vec::new();
+    let mut cursor = None;
+    loop {
+        let p = store::failed_page(&mut conn, FailedStatus::Dead, &f, cursor.as_ref(), 2)
+            .await
+            .unwrap();
+        dead.extend(ids(&p.items));
+        match p.next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    for seen in [done, dead] {
+        let mut want = seen.clone();
+        want.sort_by_key(|i| std::cmp::Reverse(i.0));
+        want.dedup();
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen, want);
+    }
+    db.cleanup().await;
+}
