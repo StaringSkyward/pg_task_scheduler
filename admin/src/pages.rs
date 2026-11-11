@@ -23,6 +23,7 @@ pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
         // `{base}/` would 404 under a prefix.
         .route("/overview", get(overview::<P>))
         .merge(crate::lists::routes())
+        .merge(crate::actions::routes())
         .route(
             "/assets/admin.css",
             get(|| async {
@@ -47,6 +48,7 @@ struct Row {
     name: String,
     link: String,
     status: &'static str,
+    paused: bool,
     reason: String,
     workers: usize,
     slots: String,
@@ -58,6 +60,7 @@ struct Row {
 
 struct Group {
     link: String,
+    replay_link: String,
     task_name: String,
     error: String,
     dead: String,
@@ -202,6 +205,7 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
             ),
             name: name.to_string(),
             status: v.status.label(),
+            paused,
             reason: v.reason,
             workers: serving.len(),
             slots: format!("{} / {slots}", q.running),
@@ -248,6 +252,16 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
                     "{}/failed?{}",
                     config.base_path,
                     serde_urlencoded::to_string([
+                        ("task_name", g.task_name.as_str()),
+                        ("error", g.error.as_str())
+                    ])
+                    .unwrap_or_default()
+                ),
+                replay_link: format!(
+                    "{}/bulk?{}",
+                    config.base_path,
+                    serde_urlencoded::to_string([
+                        ("action", "replay"),
                         ("task_name", g.task_name.as_str()),
                         ("error", g.error.as_str())
                     ])

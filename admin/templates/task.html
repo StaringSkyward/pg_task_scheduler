@@ -20,6 +20,18 @@
 <tr><th>Admin action</th><td>{% if let Some(a) = t.task.admin_action_id %}{{ a }}{% else %}—{% endif %}</td></tr>
 </table>
 
+{% if status == "queued" || status == "running" %}
+<form method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/cancel">
+  <label>Reason <input name="reason" required></label>
+  <button type="submit">Cancel task</button>
+</form>
+{% else if status == "dead" || status == "cancelled" %}
+<form method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/replay">
+  <label>Reason <input name="reason" required></label>
+  <button type="submit">Replay task</button>
+</form>
+{% endif %}
+
 <h2>Payload</h2>
 <pre>{{ payload }}</pre>
 

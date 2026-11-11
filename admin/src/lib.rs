@@ -14,6 +14,7 @@ use axum::{Router, middleware};
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::store::OverviewParams;
 
+mod actions;
 mod api;
 pub mod auth;
 mod cache;

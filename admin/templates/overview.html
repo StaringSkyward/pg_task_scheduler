@@ -27,7 +27,7 @@
 <table>
 <thead><tr>
   <th>Queue</th><th>Status</th><th>Workers</th><th>Slots in use / total</th>
-  <th>Due</th><th>Oldest due wait</th><th>{{ done_header }}</th><th>{{ dead_header }}</th>
+  <th>Due</th><th>Oldest due wait</th><th>{{ done_header }}</th><th>{{ dead_header }}</th><th>Pause</th>
 </tr></thead>
 <tbody>
 {% for r in rows %}
@@ -36,6 +36,11 @@
   <td><span class="status {{ r.status }}">{{ r.status }}</span>{% if !r.reason.is_empty() %} <small>{{ r.reason }}</small>{% endif %}</td>
   <td>{{ r.workers }}</td><td>{{ r.slots }}</td><td>{{ r.due }}</td><td>{{ r.oldest }}</td>
   <td>{{ r.done }}</td><td>{{ r.dead }}</td>
+  <td><form method="post" action="{{ base }}/queues/{% if r.paused %}resume{% else %}pause{% endif %}">
+    <input type="hidden" name="queue" value="{{ r.name }}">
+    <input name="reason" placeholder="reason" required>
+    <button type="submit">{% if r.paused %}Resume{% else %}Pause{% endif %}</button>
+  </form></td>
 </tr>
 {% endfor %}
 </tbody>
@@ -47,10 +52,10 @@
 <p>No failures in the window.</p>
 {% else %}
 <table>
-<thead><tr><th>Task</th><th>Error</th><th>Dead</th><th>Failed attempts</th></tr></thead>
+<thead><tr><th>Task</th><th>Error</th><th>Dead</th><th>Failed attempts</th><th></th></tr></thead>
 <tbody>
 {% for g in groups %}
-<tr><td><a href="{{ g.link }}">{{ g.task_name }}</a></td><td>{{ g.error }}</td><td>{{ g.dead }}</td><td>{{ g.attempts }}</td></tr>
+<tr><td><a href="{{ g.link }}">{{ g.task_name }}</a></td><td>{{ g.error }}</td><td>{{ g.dead }}</td><td>{{ g.attempts }}</td><td><a href="{{ g.replay_link }}">Replay all…</a></td></tr>
 {% endfor %}
 </tbody>
 </table>
