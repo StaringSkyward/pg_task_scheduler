@@ -22,7 +22,8 @@ use crate::runtime::health::{HealthStatus, WorkerHealth};
 use crate::runtime::registry::{Handler, Registry};
 use crate::store;
 
-/// Shortest idle wait, so an overdue-but-unclaimable task cannot spin the loop.
+/// Shortest idle wait before a task due soon (a due task the cycle could not claim waits
+/// `max_poll_interval` instead: another transaction holds it).
 const MIN_WAIT: Duration = Duration::from_millis(10);
 
 /// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
@@ -295,7 +296,7 @@ async fn claim_cycle<P: SchedulerPool>(
     shutdown: &Shutdown,
 ) -> Result<Option<Duration>, SchedulerError> {
     let mut conn = acquire(pool).await?;
-    let mut full = false;
+    let (mut full, mut claimed_any) = (false, false);
     for queue in queues {
         if shutdown.begun.is_cancelled() {
             return Ok(Some(config.max_poll_interval));
@@ -318,6 +319,7 @@ async fn claim_cycle<P: SchedulerPool>(
         )
         .await?;
         let full_batch = claimed.len() == want.get();
+        claimed_any |= !claimed.is_empty();
         for task in claimed {
             let name = task.task_name.as_str().to_owned();
             let queue_label = queue.name.as_str().to_owned();
@@ -360,7 +362,13 @@ async fn claim_cycle<P: SchedulerPool>(
         return Ok(Some(max));
     }
     let next = store::next_due_in(&mut conn, &open, names).await?;
-    Ok(Some(next.unwrap_or(max).max(MIN_WAIT).min(max)))
+    Ok(Some(match next {
+        // Due, yet this cycle claimed nothing: another transaction holds the row (SKIP
+        // LOCKED), and polling every MIN_WAIT would not get it sooner. Notifications still
+        // wake the loop for new work.
+        Some(Duration::ZERO) if !claimed_any => max,
+        next => next.unwrap_or(max).max(MIN_WAIT).min(max),
+    }))
 }
 
 /// Publish health. `fresh` is whether `error` happened in this cycle; a standing error

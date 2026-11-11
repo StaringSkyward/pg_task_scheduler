@@ -152,7 +152,8 @@ loop:     [cron] materialize due schedules, at most once per max_poll_interval
           if any batch was full: loop again immediately
           otherwise wait for the first of: notification, next due_at among queues
           that still have a free permit (clamped to 10 ms..max_poll_interval;
-          max_poll_interval if none has), [cron] the next materialization,
+          max_poll_interval if none has, or if a due task could not be claimed
+          because another transaction locks it), [cron] the next materialization,
           a handler finishing, shutdown
 maintain: every reaper_interval, rounds of one reap batch then one cleanup batch
           until both run short

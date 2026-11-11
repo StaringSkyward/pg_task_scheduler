@@ -197,6 +197,8 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   `max_poll_interval` (default 1 s);
 - scheduled tasks and retries become due with no notification, through the
   next-`due_at` wait;
+- a due task that a claim skips because another transaction locks its row is
+  retried after `max_poll_interval`, not every 10 ms;
 - if the listening connection fails, the worker keeps polling and re-listens on
   the next loop.
 
