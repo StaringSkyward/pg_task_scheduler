@@ -79,3 +79,9 @@ CREATE TABLE queue_workers (
 CREATE INDEX queue_tasks_failed_idx
     ON queue_tasks (status, completed_at DESC, id DESC)
     WHERE status IN ('dead', 'cancelled');
+
+-- 7. the overview's failed-attempt groups read the newest failed attempts. Partial, so it holds
+-- only attempts that failed and the done path never maintains it.
+CREATE INDEX queue_task_attempts_failed_idx
+    ON queue_task_attempts (finished_at)
+    WHERE outcome IN ('retry', 'dead', 'lease_expired');

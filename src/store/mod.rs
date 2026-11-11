@@ -7,6 +7,7 @@ mod inspect;
 mod maintenance;
 #[cfg(feature = "cron")]
 mod materialize;
+mod overview;
 mod transitions;
 mod workers;
 
@@ -30,6 +31,13 @@ pub use maintenance::CLEANUP_CANCELLED;
 pub use maintenance::{cleanup, reap_expired};
 #[cfg(feature = "cron")]
 pub use materialize::materialize_due_jobs;
+pub use overview::{
+    Count, FailureGroup, NoHandler, Overview, OverviewParams, QueueOverview, overview,
+};
+#[doc(hidden)]
+pub use overview::{
+    OVERVIEW_COUNTS, OVERVIEW_DEAD, OVERVIEW_DONE, OVERVIEW_FAILED_ATTEMPTS, OVERVIEW_QUEUES,
+};
 pub use transitions::{
     complete, complete_with_outbox, completed_by, fail_permanently, heartbeat, lease_status,
     lock_owned, release, retry,

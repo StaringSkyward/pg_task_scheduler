@@ -317,3 +317,83 @@ async fn failed_page_by_name_uses_failed_name_index() {
     browse_plan(plan, "queue_tasks_failed_name_idx");
     db.cleanup().await;
 }
+
+async fn overview_plan(
+    sql: &str,
+    index: &str,
+    binds: impl FnOnce(
+        diesel::query_builder::BoxedSqlQuery<'_, diesel::pg::Pg, diesel::query_builder::SqlQuery>,
+    ) -> diesel::query_builder::BoxedSqlQuery<
+        '_,
+        diesel::pg::Pg,
+        diesel::query_builder::SqlQuery,
+    >,
+) {
+    let db = TestDb::new().await;
+    let mut conn = seqscan_off_conn(&db).await;
+    let rows = binds(diesel::sql_query(format!("EXPLAIN {sql}")).into_boxed())
+        .get_results::<PlanLine>(&mut conn)
+        .await
+        .unwrap();
+    browse_plan(rows, index);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn overview_distinct_queues_skip_scan_uses_claim_index() {
+    // The planner prefers the smaller queued-by-(queue, due_at) index to the claim index; both
+    // lead with `queue` among queued rows. EXPLAIN omits the recursive step's subplan, so
+    // only the anchor scan is asserted here.
+    overview_plan(store::OVERVIEW_QUEUES, "queue_tasks_due_idx", |q| q).await;
+}
+
+#[tokio::test]
+async fn overview_due_count_uses_due_index() {
+    use diesel::sql_types::{Array, BigInt, Text};
+    overview_plan(store::OVERVIEW_COUNTS, "queue_tasks_due_idx", |q| {
+        q.bind::<Array<Text>, _>(vec!["default"])
+            .bind::<BigInt, _>(10_000_i64)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn overview_done_window_uses_terminal_index() {
+    use diesel::pg::data_types::PgInterval;
+    use diesel::sql_types::{BigInt, Interval};
+    overview_plan(
+        store::OVERVIEW_DONE,
+        "queue_tasks_terminal_cleanup_idx",
+        |q| {
+            q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
+                .bind::<BigInt, _>(10_000_i64)
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn overview_dead_window_uses_failed_index() {
+    use diesel::pg::data_types::PgInterval;
+    use diesel::sql_types::{BigInt, Interval};
+    overview_plan(store::OVERVIEW_DEAD, "queue_tasks_failed_idx", |q| {
+        q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
+            .bind::<BigInt, _>(10_000_i64)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn overview_failed_attempts_uses_failed_attempts_index() {
+    use diesel::pg::data_types::PgInterval;
+    use diesel::sql_types::{BigInt, Interval};
+    overview_plan(
+        store::OVERVIEW_FAILED_ATTEMPTS,
+        "queue_task_attempts_failed_idx",
+        |q| {
+            q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
+                .bind::<BigInt, _>(10_000_i64)
+        },
+    )
+    .await;
+}
