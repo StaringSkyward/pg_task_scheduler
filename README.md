@@ -186,7 +186,8 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
   remain. Running it on many instances is safe.
 - **Retention:** the same maintenance task deletes `done` and `dead` rows and
   published outbox rows older than their `Retention` periods, in bounded
-  batches. Attempt history is deleted with its task.
+  batches. Attempt history is deleted with its task. Each round reaps one batch
+  before it deletes one, so a retention backlog never delays lease recovery.
 - **Replay:** `queue::replay(conn, task_id, operator, reason)` moves a `dead`
   task back to `queued` with the same `task_key`, resets `attempts`, and bumps
   `lock_token`. Each replay is recorded in `queue_task_replays`. Enqueue a new
@@ -203,7 +204,13 @@ Publishing `queue_outbox` rows is the application's job. The relay must set
 - **Connections:** each running scheduler holds one pool connection for
   `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
   finalization, and maintenance. Handlers hold no connection unless they take
-  one.
+  one. Per scheduler sharing a pool, that is 1 for `LISTEN`, 1 for claims and
+  maintenance, and up to `max_concurrency` for heartbeats and finalization, plus
+  one per handler that takes its own. So set the pool's `max_size` to at least
+  `max_concurrency + 2` per scheduler, plus whatever handlers take. A smaller pool
+  starves heartbeats until local deadlines drop handlers. Deadpool's default
+  `max_size` is 2 × the logical CPU count (4 on a 2-vCPU host), well below the
+  18 that the default `max_concurrency` of 16 needs.
 
 ### Observability
 
@@ -236,6 +243,8 @@ them:
 
 Tasks the reaper marks dead are counted only in
 `pg_task_scheduler_leases_expired_total`, not in `pg_task_scheduler_tasks_dead_total`.
+`pg_task_scheduler_tasks_materialized_total` counts tasks inserted; an occurrence
+that already exists as a task counts nothing.
 
 Queue-level gauges (counts by status, due count, oldest due age, depth by name
 and priority, outbox backlog) come from `store::queue_stats`. They are not
@@ -253,7 +262,9 @@ authentication in front of it.
 With the `cron` feature, `jobs::create`, `jobs::ensure_job`, pause/resume, and
 reschedule manage rows in `scheduler_jobs`. Each due occurrence becomes an
 ordinary queue task with `task_key = "schedule:{id}:{scheduled_for}"`, so a
-re-materialized occurrence never creates a second task. Deleting or editing a
+re-materialized occurrence never creates a second task. Every running scheduler
+materializes due schedules at most once per `max_poll_interval`, so an occurrence
+becomes a task within `max_poll_interval` of its time. Deleting or editing a
 schedule does not change tasks it already created. After downtime, one
 occurrence is created for the missed slot (`run_once`).
 

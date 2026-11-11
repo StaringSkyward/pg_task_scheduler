@@ -116,7 +116,7 @@ transaction (nested transactions become savepoints).
 | Permanent failure | `store::fail_permanently(conn, lease, error)` | §11.4 | Task and attempt → `dead`. |
 | Reap | `store::reap_expired(conn, batch, crash_retry_delay)` | §12 | Bounded `SKIP LOCKED` batch. Closes the attempt as `lease_expired` in the same statement. |
 | Replay | `queue::replay(conn, id, operator, reason)` | §18 | `dead → queued`, `attempts = 0`, `lock_token + 1`, with an audit row. |
-| Cleanup | `store::cleanup(conn, &retention)` | §20 | Bounded deletes of expired `done`/`dead` rows and published outbox rows. |
+| Cleanup | `store::cleanup(conn, &retention)` | §20 | One bounded delete per terminal status (so `completed_at` is an index condition), `done` first, sharing one `batch_size` budget; then one of published outbox rows. |
 
 Every worker-owned transition uses the full ownership predicate:
 
@@ -138,12 +138,15 @@ one attempt row closes.
 ```text
 startup:  generate UUID worker_id; LISTEN queue_available on one pooled connection;
           spawn maintenance (reaper + cleanup every reaper_interval)
-loop:     [cron] materialize due schedules
+loop:     [cron] materialize due schedules, at most once per max_poll_interval
           claim up to min(free permits, claim_batch_size)
           spawn one dispatch per claim
           if the batch was full: loop again immediately
           otherwise wait for the first of: notification, next due_at
-          (clamped to 10 ms..max_poll_interval), a handler finishing, shutdown
+          (clamped to 10 ms..max_poll_interval), [cron] the next materialization,
+          a handler finishing, shutdown
+maintain: every reaper_interval, rounds of one reap batch then one cleanup batch
+          until both run short
 dispatch: run the handler and the lease keeper concurrently
           lease keeper: heartbeat every heartbeat_interval; on LostOwnership or local
                         deadline → cancel ctx.cancellation and drop the handler
@@ -151,6 +154,9 @@ dispatch: run the handler and the lease keeper concurrently
           retry   → retry with exponential backoff + jitter
           permanent → fail_permanently
 shutdown: stop maintenance; UNLISTEN; drain handlers until shutdown_timeout; abort the rest
+dropped:  if the run future is dropped instead (aborted, or a failed try_join! sibling),
+          maintenance stops, handlers are aborted, and the LISTEN connection runs
+          UNLISTEN on a spawned task before it returns to the pool
 ```
 
 The lease keeper is a separate future, not a `select!` arm body. A DB-contained
@@ -184,9 +190,9 @@ recovers it after the lease expires.
 | `shutdown_timeout` | 25 s |
 
 `build()` rejects zero intervals, `heartbeat_interval > lease_duration / 3`,
-`base_retry_delay > max_retry_delay`, and any `done` or `dead` retention shorter
-than the idempotency horizon. `max_attempts` is set per task at enqueue (default
-3).
+`base_retry_delay > max_retry_delay`, any `done` or `dead` retention shorter
+than the idempotency horizon, and any duration over 5 years. `max_attempts` is
+set per task at enqueue (default 3).
 
 ## Rust Boundaries
 
@@ -197,7 +203,8 @@ than the idempotency horizon. `max_attempts` is set per task at enqueue (default
 - `TaskLease { task_id, worker_id, lock_token, attempt_no }` is the ownership
   proof every guarded transition takes. Handlers receive it as `ctx.lease`.
 - `TaskContext` carries the lease, `task_key`, `task_name`, `max_attempts`,
-  `locked_until`, and a `CancellationToken`.
+  `locked_until` (as of claim; heartbeats do not update it), and a
+  `CancellationToken`.
 - `TaskError::{retry, permanent}` is the handler's failure classification
   (§11.1).
 - Observability (§23) goes through the `tracing` and `metrics` facades. The
@@ -211,7 +218,8 @@ than the idempotency horizon. `max_attempts` is set per task at enqueue (default
 - Heartbeat is a single `UPDATE`. Completion, retry, and failure are
   two-statement transactions.
 - The reaper and cleanup loop over bounded batches on a separate task, so a large
-  backlog never stalls claiming.
+  backlog never stalls claiming. A reap batch runs before every cleanup batch, so
+  a cleanup backlog never delays lease recovery.
 - `store::queue_stats` scans retained rows for its status counts. Poll it at a
   modest interval.
 - The claim index is the spec's default. Benchmark it against realistic

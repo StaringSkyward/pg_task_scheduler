@@ -150,9 +150,10 @@ A key stays reserved while its row exists. Retention never deletes terminal rows
 younger than `Retention::idempotency_horizon`, and the builder rejects a
 retention configuration that would.
 
-With the `cron` feature, every scheduler also materializes due schedules. It
-locks one schedule row with `SKIP LOCKED`, inserts the occurrence with a
-deterministic `task_key`, and advances the cursor in one transaction.
+With the `cron` feature, every scheduler also materializes due schedules, at
+most once per `max_poll_interval`. It locks one schedule row with `SKIP LOCKED`,
+inserts the occurrence with a deterministic `task_key`, and advances the cursor
+in one transaction.
 
 ## Ordering and Fairness
 
@@ -179,8 +180,14 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 
 - **Connection pool:** each scheduler permanently holds one connection for
   `LISTEN`. Claims, heartbeats, finalization, maintenance, and DB-contained
-  handlers take short-lived connections. Size the pool with headroom for
-  heartbeats that land together.
+  handlers take short-lived connections. Each scheduler needs 1 connection for
+  `LISTEN`, plus 1 for claims and maintenance, plus up to `max_concurrency` for
+  heartbeats and finalization, plus one per handler that takes its own. So size
+  `max_size ≥ max_concurrency + 2` per scheduler sharing the pool, plus whatever
+  handlers take. If DB-contained handlers share an undersized pool, heartbeats
+  wait for connections until local deadlines drop the handlers. Deadpool's
+  default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU host), well
+  below the 18 that the default `max_concurrency` of 16 needs.
 - **Lease duration:** keep it well above pool wait plus database latency, and
   above the longest DB-contained transaction. A database outage longer than the
   lease lets another worker start the task.
@@ -192,8 +199,9 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   task row. Monitor autovacuum, dead tuples, index bloat, and cleanup throughput.
   Partitioning is a later, measured step.
 - **Backlogs:** the reaper and cleanup loop in bounded batches on a separate task,
-  so they never block claiming. Sustained input above capacity still grows
-  `queued`. Watch `store::queue_stats`.
+  so they never block claiming. Each round reaps one batch before it cleans one,
+  so a cleanup backlog never delays lease recovery. Sustained input above
+  capacity still grows `queued`. Watch `store::queue_stats`.
 
 ## Failure Semantics (§22)
 
