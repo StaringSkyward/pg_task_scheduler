@@ -25,8 +25,8 @@ AND lock_token = $lock_token        -- +1 on every claim and every replay
 AND locked_until > clock_timestamp()  -- hard lease, database time
 ```
 
-Heartbeat, completion, completion with outbox, retry, permanent failure, and the
-DB-contained `lock_owned` all use this predicate. A guarded statement that
+Heartbeat, completion, completion with outbox, retry, permanent failure, release,
+and the DB-contained `lock_owned` all use this predicate. A guarded statement that
 matches zero rows means ownership is lost (`SchedulerError::LostOwnership`). It
 never means success.
 

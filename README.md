@@ -400,9 +400,10 @@ Tasks the reaper marks dead are counted only in
 that already exists as a task counts nothing.
 
 Queue-level gauges (counts by status, due count, oldest due age, depth by queue,
-name and priority with due count and oldest due age per queue, outbox backlog) come from `store::queue_stats`. They are not
-emitted automatically because that query scans retained rows. Poll it at an
-interval that suits you and publish the values as gauges.
+name and priority with due count and oldest due age per queue, outbox backlog)
+come from `store::queue_stats`. They are not emitted automatically because that
+query scans retained rows. Poll it at an interval that suits you and publish the
+values as gauges.
 
 ### Admin router
 
