@@ -13,6 +13,20 @@ in the core crate; this crate only calls them. Why each part works the way it
 does, and what to expect from it, is recorded in
 [Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md).
 
+This crate is available on GitHub but is not currently published to crates.io,
+pending feedback from users on its value and features. Take it and the core
+crate from the same git tag, so your application builds one copy of the core
+crate:
+
+```toml
+[dependencies]
+pg_task_scheduler = { git = "https://github.com/StaringSkyward/pg_task_scheduler", tag = "v0.1.0" }
+pg_task_scheduler_admin = { git = "https://github.com/StaringSkyward/pg_task_scheduler", tag = "v0.1.0" }
+```
+
+Feedback on whether it is useful, and what it should do, is welcome in
+[GitHub issues](https://github.com/StaringSkyward/pg_task_scheduler/issues).
+
 The UI reads the queue tables directly, so it needs migration `0003` (see the
 core README's [Database Schema](https://github.com/StaringSkyward/pg_task_scheduler#database-schema)) and workers from the same
 `pg_task_scheduler` version.
@@ -72,7 +86,7 @@ The `pg-task-admin` binary serves the same router with its own pool. It needs
 only database credentials, not your application's code.
 
 ```sh
-cargo install pg_task_scheduler_admin
+cargo install --locked --git https://github.com/StaringSkyward/pg_task_scheduler --tag v0.1.0 pg_task_scheduler_admin
 pg-task-admin hash-password <<< 'secret' # prints an argon2id PHC string
 pg-task-admin --config admin.toml        # runs the server
 ```

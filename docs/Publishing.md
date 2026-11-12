@@ -1,8 +1,9 @@
 # Publishing: Decisions and Release Steps
 
-This records the decisions made when preparing `pg_task_scheduler` and
-`pg_task_scheduler_admin` for crates.io, and what each one should look like
-from outside. It ends with the release steps.
+This records the decisions made when preparing `pg_task_scheduler` for
+crates.io, and what each one should look like from outside. The admin crate,
+`pg_task_scheduler_admin`, is held back for now (§2). The record ends with the
+release steps.
 
 Each entry has a source: **(user)** means the user decided it; **(call)** means
 it was a judgement call made during the work, open to change.
@@ -21,13 +22,35 @@ it was a judgement call made during the work, open to change.
 - **Expected behaviour:** `cargo package --list` for either crate shows no
   `example-app` files, and `cargo publish` refuses `example-app`.
 
-### 2. Packages contain only what a user builds or reads
+### 2. The admin crate is not published yet
+
+- **Source:** user.
+- **Decision:** `pg_task_scheduler_admin` has `publish = false`. It stays in the
+  workspace and is maintained with the core crate, and is available from
+  GitHub. Its crates.io metadata, `include` list and docs.rs settings stay, so
+  publishing it later needs only that line removed.
+- **Why:** Whether it is worth publishing waits on feedback from users about
+  its value and features. A published version cannot be deleted, only yanked,
+  and it would make the crate's API a semver commitment.
+- **Expected behaviour:**
+  - Both READMEs say the crate is on GitHub but not published, pending user
+    feedback, and invite that feedback in GitHub issues.
+  - Embedding it means taking both crates from the same git tag. That resolves
+    to one copy of the core crate; this was checked with `cargo tree` against a
+    local git URL. Taking the core crate from crates.io and the admin crate from
+    git builds two copies of the core crate.
+  - The standalone server installs with
+    `cargo install --locked --git https://github.com/StaringSkyward/pg_task_scheduler --tag v0.1.0 pg_task_scheduler_admin`.
+  - `cargo publish -p pg_task_scheduler_admin` refuses to run.
+
+### 3. Packages contain only what a user builds or reads
 
 - **Source:** call.
 - **Decision:** Each crate has an `include` list:
   - core: `src`, `migrations`, `README.md` and `LICENSE`;
-  - admin: `src`, `assets`, `templates`, `README.md` and `LICENSE`. The admin
-    crate's `LICENSE` is a symlink to the root one.
+  - admin, ready for when it is published: `src`, `assets`, `templates`,
+    `README.md` and `LICENSE`. The admin crate's `LICENSE` is a symlink to the
+    root one.
 
   Tests, `docs/`, CI config, compose files, the justfiles and
   `rust-toolchain.toml` stay in the repository.
@@ -36,7 +59,7 @@ it was a judgement call made during the work, open to change.
 - **Expected behaviour:** `cargo package --list` shows only those paths, plus
   the files Cargo generates.
 
-### 3. README links are absolute GitHub URLs
+### 4. README links are absolute GitHub URLs
 
 - **Source:** call.
 - **Decision:** Links from either README to other files in the repository use
@@ -49,17 +72,18 @@ it was a judgement call made during the work, open to change.
   only once the repository is public. Links into `docs/` show the latest `main`,
   not the published version. The migrations link 404s until the tag is pushed.
 
-### 4. docs.rs builds every feature, with feature badges
+### 5. docs.rs builds every feature, with feature badges
 
 - **Source:** call.
-- **Decision:** Both crates set `[package.metadata.docs.rs] all-features = true`.
-  The core crate has `#![cfg_attr(docsrs, feature(doc_cfg))]`.
+- **Decision:** Both crates set `[package.metadata.docs.rs] all-features = true`
+  (the admin crate's takes effect once it is published). The core crate has
+  `#![cfg_attr(docsrs, feature(doc_cfg))]`.
 - **Why:** docs.rs builds only default features otherwise, and everything behind
   `cron` (`jobs`, `CronExpression`, `CreateJob`, ...) would be missing.
 - **Expected behaviour:** docs.rs shows the `cron` items, each marked as needing
   that feature.
 
-### 5. Every public item is documented
+### 6. Every public item is documented
 
 - **Source:** user.
 - **Decision:** Both crates have `#![warn(missing_docs)]`. CI runs clippy with
@@ -67,21 +91,22 @@ it was a judgement call made during the work, open to change.
 - **Expected behaviour:** `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --all-features` passes for both crates.
 
-### 6. The admin crate's dependencies are not exact-pinned
+### 7. The admin crate's dependencies are not exact-pinned
 
 - **Source:** call.
 - **Decision:** The `=x.y.z` requirements (argon2, askama, base64,
   serde_urlencoded, toml, tracing-subscriber) became ordinary caret requirements
   at the same versions.
 - **Why:** An application that embeds the admin router resolves one version of
-  each crate for its whole dependency tree. An exact pin in a library forces
-  that version on the application, so resolution fails if any other dependency
+  each crate for its whole dependency tree. This is true whether the admin crate
+  comes from git or from crates.io. An exact pin in a library forces that
+  version on the application, so resolution fails if any other dependency
   needs a newer patch release.
 - **Expected behaviour:** `Cargo.lock` is unchanged, so this repository builds
-  the same. `cargo install --locked pg_task_scheduler_admin` uses the published
+  the same. `cargo install --locked --git ...` uses the repository's
   lockfile.
 
-### 7. `CancellationToken` is re-exported
+### 8. `CancellationToken` is re-exported
 
 - **Source:** call.
 - **Decision:** `pg_task_scheduler::CancellationToken` re-exports
@@ -90,7 +115,7 @@ it was a judgement call made during the work, open to change.
   `TaskContext::cancellation` is one, so every user needs the type.
 - **Expected behaviour:** A worker needs no direct `tokio-util` dependency.
 
-### 8. `runtime::Registry` and `runtime::Handler` are private
+### 9. `runtime::Registry` and `runtime::Handler` are private
 
 - **Source:** call.
 - **Decision:** They are no longer exported.
@@ -98,7 +123,7 @@ it was a judgement call made during the work, open to change.
   `SchedulerBuilder::register` and `register_task`.
 - **Expected behaviour:** No change for any user of the builder.
 
-### 9. Minimum Rust version is 1.88
+### 10. Minimum Rust version is 1.88
 
 - **Source:** call.
 - **Decision:** `rust-version = "1.88"`, set once in `[workspace.package]`.
@@ -109,7 +134,7 @@ it was a judgement call made during the work, open to change.
   CI builds only on nightly, so a newer language feature could raise the real
   minimum without anyone noticing.
 
-### 10. First release is plain `0.1.0`
+### 11. First release is plain `0.1.0`
 
 - **Source:** call.
 - **Decision:** Plain `0.1.0`, with no `-alpha` suffix. The README says the
@@ -117,7 +142,7 @@ it was a judgement call made during the work, open to change.
 - **Why:** Under Cargo's semver rules, any 0.x release may break the API, and
   `cargo add` skips pre-release versions by default.
 
-### 11. The README describes the first release, not its history
+### 12. The README describes the first release, not its history
 
 - **Source:** call.
 - **Decision:** These notes came out of the READMEs, because no published
@@ -131,14 +156,18 @@ it was a judgement call made during the work, open to change.
 
 ## Release steps
 
-1. Check both crates package and build from their packaged sources:
-   `cargo publish --dry-run --workspace`.
-2. Publish core, then admin, which depends on core's published version:
-   `cargo publish -p pg_task_scheduler`, then
-   `cargo publish -p pg_task_scheduler_admin`.
-3. Tag the release and push the tag, which the README's migrations link points
-   at: `git tag v0.1.0 && git push origin v0.1.0`.
+1. Check that the core crate packages and builds from its packaged sources:
+   `cargo publish --dry-run -p pg_task_scheduler`.
+2. Publish it: `cargo publish -p pg_task_scheduler`.
+3. Tag the release and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+   The README's migrations link and both READMEs' git instructions for the
+   admin crate point at it.
 4. For the next release, bump:
    - both crates' `version`;
    - the admin crate's `pg_task_scheduler` dependency version;
-   - the tag in the README's migrations link.
+   - every `v0.1.0` in `README.md` and `admin/README.md`.
+
+To publish the admin crate later:
+1. Remove `publish = false` from `admin/Cargo.toml`.
+2. Switch both READMEs' git instructions to crates.io ones.
+3. Publish it after the core crate.

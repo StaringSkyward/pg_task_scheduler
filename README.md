@@ -41,7 +41,8 @@ workers and the admin UI.
 See [Concurrency Model](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/Concurrency.md) for races, fencing, and
 scaling, and [Scheduler Design](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/SchedulerDesign.md) for the data model
 and state machine. The optional admin UI is the separate
-[`pg_task_scheduler_admin`](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/admin/README.md) crate;
+[`pg_task_scheduler_admin`](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/admin/README.md) crate, available on GitHub
+(see [Admin UI](#admin-ui));
 [Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md) records what it, cancel, pause and the
 worker registry do, and why.
 
@@ -552,6 +553,23 @@ The core crate has no HTTP dependencies. The admin UI, its JSON API and the
 standalone `pg-task-admin` server are in the separate `pg_task_scheduler_admin`
 crate: see [admin/README.md](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/admin/README.md) for setup and
 [Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md) for what it does and why.
+
+The admin crate is available on GitHub but is not currently published to
+crates.io, pending feedback from users on its value and features. To embed it,
+take both crates from the same git tag, so the application builds one copy of
+the core crate:
+
+```toml
+[dependencies]
+pg_task_scheduler = { git = "https://github.com/StaringSkyward/pg_task_scheduler", tag = "v0.1.0" }
+pg_task_scheduler_admin = { git = "https://github.com/StaringSkyward/pg_task_scheduler", tag = "v0.1.0" }
+```
+
+To install the standalone server:
+`cargo install --locked --git https://github.com/StaringSkyward/pg_task_scheduler --tag v0.1.0 pg_task_scheduler_admin`.
+
+Feedback on whether the admin UI is useful, and what it should do, is welcome
+in [GitHub issues](https://github.com/StaringSkyward/pg_task_scheduler/issues).
 
 ## Recurring Schedules
 
