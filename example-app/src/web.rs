@@ -188,8 +188,11 @@ pub fn parse_order_no(input: &str) -> Option<u32> {
 
 #[derive(Deserialize)]
 struct ReceiptForm {
+    // Missing fields default to "", so they take the red-banner path.
+    #[serde(default)]
     order: String,
     /// `same` or `changed`.
+    #[serde(default)]
     variant: String,
 }
 
