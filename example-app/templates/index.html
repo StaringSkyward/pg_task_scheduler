@@ -46,7 +46,7 @@
 {% if let Some(flash) = flash %}
 {% if let Some(kind) = flash.kind %}
 {% if let Some(text) = flash.text %}
-<div class="banner {{ kind.css() }}">{{ text }} <a href="{{ flash.link() }}">Watch in the admin UI</a></div>
+<div class="banner {{ kind.css() }}">{{ text }}{% if kind.watchable() %} <a href="{{ flash.link() }}">Watch in the admin UI</a>{% endif %}</div>
 {% endif %}
 {% endif %}
 {% endif %}
@@ -130,7 +130,7 @@
         <tr><th>topic</th><th>for</th><th>state</th></tr>
         {% for m in panel.outbox %}
         <tr><td>{{ m.topic }}</td><td>{% if let Some(id) = m.order_id %}order #{{ id }}{% endif %}</td>
-        {% if let Some(t) = m.published_at %}<td class="published">published {{ t.format("%H:%M:%S") }}</td>{% else %}<td class="pending">pending</td>{% endif %}</tr>
+        {% if let Some(t) = m.published_at %}<td class="published">published {{ t.format("%H:%M:%S") }} UTC</td>{% else %}<td class="pending">pending</td>{% endif %}</tr>
         {% endfor %}
       </table>
     </div>

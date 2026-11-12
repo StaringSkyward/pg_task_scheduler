@@ -49,7 +49,7 @@ repository), the entry says so. Each entry has a source:
   `.env`. Every task fakes its work with sleeps and log lines.
 - **Why:** No script or extra binary is needed, and nothing can leave the
   machine.
-- **Expected behaviour:** No handler makes a network call. Each button answers
+- **Expected behaviour:** No handler makes an external call. Each button answers
   `303 See Other` back to `/`.
 
 ### 1.3 The task mix and the marking of deliberate failures
@@ -218,7 +218,9 @@ repository), the entry says so. Each entry has a source:
 - **Decision:** Each of 40 steps (about 4 s each) waits on `ctx.cancellation`
   alongside its sleep and returns `TaskError::interrupted()` when it fires. A
   released or replayed import restarts at batch 1.
-- **Why:** A long task must yield to a cancel or a shutdown. Making it
+- **Why:** An operator cancel never fires the token: the worker sees it at its
+  next heartbeat (every 5 s here) and drops the handler. The `select!` is for
+  shutdown, so the import releases promptly instead of being killed. Making it
   resumable is a non-goal, and a comment says real long tasks keep durable
   progress keyed by `task_key`.
 - **Expected behaviour:** After `docker compose stop worker-2` mid-import, the
@@ -334,7 +336,7 @@ repository), the entry says so. Each entry has a source:
 - **Source:** spec "Web role" (call).
 - **Decision:** A loop every 2 s takes unpublished `queue_outbox` rows created
   at least 3 s ago (oldest first, up to 100), logs each as
-  `delivered orders order-placed for order <id> …` and sets `published_at`, in one
+  `delivered order-placed for order <id> (command_key …)` and sets `published_at`, in one
   transaction with `FOR UPDATE SKIP LOCKED`. The outbox command's `command_key`
   is the JSON of `(task_key, "order-placed")`.
 - **Why:** `web` runs as one instance, and the 3 s delay lets the page show

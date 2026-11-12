@@ -36,9 +36,12 @@ docker compose up
 Edit `.env` first if you like. It holds the database password, the admin login
 (`ADMIN_USER` and `ADMIN_PASSWORD`, `admin` and `change-me` by default) and the
 log filter.
+If you change `POSTGRES_PASSWORD` after the first run, reset with
+`docker compose down -v`, because the database volume keeps the old password.
 
 The first run compiles the app inside Docker, which takes several minutes.
-Later runs reuse the build. Wait for `web` to log `demo at http://localhost:8080`
+Later runs reuse the build. After pulling new code, run
+`docker compose up --build`, because a plain `up` reuses the old image. Wait for `web` to log `demo at http://localhost:8080`
 and for both workers to log `worker started`.
 
 Open <http://localhost:8080>. The admin UI is at <http://localhost:8080/admin>.
@@ -66,7 +69,7 @@ task's page. It runs for 2 to 3 minutes in 40 steps and logs each one:
 docker compose logs -f worker-1 worker-2
 ```
 
-- *Cancel and replay.* On the task page (or the overview's Running list),
+- *Cancel and replay.* On the task page (reach it from the Running list),
   cancel it with a reason. The cancel is seen at the worker's next heartbeat,
   every 5 seconds here, so the batch logs stop within about 5 seconds (often sooner). Then
   replay it from the cancelled task's page. It runs again from batch 1. A

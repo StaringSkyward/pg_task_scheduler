@@ -66,6 +66,11 @@ impl Flash {
 }
 
 impl FlashKind {
+    /// Only banners about a task that exists link to the admin UI.
+    fn watchable(self) -> bool {
+        matches!(self, FlashKind::Enqueued | FlashKind::Existing)
+    }
+
     fn css(self) -> &'static str {
         match self {
             FlashKind::Enqueued => "enqueued",
@@ -371,6 +376,15 @@ mod tests {
         let html = page.render().unwrap();
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("<script>alert(1)"));
-        assert!(html.contains(r#"href="/admin""#));
+        assert!(!html.contains("Watch in the admin UI"));
+    }
+
+    #[test]
+    fn enqueued_banner_links_to_the_admin_ui() {
+        let page = IndexPage {
+            flash: Some(Flash::new(FlashKind::Enqueued, "ok".into(), None)),
+            panel: None,
+        };
+        assert!(page.render().unwrap().contains(r#"href="/admin""#));
     }
 }

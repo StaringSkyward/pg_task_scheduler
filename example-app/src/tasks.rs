@@ -84,8 +84,8 @@ pub fn scheduler(pool: Pool) -> Result<Scheduler<Pool>, Box<dyn std::error::Erro
     Ok(Scheduler::builder(pool.clone())
         .queue("default", NonZeroUsize::new(4).unwrap())?
         .queue("bulk", NonZeroUsize::new(1).unwrap())?
-        // A handler sees an operator's cancel at its next heartbeat, so a short
-        // heartbeat makes cancelling a running import visibly stop it.
+        // The worker sees an operator's cancel at its next heartbeat and drops
+        // the handler, so a short heartbeat makes a cancel visibly stop an import.
         .lease_duration(Duration::from_secs(30))
         .heartbeat_interval(Duration::from_secs(5))
         .register_task::<SendEmail, _, _>(send_email)?
@@ -96,10 +96,7 @@ pub fn scheduler(pool: Pool) -> Result<Scheduler<Pool>, Box<dyn std::error::Erro
         .build()?)
 }
 
-async fn send_email(
-    _ctx: pg_task_scheduler::TaskContext,
-    args: EmailArgs,
-) -> Result<(), TaskError> {
+async fn send_email(_ctx: TaskContext, args: EmailArgs) -> Result<(), TaskError> {
     tokio::time::sleep(Duration::from_millis(random_between(1000, 3000))).await;
     tracing::info!("pretend-sent \"{}\" to {}", args.subject, args.to);
     Ok(())
@@ -107,12 +104,13 @@ async fn send_email(
 
 const IMPORT_STEPS: u32 = 40;
 
-async fn bulk_import(
-    ctx: pg_task_scheduler::TaskContext,
-    args: BulkImportArgs,
-) -> Result<(), TaskError> {
+async fn bulk_import(ctx: TaskContext, args: BulkImportArgs) -> Result<(), TaskError> {
     // A released or replayed import restarts at batch 1. Real long tasks keep
     // their progress somewhere durable, keyed by `task_key`.
+    //
+    // An operator cancel never fires `ctx.cancellation`: the worker drops this
+    // future at its next heartbeat. The `select!` is for shutdown, so the import
+    // releases promptly instead of being killed.
     for i in 1..=IMPORT_STEPS {
         tokio::select! {
             _ = ctx.cancellation.cancelled() => return Err(TaskError::interrupted()),
@@ -128,10 +126,8 @@ async fn bulk_import(
     Ok(())
 }
 
-async fn flaky_demo(
-    _ctx: pg_task_scheduler::TaskContext,
-    _args: FlakyArgs,
-) -> Result<(), TaskError> {
+/// Fails on purpose about 70% of the time, so the demo has retries to show.
+async fn flaky_demo(_ctx: TaskContext, _args: FlakyArgs) -> Result<(), TaskError> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     if random_between(1, 100) <= 70 {
         return Err(TaskError::retry(
@@ -141,7 +137,7 @@ async fn flaky_demo(
     Ok(())
 }
 
-async fn digest(_ctx: pg_task_scheduler::TaskContext, _args: DigestArgs) -> Result<(), TaskError> {
+async fn digest(_ctx: TaskContext, _args: DigestArgs) -> Result<(), TaskError> {
     tokio::time::sleep(Duration::from_secs(1)).await;
     tracing::info!("pretend-built digest");
     Ok(())
