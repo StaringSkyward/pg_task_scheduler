@@ -177,6 +177,8 @@ pub async fn run(
     )?;
     jobs::ensure_job(&mut *app_pool.get().await?, job).await?;
 
+    // Fast refresh and a short cache, so the demo shows batches draining. The
+    // defaults (10 s refresh, 5 s cache) suit production.
     let admin = router(
         admin_pool,
         AdminConfig {
