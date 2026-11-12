@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "admin"]
+exclude = ["example-app"]
 
 [package]
 name = "pg_task_scheduler"

@@ -1,0 +1,7 @@
+target
+example-app/target
+.git
+.superpowers
+docs
+.env
+example-app/.env

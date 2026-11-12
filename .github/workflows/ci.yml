@@ -75,3 +75,9 @@ jobs:
       - name: Test (all features)
         run: cargo test --workspace --all-features
 
+      - name: Example app
+        run: |
+          cargo +nightly fmt --manifest-path example-app/Cargo.toml -- --check
+          cargo clippy --manifest-path example-app/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path example-app/Cargo.toml
+
