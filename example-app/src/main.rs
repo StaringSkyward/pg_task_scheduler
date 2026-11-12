@@ -1,4 +1,5 @@
 mod tasks;
+mod web;
 
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -54,12 +55,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     token.cancel();
                 }
             });
+            tracing::info!("worker started: queues default(4), bulk(1)");
             scheduler.run_until_shutdown(token).await?;
+            tracing::info!("worker stopped cleanly");
             Ok(())
         }
         Some("web") => {
-            eprintln!("web role not implemented yet");
-            std::process::exit(1);
+            let url = required_env("DATABASE_URL");
+            web::run(
+                pool(&url, 4),
+                pool(&url, 4),
+                required_env("ADMIN_USER"),
+                required_env("ADMIN_PASSWORD"),
+            )
+            .await
         }
         _ => {
             eprintln!("usage: example-app <worker|web>");

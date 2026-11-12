@@ -25,6 +25,14 @@ services:
       retries: 60
   worker-1: { <<: *app, command: ["worker"], hostname: worker-1, stop_grace_period: 35s }
   worker-2: { <<: *app, command: ["worker"], hostname: worker-2, stop_grace_period: 35s }
+  web:
+    <<: *app
+    command: ["web"]
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      <<: *app-env
+      ADMIN_USER: ${ADMIN_USER:?set ADMIN_USER in example-app/.env (see README)}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in example-app/.env (see README)}
 
 volumes:
   pgdata:

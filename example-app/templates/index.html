@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pg_task_scheduler demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; font-size: 15px; max-width: 880px; margin: 0 auto; padding: 16px; color: #222; }
+  a { color: #2563eb; }
+  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #ccc; padding-bottom: 8px; margin-bottom: 12px; }
+  .banner { border: 1px solid; padding: 8px; border-radius: 4px; margin-bottom: 12px; }
+  .banner.enqueued { background: #dcfce7; border-color: #86efac; }
+  .banner.existing { background: #dbeafe; border-color: #93c5fd; }
+  .banner.conflict { background: #fef3c7; border-color: #fcd34d; }
+  .banner.error { background: #fee2e2; border-color: #fca5a5; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+  .card { border: 1px solid #ccc; border-radius: 6px; padding: 10px; }
+  .card.flaky { border: 2px dashed #f59e0b; background: #fffbeb; }
+  .card.info { background: #f8fafc; }
+  .card p { margin: 6px 0; color: #444; }
+  .card .try { color: #666; font-size: 13px; }
+  .meta { font-size: 12px; color: #666; }
+  .badge { font-size: 11px; background: #f59e0b; color: #fff; padding: 1px 5px; border-radius: 3px; }
+  footer { margin-top: 12px; font-size: 13px; color: #666; }
+</style>
+</head>
+<body>
+<header>
+  <strong>pg_task_scheduler demo</strong>
+  <a href="/admin">Open admin UI &rarr;</a>
+</header>
+
+{% if let Some(flash) = flash %}
+{% if let Some(kind) = flash.kind %}
+{% if let Some(text) = flash.text %}
+<div class="banner {{ kind.css() }}">{{ text }} <a href="{{ flash.link() }}">Watch in the admin UI</a></div>
+{% endif %}
+{% endif %}
+{% endif %}
+
+<h2>Watch work flow</h2>
+<p>Each button enqueues simulated work. Nothing leaves your machine.</p>
+
+<div class="grid">
+  <form class="card" method="post" action="/enqueue/emails">
+    <strong>Send emails</strong> <span class="meta">queue: default</span>
+    <p>Short tasks, 1&ndash;3 s each. Pretend-sends to user-N@example.com.</p>
+    <p class="try"><em>Try:</em> open the overview right away and watch Queued drop and Done climb over about half a minute.</p>
+    <button>Send 100 emails</button>
+  </form>
+
+  <form class="card" method="post" action="/enqueue/bulk-import">
+    <strong>Bulk import</strong> <span class="meta">queue: bulk</span>
+    <p>A long task, about 2&ndash;3 minutes, in steps. Logs progress and stops cleanly when cancelled.</p>
+    <p class="try"><em>Try:</em> cancel it from Running and then replay it, or stop a worker container mid-run and watch another worker pick it up.</p>
+    <button>Start bulk import</button>
+  </form>
+
+  <form class="card flaky" method="post" action="/enqueue/flaky">
+    <strong>Flaky task</strong> <span class="badge">FAILS ON PURPOSE</span>
+    <p>This task fails on purpose, for the demo. It retries with backoff, and some runs end up dead.</p>
+    <p class="try"><em>Try:</em> the Failure groups on the overview, then "Replay all&hellip;".</p>
+    <button>Enqueue 10 flaky tasks</button>
+  </form>
+
+  <div class="card info">
+    <strong>Scheduled digest</strong> <span class="meta">cron: */5 * * * *</span>
+    <p>Runs every 5 minutes on its own, with no button. Created at startup.</p>
+    <p class="try"><em>Try:</em> find its runs under Completed.</p>
+  </div>
+</div>
+
+<footer>The admin login is <code>ADMIN_USER</code> / <code>ADMIN_PASSWORD</code> in your <code>.env</code>; see example-app/README.md.</footer>
+</body>
+</html>
