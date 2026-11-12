@@ -4,7 +4,11 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use pg_task_scheduler::{Scheduler, Task, TaskError};
+use diesel::sql_types::{Integer, Text};
+use diesel_async::{AsyncConnection, RunQueryDsl};
+use pg_task_scheduler::{
+    OutboxCommand, Scheduler, SchedulerError, Task, TaskContext, TaskError, store,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -58,12 +62,9 @@ impl Task for Digest {
     type Args = DigestArgs;
 }
 
-// Unused until the place-order handler and the web role land.
-#[allow(dead_code)]
 pub struct PlaceOrder;
 
 #[derive(Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct OrderArgs {
     pub amount_cents: i32,
 }
@@ -80,7 +81,7 @@ pub fn random_between(min: u64, max: u64) -> u64 {
 
 /// The worker role's scheduler: queues, intervals and handlers.
 pub fn scheduler(pool: Pool) -> Result<Scheduler<Pool>, Box<dyn std::error::Error>> {
-    Ok(Scheduler::builder(pool)
+    Ok(Scheduler::builder(pool.clone())
         .queue("default", NonZeroUsize::new(4).unwrap())?
         .queue("bulk", NonZeroUsize::new(1).unwrap())?
         // A handler sees an operator's cancel at its next heartbeat, so a short
@@ -91,6 +92,7 @@ pub fn scheduler(pool: Pool) -> Result<Scheduler<Pool>, Box<dyn std::error::Erro
         .register_task::<BulkImport, _, _>(bulk_import)?
         .register_task::<FlakyDemo, _, _>(flaky_demo)?
         .register_task::<Digest, _, _>(digest)?
+        .register_task::<PlaceOrder, _, _>(move |ctx, args| place_order(pool.clone(), ctx, args))?
         .build()?)
 }
 
@@ -143,4 +145,68 @@ async fn digest(_ctx: pg_task_scheduler::TaskContext, _args: DigestArgs) -> Resu
     tokio::time::sleep(Duration::from_secs(1)).await;
     tracing::info!("pretend-built digest");
     Ok(())
+}
+
+/// What can end `place_order`'s transaction early. Anything but `Crash` is a
+/// real error.
+#[derive(Debug, thiserror::Error)]
+enum PlaceOrderError {
+    #[error("simulated crash")]
+    Crash,
+    #[error(transparent)]
+    Db(#[from] diesel::result::Error),
+    #[error(transparent)]
+    Scheduler(#[from] SchedulerError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(diesel::QueryableByName)]
+struct NewOrder {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+}
+
+/// Exactly-once database work: the order row, the outbox message and the task's
+/// completion commit in one transaction, so all happen or none do.
+///
+/// The first attempt crashes on purpose, right after the INSERT. That rolls the
+/// row back, the task retries, and the second attempt leaves exactly one row.
+/// `demo_orders` deliberately has no unique key on `task_key`: only this
+/// transaction keeps it to one row per order.
+async fn place_order(pool: Pool, ctx: TaskContext, args: OrderArgs) -> Result<(), TaskError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| TaskError::retry(e.to_string()))?;
+    conn.transaction::<_, PlaceOrderError, _>(async |c| {
+        // Lock and validate ownership first; the reaper skips a locked row.
+        store::lock_owned(c, &ctx.lease).await?;
+        let order = diesel::sql_query(
+            "INSERT INTO demo_orders (task_key, amount_cents) VALUES ($1, $2) RETURNING id",
+        )
+        .bind::<Text, _>(ctx.task_key.as_str())
+        .bind::<Integer, _>(args.amount_cents)
+        .get_result::<NewOrder>(c)
+        .await?;
+        if ctx.lease.attempt_no == 1 {
+            return Err(PlaceOrderError::Crash);
+        }
+        let command = OutboxCommand {
+            effect_name: "order-placed".into(),
+            command_key: serde_json::to_string(&(ctx.task_key.as_str(), "order-placed"))?,
+            topic: "orders".into(),
+            payload: serde_json::json!({"order_id": order.id, "amount_cents": args.amount_cents}),
+        };
+        store::complete_with_outbox(c, &ctx.lease, &command).await?;
+        Ok(())
+    })
+    .await
+    // Map explicitly: `?` into `TaskError` would make the failure permanent.
+    .map_err(|e| match e {
+        PlaceOrderError::Crash => {
+            TaskError::retry("simulated crash after writing the order (demo: fails on purpose)")
+        }
+        other => TaskError::retry(other.to_string()),
+    })
 }

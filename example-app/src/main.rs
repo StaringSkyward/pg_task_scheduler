@@ -1,3 +1,5 @@
+mod outbox;
+mod panel;
 mod tasks;
 mod web;
 

@@ -22,6 +22,18 @@
   .card .try { color: #666; font-size: 13px; }
   .meta { font-size: 12px; color: #666; }
   .badge { font-size: 11px; background: #f59e0b; color: #fff; padding: 1px 5px; border-radius: 3px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  @media (max-width: 600px) { .grid3 { grid-template-columns: 1fr; } }
+  .card .small { font-size: 12px; color: #666; }
+  .card .deliberate { font-size: 12px; background: #fffbeb; border: 1px dashed #f59e0b; padding: 4px; }
+  .card button { margin-top: 4px; }
+  .panel { margin-top: 12px; border: 1px solid #ccc; border-radius: 6px; padding: 10px; background: #f8fafc; }
+  .panel .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 12px; margin-top: 6px; }
+  @media (max-width: 600px) { .panel .cols { grid-template-columns: 1fr; } }
+  .panel table { width: 100%; border-collapse: collapse; }
+  .panel th { text-align: left; color: #666; }
+  .pending { color: #b45309; }
+  .published { color: #15803d; }
   footer { margin-top: 12px; font-size: 13px; color: #666; }
 </style>
 </head>
@@ -69,6 +81,63 @@
     <p>Runs every 5 minutes on its own, with no button. Created at startup.</p>
     <p class="try"><em>Try:</em> find its runs under Completed.</p>
   </div>
+</div>
+
+<h2>Guarantees you can check</h2>
+<p>What makes a Postgres-backed queue worth having. Each card explains one guarantee and lets you prove it.</p>
+
+<div class="grid3">
+  <form class="card" method="post" action="/enqueue/receipt">
+    <strong>Duplicate-safe enqueue</strong>
+    <p>Every task has a key you choose. Enqueue the same key again (a retried request, a double-click) and you get the <em>same</em> task back, not a second one. The same key with a different payload is rejected.</p>
+    <p class="small"><label>Order <input type="number" name="order" min="1" max="999999" value="1001" style="width: 80px;"></label> &rarr; key <code>receipt:order-&lt;n&gt;</code></p>
+    <button name="variant" value="same">Send receipt</button>
+    <button name="variant" value="changed">Same key, different subject</button>
+    <p class="small"><em>Try:</em> press "Send receipt" twice; the banner shows the same task id. Then press the other button.</p>
+  </form>
+
+  <form class="card" method="post" action="/enqueue/orders">
+    <strong>Exactly-once database work</strong> <span class="meta">task: place-order</span>
+    <p>The order row and the task's completion commit in <em>one</em> transaction: both happen or neither does.</p>
+    <p class="deliberate"><span class="badge">FAILS ON PURPOSE</span> The first attempt crashes right after writing the row. The write rolls back, the task retries, and you still get exactly one row.</p>
+    <button>Place 5 orders</button>
+    <p class="small"><em>Try:</em> each order shows 2 attempts in the admin UI, but 1 row below.</p>
+  </form>
+
+  <div class="card">
+    <strong>Transactional outbox</strong>
+    <p>Completing a placed order also writes an <code>order-placed</code> message to <code>queue_outbox</code>, in the same transaction, so a message exists only if the order does. A relay in the app delivers each message a few seconds later (here it just logs it) and marks it published.</p>
+    <p class="small"><em>Try:</em> place orders, then reload: messages go from <em>pending</em> to <em>published</em>. The crashed first attempts left no messages.</p>
+  </div>
+</div>
+
+<div class="panel">
+  <div style="display: flex; justify-content: space-between;"><strong>In the database</strong> <a href="/" class="small">reload</a></div>
+  {% if let Some(panel) = panel %}
+  <div class="cols">
+    <div>
+      <div class="small">demo_orders: {{ panel.order_rows }} rows from {{ panel.orders_done }} completed place-order tasks ({{ panel.order_attempts }} attempts)</div>
+      <table>
+        <tr><th>order</th><th>task</th><th>attempts</th></tr>
+        {% for o in panel.orders %}
+        <tr><td>#{{ o.order_id }}</td><td>{% if let Some(id) = o.task_id %}<a href="/admin/tasks/{{ id }}">{{ id }}</a>{% endif %}</td><td>{% if let Some(a) = o.attempts %}{{ a }}{% endif %}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+    <div>
+      <div class="small">queue_outbox: newest messages</div>
+      <table>
+        <tr><th>topic</th><th>for</th><th>state</th></tr>
+        {% for m in panel.outbox %}
+        <tr><td>{{ m.topic }}</td><td>{% if let Some(id) = m.order_id %}order #{{ id }}{% endif %}</td>
+        {% if let Some(t) = m.published_at %}<td class="published">published {{ t.format("%H:%M:%S") }}</td>{% else %}<td class="pending">pending</td>{% endif %}</tr>
+        {% endfor %}
+      </table>
+    </div>
+  </div>
+  {% else %}
+  <p class="small">database unavailable</p>
+  {% endif %}
 </div>
 
 <footer>The admin login is <code>ADMIN_USER</code> / <code>ADMIN_PASSWORD</code> in your <code>.env</code>; see example-app/README.md.</footer>
