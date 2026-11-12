@@ -73,7 +73,9 @@ repository), the entry says so. Each entry has a source:
   readable labels (the scheduler's label defaults to `HOSTNAME`), and the README
   can say `docker compose stop worker-2`.
 - **Expected behaviour:** The Workers page lists `worker-1` and `worker-2`.
-  Stopping one shows it going lost, and its running tasks move to the other.
+  A cleanly stopped worker deletes its registry row, so it
+  disappears from the page (a killed one would read as lost), and its running
+  tasks move to the other.
 
 ### 1.5 Layout A, plus a Guarantees section and a database panel
 
