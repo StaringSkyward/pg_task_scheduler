@@ -1,0 +1,5 @@
+# claim_loop counts its worker's claims; any other test's NOTIFY on the shared database wakes
+# that worker, so each of its tests must run with nothing else in flight.
+[[profile.default.overrides]]
+filter = 'binary(claim_loop)'
+threads-required = 'num-test-threads'
