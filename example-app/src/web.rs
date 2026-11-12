@@ -157,10 +157,15 @@ async fn enqueue_bulk_import(pool: &Pool) -> Result<Flash, BoxError> {
 
 async fn enqueue_flaky(pool: &Pool) -> Result<Flash, BoxError> {
     let mut conn = pool.get().await?;
-    for _ in 0..10 {
-        let key = TaskKey::try_from(format!("flaky:{}", Uuid::new_v4()))?;
-        enqueue::<FlakyDemo>(&mut conn, key, FlakyArgs {}, EnqueueOptions::immediate()).await?;
-    }
+    // One transaction: all 10 tasks exist, or none do.
+    conn.transaction::<_, BoxError, _>(async |c| {
+        for _ in 0..10 {
+            let key = TaskKey::try_from(format!("flaky:{}", Uuid::new_v4()))?;
+            enqueue::<FlakyDemo>(c, key, FlakyArgs {}, EnqueueOptions::immediate()).await?;
+        }
+        Ok(())
+    })
+    .await?;
     let text = format!(
         "Enqueued 10 \"{}\" tasks (they fail on purpose).",
         FlakyDemo::NAME
@@ -170,13 +175,18 @@ async fn enqueue_flaky(pool: &Pool) -> Result<Flash, BoxError> {
 
 async fn enqueue_orders(pool: &Pool) -> Result<Flash, BoxError> {
     let mut conn = pool.get().await?;
-    for _ in 0..5 {
-        let key = TaskKey::try_from(format!("order:{}", Uuid::new_v4()))?;
-        let args = OrderArgs {
-            amount_cents: random_between(500, 5000) as i32,
-        };
-        enqueue::<PlaceOrder>(&mut conn, key, args, EnqueueOptions::immediate()).await?;
-    }
+    // One transaction: all 5 tasks exist, or none do.
+    conn.transaction::<_, BoxError, _>(async |c| {
+        for _ in 0..5 {
+            let key = TaskKey::try_from(format!("order:{}", Uuid::new_v4()))?;
+            let args = OrderArgs {
+                amount_cents: random_between(500, 5000) as i32,
+            };
+            enqueue::<PlaceOrder>(c, key, args, EnqueueOptions::immediate()).await?;
+        }
+        Ok(())
+    })
+    .await?;
     let text = format!("Enqueued 5 \"{}\" tasks.", PlaceOrder::NAME);
     Ok(Flash::new(FlashKind::Enqueued, text, None))
 }

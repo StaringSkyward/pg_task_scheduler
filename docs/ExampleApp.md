@@ -264,12 +264,16 @@ repository), the entry says so. Each entry has a source:
 - **Decision:** Each button enqueues and answers `303` to `/?kind=…&text=…&task=…`.
   The banner's link is derived from `task` alone: the task page for a single
   task, `/admin` for a batch. Only the green and blue banners carry it; the
-  amber and red ones have nothing to watch (§6.4).
+  amber and red ones have nothing to watch (§6.4). Each batch button (emails,
+  flaky, orders) enqueues its whole batch in one transaction.
 - **Why:** Reloading never re-submits. A crafted URL cannot make the banner link
-  anywhere else.
+  anywhere else. Without the transaction, a database failure partway through a
+  batch would show the red banner while the tasks already written still ran,
+  and pressing again would break the walkthrough's counts (PR review 001).
 - **Expected behaviour:** Green banner after an enqueue; blue for an existing
   key (`inserted = false`); amber for an idempotency conflict; red for bad input
-  or an error. A malformed query shows no banner, not a 400. Banner text is
+  or an error; after a red banner from a batch button, none of that batch was
+  enqueued. A malformed query shows no banner, not a 400. Banner text is
   escaped (`web::tests::index_page_escapes_flash_text`), and only an enqueued or
   existing banner links to the admin UI
   (`web::tests::enqueued_banner_links_to_the_admin_ui`).
@@ -394,8 +398,9 @@ repository), the entry says so. Each entry has a source:
 - **Source:** Ledger ruling (final review).
 - **Decision:** The whole-branch review found one Important issue and some
   polish. The fix wave took the Important one and the polish a template reader
-  would copy. It left out an inconsistency in which enqueue routes use a
-  transaction, and cosmetic items.
+  would copy, and left out cosmetic items. It also left out one nit: only the
+  email button enqueued its batch in a transaction. The PR review showed that
+  nit's real effect, and it is fixed (§4.1).
   - CI runs the example's clippy and tests with `--locked`, as the Dockerfile
     builds.
   - The comments say how an operator cancel really works: the worker sees it at
