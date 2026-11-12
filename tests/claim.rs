@@ -5,11 +5,17 @@ use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::LockToken;
+use pg_task_scheduler::Priority;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store;
-use pg_task_scheduler::{
-    EnqueueOptions, LockToken, Priority, QueueName, Task, TaskId, TaskKey, TaskStatus, WorkerId,
-    enqueue,
-};
 use serde_json::json;
 
 struct Email;

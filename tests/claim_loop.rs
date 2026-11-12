@@ -2,12 +2,17 @@
 //! shared binary would wake this worker and inflate the claim count.
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use common::TestDb;
 use diesel_async::SimpleAsyncConnection;
-use pg_task_scheduler::{EnqueueOptions, Scheduler, Task, TaskKey, enqueue};
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::enqueue;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 

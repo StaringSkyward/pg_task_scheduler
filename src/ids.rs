@@ -1,5 +1,6 @@
 use diesel_derive_newtype::DieselNewType;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use uuid::Uuid;
 
 /// Maximum length (in `char`s) of a [`TaskName`], [`TaskKey`], [`QueueName`] or [`WorkerId`].
@@ -129,8 +130,13 @@ impl WorkerId {
 
 #[cfg(test)]
 mod identifier_tests {
-    use super::{IdentifierError, QueueName, TaskKey, TaskName, WorkerId};
     use std::str::FromStr;
+
+    use super::IdentifierError;
+    use super::QueueName;
+    use super::TaskKey;
+    use super::TaskName;
+    use super::WorkerId;
 
     #[test]
     fn queue_name_defaults_to_default_and_rejects_empty() {

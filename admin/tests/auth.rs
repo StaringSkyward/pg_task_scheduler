@@ -1,16 +1,24 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
+use axum::Extension;
+use axum::Router;
 use axum::body::Body;
-use axum::http::{HeaderName, Method, Request, StatusCode, header};
+use axum::http::HeaderName;
+use axum::http::Method;
+use axum::http::Request;
+use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::Response;
-use axum::{Extension, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use common::TestDb;
-use pg_task_scheduler_admin::auth::{
-    BasicUser, hash_password, with_basic_auth, with_trusted_header,
-};
-use pg_task_scheduler_admin::{AdminConfig, Operator, router};
+use pg_task_scheduler_admin::AdminConfig;
+use pg_task_scheduler_admin::Operator;
+use pg_task_scheduler_admin::auth::BasicUser;
+use pg_task_scheduler_admin::auth::hash_password;
+use pg_task_scheduler_admin::auth::with_basic_auth;
+use pg_task_scheduler_admin::auth::with_trusted_header;
+use pg_task_scheduler_admin::router;
 use tower::ServiceExt; // for `oneshot`
 
 struct AdminTask;

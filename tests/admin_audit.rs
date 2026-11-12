@@ -1,8 +1,10 @@
 mod common;
 use common::TestDb;
 use diesel_async::RunQueryDsl;
-use pg_task_scheduler::store::{self, AdminActionKind};
-use pg_task_scheduler::{TaskStatus, replay};
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::replay;
+use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::{self};
 
 async fn exec(db: &TestDb, sql: &str) {
     let mut conn = db.pool.get().await.unwrap();

@@ -2,7 +2,8 @@
 mod common;
 
 use common::TestDb;
-use diesel::result::{DatabaseErrorKind, Error as DieselError};
+use diesel::result::DatabaseErrorKind;
+use diesel::result::Error as DieselError;
 use diesel_async::RunQueryDsl;
 
 /// Raw insert of a job with the given name, bypassing the Rust JobName

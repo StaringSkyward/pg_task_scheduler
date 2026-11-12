@@ -1,8 +1,13 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use crate::error::{RegisterError, SchedulerError, TaskError};
-use crate::ids::{IdentifierError, QueueName, TaskName, WorkerId};
+use crate::error::RegisterError;
+use crate::error::SchedulerError;
+use crate::error::TaskError;
+use crate::ids::IdentifierError;
+use crate::ids::QueueName;
+use crate::ids::TaskName;
+use crate::ids::WorkerId;
 use crate::models::Retention;
 use crate::pool::SchedulerPool;
 use crate::queue::Task;

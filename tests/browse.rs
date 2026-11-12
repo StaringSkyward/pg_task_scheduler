@@ -5,8 +5,16 @@ use std::time::Duration;
 
 use common::TestDb;
 use diesel_async::SimpleAsyncConnection;
-use pg_task_scheduler::store::{self, AdminActionKind, FailedFilter, FailedStatus};
-use pg_task_scheduler::{AttemptOutcome, QueueName, TaskId, TaskName, TaskStatus, WorkerId};
+use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::FailedFilter;
+use pg_task_scheduler::store::FailedStatus;
+use pg_task_scheduler::store::{self};
 
 async fn sql(db: &TestDb, stmt: &str) {
     let mut conn = db.pool.get().await.unwrap();

@@ -3,11 +3,19 @@ mod common;
 
 use chrono::Utc;
 use common::TestDb;
-use pg_task_scheduler::jobs::{self, Applied, CreateJob, ScheduleUpdate};
-use pg_task_scheduler::{
-    CorruptJobRow, CronExpression, JobId, JobLifecycle, MaxAttempts, QueueName, SchedulerError,
-    TaskName, store,
-};
+use pg_task_scheduler::CorruptJobRow;
+use pg_task_scheduler::CronExpression;
+use pg_task_scheduler::JobId;
+use pg_task_scheduler::JobLifecycle;
+use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::jobs::Applied;
+use pg_task_scheduler::jobs::CreateJob;
+use pg_task_scheduler::jobs::ScheduleUpdate;
+use pg_task_scheduler::jobs::{self};
+use pg_task_scheduler::store;
 
 fn spec(name: &str, cron: &str) -> CreateJob {
     CreateJob::new(

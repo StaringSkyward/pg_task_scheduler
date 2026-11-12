@@ -4,12 +4,24 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use common::TestDb;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::ClaimedTask;
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::LockToken;
+use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::ReapSummary;
+use pg_task_scheduler::Retention;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::replay;
 use pg_task_scheduler::store;
-use pg_task_scheduler::{
-    AttemptOutcome, ClaimedTask, EnqueueOptions, LockToken, MaxAttempts, ReapSummary, Retention,
-    SchedulerError, Task, TaskKey, TaskStatus, WorkerId, enqueue, replay,
-};
 use serde_json::json;
 
 struct Email;

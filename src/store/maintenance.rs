@@ -2,10 +2,14 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use diesel::sql_types;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
-use crate::models::{CleanupSummary, ReapSummary, Retention, pg_interval};
+use crate::models::CleanupSummary;
+use crate::models::ReapSummary;
+use crate::models::Retention;
+use crate::models::pg_interval;
 
 // §12 reaper, plus closing each reaped task's open attempt. One statement, so both commit together.
 const REAP: &str = r#"

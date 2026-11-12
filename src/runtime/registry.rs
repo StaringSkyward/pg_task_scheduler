@@ -4,7 +4,8 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 
-use crate::error::{DuplicateTaskName, TaskError};
+use crate::error::DuplicateTaskName;
+use crate::error::TaskError;
 use crate::ids::TaskName;
 use crate::runtime::context::TaskContext;
 
@@ -80,11 +81,17 @@ impl Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ids::{LockToken, TaskId, TaskKey, WorkerId};
-    use crate::models::TaskLease;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::Ordering;
+
     use chrono::Utc;
-    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::*;
+    use crate::ids::LockToken;
+    use crate::ids::TaskId;
+    use crate::ids::TaskKey;
+    use crate::ids::WorkerId;
+    use crate::models::TaskLease;
 
     fn ctx() -> TaskContext {
         TaskContext {

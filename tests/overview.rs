@@ -4,10 +4,15 @@ use std::time::Duration;
 
 use common::TestDb;
 use diesel_async::SimpleAsyncConnection;
-use pg_task_scheduler::store::{
-    self, Count, Overview, OverviewParams, QueueSlots, WorkerRegistration, WorkerStatus,
-};
-use pg_task_scheduler::{QueueName, WorkerId};
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::store::Count;
+use pg_task_scheduler::store::Overview;
+use pg_task_scheduler::store::OverviewParams;
+use pg_task_scheduler::store::QueueSlots;
+use pg_task_scheduler::store::WorkerRegistration;
+use pg_task_scheduler::store::WorkerStatus;
+use pg_task_scheduler::store::{self};
 
 async fn sql(db: &TestDb, stmt: &str) {
     let mut conn = db.pool.get().await.unwrap();

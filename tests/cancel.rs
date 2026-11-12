@@ -3,16 +3,29 @@ mod common;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use common::TestDb;
-use diesel_async::{AsyncPgConnection, SimpleAsyncConnection};
-use pg_task_scheduler::store::{self, AdminActionKind, CancelOutcome};
-use pg_task_scheduler::{
-    AttemptOutcome, ClaimedTask, EnqueueOptions, QueueName, Scheduler, SchedulerError, Task,
-    TaskId, TaskKey, TaskStatus, WorkerId, enqueue,
-};
+use diesel_async::AsyncPgConnection;
+use diesel_async::SimpleAsyncConnection;
+use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::ClaimedTask;
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::CancelOutcome;
+use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;

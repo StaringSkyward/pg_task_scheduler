@@ -2,9 +2,14 @@
 
 use std::time::Duration;
 
-use diesel::sql_types::{Array, BigInt, Jsonb, Text};
-use diesel::{QueryableByName, sql_query};
-use diesel_async::{AsyncConnection, RunQueryDsl};
+use diesel::QueryableByName;
+use diesel::sql_query;
+use diesel::sql_types::Array;
+use diesel::sql_types::BigInt;
+use diesel::sql_types::Jsonb;
+use diesel::sql_types::Text;
+use diesel_async::AsyncConnection;
+use diesel_async::RunQueryDsl;
 use tokio_util::sync::CancellationToken;
 
 use crate::Pool;

@@ -1,9 +1,15 @@
 //! The page's "In the database" panel: plain SQL reads of the demo tables. The
 //! admin UI never shows these.
 
-use diesel::sql_types::{BigInt, Int4, Nullable, Text, Timestamptz};
-use diesel::{QueryableByName, sql_query};
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel::QueryableByName;
+use diesel::sql_query;
+use diesel::sql_types::BigInt;
+use diesel::sql_types::Int4;
+use diesel::sql_types::Nullable;
+use diesel::sql_types::Text;
+use diesel::sql_types::Timestamptz;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 pub struct Panel {
     pub order_rows: i64,

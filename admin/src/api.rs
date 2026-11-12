@@ -1,18 +1,30 @@
 //! JSON routes under `/api`: task inspection, audited replay and (with `cron`) job
 //! pause, resume and delete.
-use axum::extract::{Path, State};
+use axum::Json;
+use axum::Router;
+use axum::extract::Path;
+use axum::extract::State;
 use axum::http::StatusCode;
 #[cfg(feature = "cron")]
 use axum::routing::delete;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::get;
+use axum::routing::post;
 #[cfg(feature = "cron")]
 use pg_task_scheduler::JobId;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskView;
 #[cfg(feature = "cron")]
-use pg_task_scheduler::jobs::{self, Applied};
-use pg_task_scheduler::{SchedulerError, SchedulerPool, TaskId, TaskView, queue, store};
+use pg_task_scheduler::jobs::Applied;
+#[cfg(feature = "cron")]
+use pg_task_scheduler::jobs::{self};
+use pg_task_scheduler::queue;
+use pg_task_scheduler::store;
 
-use crate::{AppState, Operator, db};
+use crate::AppState;
+use crate::Operator;
+use crate::db;
 
 type ApiError = (StatusCode, String);
 

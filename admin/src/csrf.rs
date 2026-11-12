@@ -1,10 +1,15 @@
 //! Cross-site request check for state-changing requests (spec §6.1). Browsers attach
 //! basic-auth credentials and proxy cookies to cross-site requests, so without it a
 //! hostile page could trigger an action.
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::extract::Request;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::http::Method;
+use axum::http::StatusCode;
+use axum::http::header;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
+use axum::response::Response;
 
 pub(crate) async fn guard(
     State(public_origin): State<Option<String>>,

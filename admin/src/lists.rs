@@ -2,20 +2,36 @@
 //! Cursors travel as flat query fields; names are only ever in query strings.
 use askama::Template;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::get;
-use chrono::{DateTime, Utc};
-use pg_task_scheduler::store::{
-    self, FailedFilter, FailedStatus, FinishedCursor, QueuedCursor, RunningCursor, TaskRow,
-};
-use pg_task_scheduler::{QueueName, SchedulerPool, TaskId, TaskName};
-use serde::{Deserialize, Serialize};
+use chrono::DateTime;
+use chrono::Utc;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::store::FailedFilter;
+use pg_task_scheduler::store::FailedStatus;
+use pg_task_scheduler::store::FinishedCursor;
+use pg_task_scheduler::store::QueuedCursor;
+use pg_task_scheduler::store::RunningCursor;
+use pg_task_scheduler::store::TaskRow;
+use pg_task_scheduler::store::{self};
+use serde::Deserialize;
+use serde::Serialize;
 
+use crate::AppState;
+use crate::db;
 use crate::health::fmt_duration;
-use crate::pages::{ErrorPage, cached_overview, render, unavailable};
-use crate::{AppState, db};
+use crate::pages::ErrorPage;
+use crate::pages::cached_overview;
+use crate::pages::render;
+use crate::pages::unavailable;
 
 pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
     Router::new()

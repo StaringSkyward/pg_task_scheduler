@@ -2,14 +2,22 @@ mod common;
 
 use std::time::Duration;
 
-use chrono::{SubsecRound, Utc};
+use chrono::SubsecRound;
+use chrono::Utc;
 use common::TestDb;
-use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::SimpleAsyncConnection;
 use futures::StreamExt;
-use pg_task_scheduler::{
-    EnqueueOptions, IdentifierError, QueueName, SchedulerError, Task, TaskKey, TaskStatus, enqueue,
-    store,
-};
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::IdentifierError;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::store;
 use serde_json::json;
 
 struct Email;

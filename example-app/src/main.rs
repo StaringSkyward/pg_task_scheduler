@@ -30,7 +30,8 @@ fn required_env(name: &str) -> String {
 
 /// Resolves on SIGTERM (what `docker stop` sends to PID 1) or Ctrl-C.
 async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
+    use tokio::signal::unix::SignalKind;
+    use tokio::signal::unix::signal;
     let mut term = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
     tokio::select! {
         _ = term.recv() => {}

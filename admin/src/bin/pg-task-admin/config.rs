@@ -4,8 +4,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use pg_task_scheduler::store::OverviewParams;
+use pg_task_scheduler_admin::AdminConfig;
+use pg_task_scheduler_admin::QueueThresholds;
+use pg_task_scheduler_admin::Thresholds;
 use pg_task_scheduler_admin::auth::BasicUser;
-use pg_task_scheduler_admin::{AdminConfig, QueueThresholds, Thresholds};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]

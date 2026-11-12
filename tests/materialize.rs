@@ -1,10 +1,20 @@
 #![cfg(feature = "cron")]
 mod common;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::DateTime;
+use chrono::Duration;
+use chrono::SecondsFormat;
+use chrono::Utc;
 use common::TestDb;
-use pg_task_scheduler::jobs::{self, CreateJob, ScheduleUpdate};
+use pg_task_scheduler::CronExpression;
+use pg_task_scheduler::JobLifecycle;
+use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::jobs::CreateJob;
+use pg_task_scheduler::jobs::ScheduleUpdate;
+use pg_task_scheduler::jobs::{self};
 use pg_task_scheduler::store;
-use pg_task_scheduler::{CronExpression, JobLifecycle, MaxAttempts, QueueName, TaskId, TaskName};
 
 fn occurrence_key(job: impl std::fmt::Display, at: DateTime<Utc>) -> String {
     format!(
@@ -209,7 +219,8 @@ struct Setting {
 /// idle pooled connection. A trigger records the setting from inside the transaction.
 #[tokio::test]
 async fn materializer_transaction_ends_itself_when_left_idle() {
-    use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
+    use diesel_async::RunQueryDsl;
+    use diesel_async::SimpleAsyncConnection;
     let db = TestDb::new().await;
     db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(5))
         .await;

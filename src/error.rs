@@ -1,8 +1,11 @@
 //! Crate error types.
 
+use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
 use crate::ids::JobId;
-use crate::ids::{IdentifierError, TaskId, TaskKey, TaskName};
+use crate::ids::TaskId;
+use crate::ids::TaskKey;
+use crate::ids::TaskName;
 #[cfg(feature = "cron")]
 use crate::models::MaxAttemptsError;
 

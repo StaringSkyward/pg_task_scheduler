@@ -4,12 +4,19 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use diesel::sql_types::{Integer, Text};
-use diesel_async::{AsyncConnection, RunQueryDsl};
-use pg_task_scheduler::{
-    OutboxCommand, Scheduler, SchedulerError, Task, TaskContext, TaskError, store,
-};
-use serde::{Deserialize, Serialize};
+use diesel::sql_types::Integer;
+use diesel::sql_types::Text;
+use diesel_async::AsyncConnection;
+use diesel_async::RunQueryDsl;
+use pg_task_scheduler::OutboxCommand;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskContext;
+use pg_task_scheduler::TaskError;
+use pg_task_scheduler::store;
+use serde::Deserialize;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::Pool;

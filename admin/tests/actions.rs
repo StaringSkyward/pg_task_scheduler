@@ -1,12 +1,17 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
+use axum::Extension;
+use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
-use axum::{Extension, Router};
+use axum::http::Request;
+use axum::http::StatusCode;
+use axum::http::header;
 use common::TestDb;
 use diesel_async::SimpleAsyncConnection;
 use pg_task_scheduler::store;
-use pg_task_scheduler_admin::{AdminConfig, Operator, router};
+use pg_task_scheduler_admin::AdminConfig;
+use pg_task_scheduler_admin::Operator;
+use pg_task_scheduler_admin::router;
 use tower::ServiceExt;
 
 async fn sql(db: &TestDb, stmt: &str) {

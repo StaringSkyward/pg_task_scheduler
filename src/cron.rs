@@ -1,6 +1,8 @@
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 
-use crate::error::{CorruptJobRow, SchedulerError};
+use crate::error::CorruptJobRow;
+use crate::error::SchedulerError;
 use crate::ids::JobId;
 
 /// A five-field cron expression validated at construction (parse, don't validate).
@@ -50,8 +52,9 @@ impl CronExpression {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::TimeZone;
+
+    use super::*;
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()

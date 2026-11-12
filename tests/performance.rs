@@ -1,7 +1,8 @@
 mod common;
 
 use common::TestDb;
-use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
+use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use pg_task_scheduler::store;
 
 #[derive(diesel::QueryableByName)]
@@ -121,7 +122,8 @@ async fn outbox_cleanup_uses_published_index() {
 #[tokio::test]
 async fn cleanup_cancelled_uses_terminal_index() {
     use diesel::pg::data_types::PgInterval;
-    use diesel::sql_types::{BigInt, Interval};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Interval;
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     conn.batch_execute("SET enable_seqscan = off")
@@ -155,7 +157,9 @@ async fn cleanup_cancelled_uses_terminal_index() {
 /// A bulk replay batch finds dead and cancelled rows by name through the failed-name index.
 #[tokio::test]
 async fn replay_matching_uses_failed_name_index() {
-    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
+    use diesel::sql_types::Text;
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     conn.batch_execute("SET enable_seqscan = off")
@@ -212,7 +216,9 @@ async fn seqscan_off_conn(
 
 #[tokio::test]
 async fn queued_page_uses_claim_and_due_indexes() {
-    use diesel::sql_types::{BigInt, Text, Timestamptz};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Text;
+    use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
     let now = chrono::Utc::now();
@@ -240,7 +246,8 @@ async fn queued_page_uses_claim_and_due_indexes() {
 
 #[tokio::test]
 async fn running_page_uses_lease_index() {
-    use diesel::sql_types::{BigInt, Timestamptz};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
     let plan = diesel::sql_query(format!("EXPLAIN {}", store::RUNNING))
@@ -256,7 +263,8 @@ async fn running_page_uses_lease_index() {
 
 #[tokio::test]
 async fn done_page_uses_terminal_index() {
-    use diesel::sql_types::{BigInt, Timestamptz};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
     let plan = diesel::sql_query(format!("EXPLAIN {}", store::DONE))
@@ -272,7 +280,10 @@ async fn done_page_uses_terminal_index() {
 
 #[tokio::test]
 async fn failed_page_uses_failed_index() {
-    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
+    use diesel::sql_types::Text;
+    use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
     let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED))
@@ -290,7 +301,10 @@ async fn failed_page_uses_failed_index() {
 
 #[tokio::test]
 async fn failed_page_by_name_uses_failed_name_index() {
-    use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
+    use diesel::sql_types::Text;
+    use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     // With real statistics, the selective task_name wins over the status-only index.
     let mut setup = db.pool.get().await.unwrap();
@@ -349,7 +363,9 @@ async fn overview_distinct_queues_skip_scan_uses_due_index() {
 
 #[tokio::test]
 async fn overview_due_count_uses_due_index() {
-    use diesel::sql_types::{Array, BigInt, Text};
+    use diesel::sql_types::Array;
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Text;
     overview_plan(store::OVERVIEW_COUNTS, "queue_tasks_due_idx", |q| {
         q.bind::<Array<Text>, _>(vec!["default"])
             .bind::<BigInt, _>(10_000_i64)
@@ -360,7 +376,8 @@ async fn overview_due_count_uses_due_index() {
 #[tokio::test]
 async fn overview_done_window_uses_terminal_index() {
     use diesel::pg::data_types::PgInterval;
-    use diesel::sql_types::{BigInt, Interval};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Interval;
     overview_plan(
         store::OVERVIEW_DONE,
         "queue_tasks_terminal_cleanup_idx",
@@ -375,7 +392,8 @@ async fn overview_done_window_uses_terminal_index() {
 #[tokio::test]
 async fn overview_dead_window_uses_failed_index() {
     use diesel::pg::data_types::PgInterval;
-    use diesel::sql_types::{BigInt, Interval};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Interval;
     overview_plan(store::OVERVIEW_DEAD, "queue_tasks_failed_idx", |q| {
         q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
             .bind::<BigInt, _>(10_000_i64)
@@ -386,7 +404,8 @@ async fn overview_dead_window_uses_failed_index() {
 #[tokio::test]
 async fn overview_failed_attempts_use_started_index() {
     use diesel::pg::data_types::PgInterval;
-    use diesel::sql_types::{BigInt, Interval};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Interval;
     overview_plan(
         store::OVERVIEW_FAILED_ATTEMPTS,
         "queue_task_attempts_started_idx",
@@ -411,7 +430,8 @@ async fn overview_running_uses_lease_index() {
 #[tokio::test]
 async fn overview_dead_groups_use_failed_index() {
     use diesel::pg::data_types::PgInterval;
-    use diesel::sql_types::{BigInt, Interval};
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Interval;
     overview_plan(store::DEAD_GROUPS, "queue_tasks_failed_idx", |q| {
         q.bind::<Interval, _>(PgInterval::from_microseconds(3_600_000_000))
             .bind::<BigInt, _>(10_000_i64)
@@ -421,7 +441,9 @@ async fn overview_dead_groups_use_failed_index() {
 
 #[tokio::test]
 async fn overview_no_handler_probe_is_a_limited_due_index_scan() {
-    use diesel::sql_types::{Array, BigInt, Text};
+    use diesel::sql_types::Array;
+    use diesel::sql_types::BigInt;
+    use diesel::sql_types::Text;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
     let rows = diesel::sql_query(format!("EXPLAIN {}", store::NO_HANDLER))
