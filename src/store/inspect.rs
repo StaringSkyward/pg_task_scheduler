@@ -1,11 +1,22 @@
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
-use crate::ids::{LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
-use crate::models::{Attempt, QueueDepth, QueueStats, TaskView, interval_to_duration};
+use crate::ids::LockToken;
+use crate::ids::QueueName;
+use crate::ids::TaskId;
+use crate::ids::TaskKey;
+use crate::ids::TaskName;
+use crate::ids::WorkerId;
+use crate::models::Attempt;
+use crate::models::QueueDepth;
+use crate::models::QueueStats;
+use crate::models::TaskView;
+use crate::models::interval_to_duration;
 
 #[derive(diesel::QueryableByName)]
 struct TaskRow {

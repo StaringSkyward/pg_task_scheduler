@@ -2,19 +2,36 @@ mod common;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use chrono::Utc;
 use common::TestDb;
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::HealthStatus;
+use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::Priority;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::Retention;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskError;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::TaskView;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store;
-use pg_task_scheduler::{
-    AttemptOutcome, EnqueueOptions, HealthStatus, MaxAttempts, Priority, QueueName, Retention,
-    Scheduler, SchedulerError, Task, TaskError, TaskId, TaskKey, TaskStatus, TaskView, WorkerId,
-    enqueue,
-};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;

@@ -1,8 +1,10 @@
 //! The queue status rules (spec §7.2). Pure: everything it needs is passed in.
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use pg_task_scheduler::store::{QueueOverview, WorkerView};
+use chrono::DateTime;
+use chrono::Utc;
+use pg_task_scheduler::store::QueueOverview;
+use pg_task_scheduler::store::WorkerView;
 
 use crate::QueueThresholds;
 
@@ -100,8 +102,11 @@ pub fn verdict(
 
 #[cfg(test)]
 mod tests {
-    use pg_task_scheduler::store::{Count, WorkerQueueView, WorkerStatus};
-    use pg_task_scheduler::{QueueName, WorkerId};
+    use pg_task_scheduler::QueueName;
+    use pg_task_scheduler::WorkerId;
+    use pg_task_scheduler::store::Count;
+    use pg_task_scheduler::store::WorkerQueueView;
+    use pg_task_scheduler::store::WorkerStatus;
 
     use super::*;
 

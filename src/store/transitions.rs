@@ -1,11 +1,19 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use diesel::{OptionalExtension, sql_types};
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use chrono::DateTime;
+use chrono::Utc;
+use diesel::OptionalExtension;
+use diesel::sql_types;
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
-use crate::models::{OutboxCommand, RetryOutcome, TaskLease, TaskStatus, pg_interval};
+use crate::models::OutboxCommand;
+use crate::models::RetryOutcome;
+use crate::models::TaskLease;
+use crate::models::TaskStatus;
+use crate::models::pg_interval;
 
 // Ownership guard shared by every worker-owned mutation. Binds: $1 task id, $2 worker, $3 token.
 macro_rules! owned {

@@ -4,8 +4,11 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use diesel::sql_types::Text;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use pg_task_scheduler::{SchedulerError, SchedulerPool};
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::SchedulerPool;
 
 /// `SET LOCAL` of `statement_timeout` and `idle_in_transaction_session_timeout`, with the
 /// value bound.

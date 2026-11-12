@@ -6,15 +6,26 @@ use std::sync::Arc;
 use askama::Template;
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::StatusCode;
+use axum::http::header;
+use axum::response::Html;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::get;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use pg_task_scheduler::SchedulerPool;
-use pg_task_scheduler::store::{self, Count, Overview, QueueOverview, WorkerView};
+use pg_task_scheduler::store::Count;
+use pg_task_scheduler::store::Overview;
+use pg_task_scheduler::store::QueueOverview;
+use pg_task_scheduler::store::WorkerView;
+use pg_task_scheduler::store::{self};
 
-use crate::health::{QueueStatus, fmt_duration, verdict};
-use crate::{AppState, db};
+use crate::AppState;
+use crate::db;
+use crate::health::QueueStatus;
+use crate::health::fmt_duration;
+use crate::health::verdict;
 
 pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
     Router::new()

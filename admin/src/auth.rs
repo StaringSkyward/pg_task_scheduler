@@ -4,16 +4,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
-
-use argon2::{ARGON2ID_IDENT, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::ARGON2ID_IDENT;
+use argon2::Argon2;
+use argon2::PasswordHash;
+use argon2::PasswordHasher;
+use argon2::PasswordVerifier;
 use axum::Router;
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode, header};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::extract::Request;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::http::HeaderName;
+use axum::http::StatusCode;
+use axum::http::header;
+use axum::middleware::Next;
+use axum::middleware::{self};
+use axum::response::IntoResponse;
+use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use tokio::sync::Semaphore;
 
 use crate::Operator;
 
@@ -176,7 +185,8 @@ async fn trusted(State(header): State<HeaderName>, mut req: Request, next: Next)
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
     use std::time::Duration;
 
     use super::*;

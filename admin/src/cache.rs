@@ -1,7 +1,8 @@
 //! A single-flight, time-boxed cache for the overview (spec §7.4).
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use pg_task_scheduler::store::Overview;
 use tokio::sync::Mutex;
@@ -39,7 +40,8 @@ impl OverviewCache {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 

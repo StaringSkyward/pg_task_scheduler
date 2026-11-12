@@ -2,14 +2,19 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
-use crate::ids::{QueueName, WorkerId};
-use crate::models::{ParseEnumError, pg_interval, text_enum};
+use crate::ids::QueueName;
+use crate::ids::WorkerId;
+use crate::models::ParseEnumError;
+use crate::models::pg_interval;
+use crate::models::text_enum;
 
 /// A registered worker's state, from its health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

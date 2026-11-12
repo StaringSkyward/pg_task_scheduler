@@ -1,5 +1,6 @@
-use diesel_async::AsyncPgConnection;
 use std::ops::DerefMut;
+
+use diesel_async::AsyncPgConnection;
 
 /// Opaque pool error type — wraps any pool error without losing the source.
 pub type PoolError = Box<dyn std::error::Error + Send + Sync>;
@@ -19,8 +20,10 @@ pub trait SchedulerPool: Clone + Send + Sync + 'static {
 
 #[cfg(feature = "deadpool")]
 mod deadpool_impl {
+    use diesel_async::pooled_connection::deadpool::Object;
+    use diesel_async::pooled_connection::deadpool::Pool;
+
     use super::*;
-    use diesel_async::pooled_connection::deadpool::{Object, Pool};
 
     impl SchedulerPool for Pool<AsyncPgConnection> {
         type Conn = Object<AsyncPgConnection>;
@@ -36,8 +39,10 @@ mod deadpool_impl {
 
 #[cfg(feature = "bb8")]
 mod bb8_impl {
+    use diesel_async::pooled_connection::bb8::Pool;
+    use diesel_async::pooled_connection::bb8::PooledConnection;
+
     use super::*;
-    use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
 
     impl SchedulerPool for Pool<AsyncPgConnection> {
         type Conn = PooledConnection<'static, AsyncPgConnection>;
@@ -53,8 +58,10 @@ mod bb8_impl {
 
 #[cfg(feature = "mobc")]
 mod mobc_impl {
+    use diesel_async::pooled_connection::mobc::Pool;
+    use diesel_async::pooled_connection::mobc::PooledConnection;
+
     use super::*;
-    use diesel_async::pooled_connection::mobc::{Pool, PooledConnection};
 
     impl SchedulerPool for Pool<AsyncPgConnection> {
         type Conn = PooledConnection<AsyncPgConnection>;

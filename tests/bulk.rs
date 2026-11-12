@@ -5,8 +5,15 @@ use std::time::Duration;
 
 use common::TestDb;
 use diesel_async::SimpleAsyncConnection;
-use pg_task_scheduler::store::{self, BulkFilter};
-use pg_task_scheduler::{EnqueueOptions, QueueName, Task, TaskKey, TaskName, WorkerId, enqueue};
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::store::BulkFilter;
+use pg_task_scheduler::store::{self};
 use serde_json::json;
 
 struct A;

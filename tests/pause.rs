@@ -1,11 +1,19 @@
 mod common;
 
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use common::TestDb;
-use pg_task_scheduler::store::{self, AdminActionKind};
-use pg_task_scheduler::{EnqueueOptions, QueueName, Scheduler, Task, TaskKey, WorkerId, enqueue};
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 

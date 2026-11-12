@@ -5,16 +5,31 @@
 use askama::Template;
 use axum::Form;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
-use pg_task_scheduler::store::{self, BULK_BUDGET, BulkFilter, CancelOutcome};
-use pg_task_scheduler::{QueueName, SchedulerError, SchedulerPool, TaskId, TaskName, replay};
+use axum::response::IntoResponse;
+use axum::response::Redirect;
+use axum::response::Response;
+use axum::routing::get;
+use axum::routing::post;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::replay;
+use pg_task_scheduler::store::BULK_BUDGET;
+use pg_task_scheduler::store::BulkFilter;
+use pg_task_scheduler::store::CancelOutcome;
+use pg_task_scheduler::store::{self};
 use serde::Deserialize;
 
-use crate::pages::{ErrorPage, render};
-use crate::{AppState, Operator};
+use crate::AppState;
+use crate::Operator;
+use crate::pages::ErrorPage;
+use crate::pages::render;
 
 pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
     Router::new()

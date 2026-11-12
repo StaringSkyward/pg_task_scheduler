@@ -1,17 +1,27 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use common::TestDb;
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncConnection, AsyncPgConnection};
+use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskError;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::TaskView;
+use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store;
-use pg_task_scheduler::{
-    AttemptOutcome, EnqueueOptions, Scheduler, SchedulerError, Task, TaskError, TaskId, TaskKey,
-    TaskStatus, TaskView, enqueue,
-};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

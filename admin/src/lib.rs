@@ -3,11 +3,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::FromRequestParts;
+use axum::http::HeaderValue;
+use axum::http::StatusCode;
+use axum::http::header;
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware;
 use axum::response::Response;
-use axum::{Router, middleware};
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::store::OverviewParams;
 

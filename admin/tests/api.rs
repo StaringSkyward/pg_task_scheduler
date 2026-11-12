@@ -1,10 +1,15 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
+use axum::Extension;
+use axum::Router;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
-use axum::{Extension, Router};
+use axum::http::Method;
+use axum::http::Request;
+use axum::http::StatusCode;
 use common::TestDb;
-use pg_task_scheduler_admin::{AdminConfig, Operator, router};
+use pg_task_scheduler_admin::AdminConfig;
+use pg_task_scheduler_admin::Operator;
+use pg_task_scheduler_admin::router;
 use tower::ServiceExt; // for `oneshot`
 
 struct AdminTask;

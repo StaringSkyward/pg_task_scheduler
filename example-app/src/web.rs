@@ -6,26 +6,49 @@ use std::time::Duration;
 use askama::Template;
 use axum::Form;
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::extract::Query;
+use axum::extract::State;
+use axum::response::Html;
+use axum::response::IntoResponse;
+use axum::response::Redirect;
+use axum::response::Response;
+use axum::routing::get;
+use axum::routing::post;
 use diesel_async::AsyncConnection;
-use pg_task_scheduler::{
-    CreateJob, CronExpression, EnqueueOptions, JobLifecycle, MaxAttempts, SchedulerError, Task,
-    TaskKey, TaskName, enqueue, jobs,
-};
-use pg_task_scheduler_admin::auth::{self, BasicUser};
-use pg_task_scheduler_admin::{AdminConfig, router};
-use serde::{Deserialize, Serialize};
+use pg_task_scheduler::CreateJob;
+use pg_task_scheduler::CronExpression;
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::JobLifecycle;
+use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskName;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::jobs;
+use pg_task_scheduler_admin::AdminConfig;
+use pg_task_scheduler_admin::auth::BasicUser;
+use pg_task_scheduler_admin::auth::{self};
+use pg_task_scheduler_admin::router;
+use serde::Deserialize;
+use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::Pool;
-use crate::panel::{self, Panel};
-use crate::tasks::{
-    BulkImport, BulkImportArgs, Digest, DigestArgs, EmailArgs, FlakyArgs, FlakyDemo, OrderArgs,
-    PlaceOrder, SendEmail, random_between,
-};
-use tokio_util::sync::CancellationToken;
+use crate::panel::Panel;
+use crate::panel::{self};
+use crate::tasks::BulkImport;
+use crate::tasks::BulkImportArgs;
+use crate::tasks::Digest;
+use crate::tasks::DigestArgs;
+use crate::tasks::EmailArgs;
+use crate::tasks::FlakyArgs;
+use crate::tasks::FlakyDemo;
+use crate::tasks::OrderArgs;
+use crate::tasks::PlaceOrder;
+use crate::tasks::SendEmail;
+use crate::tasks::random_between;
 
 /// What the banner shows after a button press. It travels in the query string of
 /// the 303 redirect, so reloading the page never re-submits the form.
@@ -350,8 +373,9 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use askama::Template;
+
+    use super::*;
 
     #[test]
     fn parse_order_no_accepts_only_1_to_999999() {

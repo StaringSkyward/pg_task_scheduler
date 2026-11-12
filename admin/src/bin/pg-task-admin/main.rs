@@ -1,14 +1,15 @@
 //! Standalone admin server: `pg-task-admin --config <path>` or `pg-task-admin hash-password`.
 mod config;
 
+use config::Auth;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use pg_task_scheduler_admin::auth::{self, with_basic_auth, with_trusted_header};
+use pg_task_scheduler_admin::auth::with_basic_auth;
+use pg_task_scheduler_admin::auth::with_trusted_header;
+use pg_task_scheduler_admin::auth::{self};
 use pg_task_scheduler_admin::router;
 use tracing_subscriber::EnvFilter;
-
-use config::Auth;
 
 #[tokio::main]
 async fn main() {

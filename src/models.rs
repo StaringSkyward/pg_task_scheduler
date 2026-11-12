@@ -1,16 +1,27 @@
-use std::num::{NonZeroI32, NonZeroUsize};
+use std::num::NonZeroI32;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use chrono::DateTime;
+use chrono::Utc;
 use diesel::pg::data_types::PgInterval;
-
-use chrono::{DateTime, Utc};
-
-use crate::ids::{LockToken, QueueName, TaskId, TaskKey, TaskName, WorkerId};
 #[cfg(feature = "cron")]
-use {
-    crate::cron::CronExpression, crate::error::SchedulerError, crate::ids::JobId,
-    crate::schema::scheduler_jobs, diesel::prelude::*,
-};
+use diesel::prelude::*;
+
+#[cfg(feature = "cron")]
+use crate::cron::CronExpression;
+#[cfg(feature = "cron")]
+use crate::error::SchedulerError;
+#[cfg(feature = "cron")]
+use crate::ids::JobId;
+use crate::ids::LockToken;
+use crate::ids::QueueName;
+use crate::ids::TaskId;
+use crate::ids::TaskKey;
+use crate::ids::TaskName;
+use crate::ids::WorkerId;
+#[cfg(feature = "cron")]
+use crate::schema::scheduler_jobs;
 
 /// Lifecycle state of a `queue_tasks` row (stored as TEXT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,8 +293,9 @@ impl MaxAttempts {
 
 #[cfg(test)]
 mod task_enum_tests {
-    use super::*;
     use std::str::FromStr;
+
+    use super::*;
 
     #[test]
     fn status_round_trips() {
@@ -332,7 +344,8 @@ mod task_enum_tests {
 
 #[cfg(test)]
 mod max_attempts_tests {
-    use super::{MaxAttempts, MaxAttemptsError};
+    use super::MaxAttempts;
+    use super::MaxAttemptsError;
 
     #[test]
     fn try_from_zero_is_non_positive() {

@@ -2,13 +2,19 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use diesel::sql_types;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
-use crate::ids::{QueueName, TaskId, TaskName};
-use crate::models::{ParseEnumError, TaskView, text_enum};
+use crate::ids::QueueName;
+use crate::ids::TaskId;
+use crate::ids::TaskName;
+use crate::models::ParseEnumError;
+use crate::models::TaskView;
+use crate::models::text_enum;
 
 /// What an operator did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

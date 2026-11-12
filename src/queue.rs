@@ -1,13 +1,19 @@
 //! Transactional, idempotent task enqueueing.
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use diesel::sql_types;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 use serde::de::DeserializeOwned;
 
 use crate::error::SchedulerError;
-use crate::ids::{QueueName, TaskId, TaskKey, TaskName};
-use crate::models::{MaxAttempts, TaskStatus};
+use crate::ids::QueueName;
+use crate::ids::TaskId;
+use crate::ids::TaskKey;
+use crate::ids::TaskName;
+use crate::models::MaxAttempts;
+use crate::models::TaskStatus;
 
 /// Connects a stable queue name to its serialized argument type. The same type is
 /// used for enqueueing and handler registration, preventing name/payload drift in

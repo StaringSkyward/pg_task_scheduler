@@ -1,10 +1,16 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::DateTime;
+use chrono::SecondsFormat;
+use chrono::Utc;
 use diesel::sql_types;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
-use crate::ids::{IdentifierError, JobId, TaskKey};
+use crate::ids::IdentifierError;
+use crate::ids::JobId;
+use crate::ids::TaskKey;
 
 #[derive(diesel::QueryableByName)]
 struct DueJob {
@@ -135,8 +141,9 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::TimeZone;
+
+    use super::*;
 
     #[test]
     fn schedule_task_key_is_stable() {

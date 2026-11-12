@@ -2,18 +2,28 @@
 //! `count_cap`, the number of queues or workers, or a rare state, however large the tables grow.
 //! Verdicts (healthy, stalled, ...) are the caller's: this only gathers numbers.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
 
-use super::{AdminAction, QueuePause, WorkerView, admin_actions, paused_queues, workers};
+use super::AdminAction;
+use super::QueuePause;
+use super::WorkerView;
+use super::admin_actions;
+use super::paused_queues;
+use super::workers;
 use crate::error::SchedulerError;
-use crate::ids::{QueueName, TaskName};
-use crate::models::{interval_to_duration, pg_interval};
+use crate::ids::QueueName;
+use crate::ids::TaskName;
+use crate::models::interval_to_duration;
+use crate::models::pg_interval;
 
 #[derive(Debug, Clone)]
 pub struct OverviewParams {

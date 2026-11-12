@@ -1,25 +1,40 @@
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use futures::{FutureExt, StreamExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::{JoinError, JoinSet};
-use tokio::time::{Instant, MissedTickBehavior};
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use futures::FutureExt;
+use futures::StreamExt;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio::sync::watch;
+use tokio::task::JoinError;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::error::{SchedulerError, TaskError};
+use crate::error::SchedulerError;
+use crate::error::TaskError;
 use crate::ids::QueueName;
-use crate::models::{ClaimedTask, RetryOutcome, TaskLease, TaskStatus};
+use crate::models::ClaimedTask;
+use crate::models::RetryOutcome;
+use crate::models::TaskLease;
+use crate::models::TaskStatus;
 use crate::pool::SchedulerPool;
-use crate::runtime::builder::{Config, Scheduler};
+use crate::runtime::builder::Config;
+use crate::runtime::builder::Scheduler;
 use crate::runtime::context::TaskContext;
-use crate::runtime::health::{HealthStatus, WorkerHealth};
-use crate::runtime::registry::{Handler, Registry};
+use crate::runtime::health::HealthStatus;
+use crate::runtime::health::WorkerHealth;
+use crate::runtime::registry::Handler;
+use crate::runtime::registry::Registry;
 use crate::store;
 
 /// Shortest idle wait before a task due soon (a due task the cycle could not claim waits
@@ -840,8 +855,9 @@ pub(crate) fn retry_delay(
 
 #[cfg(test)]
 mod tests {
-    use super::retry_delay;
     use std::time::Duration;
+
+    use super::retry_delay;
 
     const BASE: Duration = Duration::from_secs(1);
     const MAX: Duration = Duration::from_secs(300);

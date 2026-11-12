@@ -2,20 +2,32 @@ mod common;
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
+use chrono::Utc;
 use common::TestDb;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
-use pg_task_scheduler::store::{
-    self, QueueSlots, WorkerQueueView, WorkerRegistration, WorkerStatus, WorkerView,
-};
-use pg_task_scheduler::{
-    EnqueueOptions, HealthStatus, QueueName, Scheduler, SchedulerBuilder, Task, TaskId, TaskKey,
-    TaskStatus, WorkerId, enqueue,
-};
+use pg_task_scheduler::EnqueueOptions;
+use pg_task_scheduler::HealthStatus;
+use pg_task_scheduler::QueueName;
+use pg_task_scheduler::Scheduler;
+use pg_task_scheduler::SchedulerBuilder;
+use pg_task_scheduler::Task;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::WorkerId;
+use pg_task_scheduler::enqueue;
+use pg_task_scheduler::store::QueueSlots;
+use pg_task_scheduler::store::WorkerQueueView;
+use pg_task_scheduler::store::WorkerRegistration;
+use pg_task_scheduler::store::WorkerStatus;
+use pg_task_scheduler::store::WorkerView;
+use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
