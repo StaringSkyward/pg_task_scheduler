@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Running{% endblock %}
+{% block content %}
+<h2>Running</h2>
+{% if rows.is_empty() %}
+<p>Nothing running.</p>
+{% else %}
+<table>
+<thead><tr><th>Id</th><th>Task</th><th>Queue</th><th>Worker</th><th>Attempt</th><th>Run time</th><th>Lease expires</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td><a href="{{ base }}/tasks/{{ r.id }}">{{ r.id }}</a></td><td>{{ r.task_name }}</td><td>{{ r.queue }}</td><td>{{ r.worker }}</td><td>{{ r.attempt }}</td><td>{{ r.run_time }}</td><td>{{ r.lease }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% if let Some(n) = next %}<p><a href="{{ n }}">Next</a></p>{% endif %}
+{% endblock %}

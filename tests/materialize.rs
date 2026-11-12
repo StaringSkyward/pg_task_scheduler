@@ -197,3 +197,46 @@ async fn materialized_task_uses_the_job_queue() {
     assert_eq!(task.queue.as_str(), "bulk");
     db.cleanup().await;
 }
+
+#[derive(diesel::QueryableByName)]
+struct Setting {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    v: String,
+}
+
+/// Each materializer transaction sets `idle_in_transaction_session_timeout` to 30 s, so one
+/// cut off by shutdown is ended by the server instead of holding its schedule row lock on an
+/// idle pooled connection. A trigger records the setting from inside the transaction.
+#[tokio::test]
+async fn materializer_transaction_ends_itself_when_left_idle() {
+    use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(5))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "CREATE TABLE seen (v text); \
+         CREATE FUNCTION record_idle() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           INSERT INTO seen VALUES (current_setting('idle_in_transaction_session_timeout')); \
+           RETURN NEW; END $$; \
+         CREATE TRIGGER record_idle BEFORE INSERT ON queue_tasks \
+           FOR EACH ROW EXECUTE FUNCTION record_idle()",
+    )
+    .await
+    .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let inside = diesel::sql_query("SELECT v FROM seen")
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    assert_eq!(inside, "30s");
+    let after =
+        diesel::sql_query("SELECT current_setting('idle_in_transaction_session_timeout') AS v")
+            .get_result::<Setting>(&mut conn)
+            .await
+            .unwrap()
+            .v;
+    assert_eq!(after, "0");
+    db.cleanup().await;
+}

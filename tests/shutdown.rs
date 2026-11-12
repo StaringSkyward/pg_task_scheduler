@@ -367,9 +367,6 @@ async fn shutdown_with_row_lock_held_returns_in_bounded_time() {
         matches!(status, TaskStatus::Queued | TaskStatus::Running),
         "{status:?}"
     );
-    // The dropped transaction is still open on an idle pooled connection; closing the pool
-    // ends it, so DROP SCHEMA does not wait forever behind its row lock.
-    db.pool.close();
     db.cleanup().await;
 }
 

@@ -35,6 +35,9 @@ pub(crate) struct Config {
     pub crash_retry_delay: Duration,
     pub retention: Retention,
     pub shutdown_timeout: Duration,
+    pub registry_interval: Duration,
+    /// Shown in the worker registry; the worker id stands in when `None`.
+    pub label: Option<String>,
 }
 
 pub struct SchedulerBuilder<P: SchedulerPool> {
@@ -85,6 +88,16 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         /// to return; those still running are released, for up to 5 s more, then aborted
         /// (default 25 s).
         shutdown_timeout: Duration;
+        /// Period of the worker's registry row refresh; the row reads as lost after 3 × this
+        /// (default 15 s).
+        registry_interval: Duration;
+    }
+
+    /// The worker's name in the registry (default: the `HOSTNAME` environment variable when
+    /// set and non-empty; otherwise none, and the worker id is shown).
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.config.label = Some(label.into());
+        self
     }
 
     /// Serve `name`, running at most `limit` of its handlers at once. Configuring any queue
@@ -157,6 +170,7 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             c.reaper_interval,
             c.crash_retry_delay,
             c.shutdown_timeout,
+            c.registry_interval,
             r.done,
             r.dead,
             r.idempotency_horizon,
@@ -171,10 +185,11 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             c.heartbeat_interval,
             c.max_poll_interval,
             c.reaper_interval,
+            c.registry_interval,
         ]
         .contains(&Duration::ZERO)
         {
-            Some("lease, heartbeat, poll and reaper intervals must be greater than zero")
+            Some("lease, heartbeat, poll, reaper and registry intervals must be greater than zero")
         } else if c.heartbeat_interval.saturating_mul(3) > c.lease_duration {
             Some("heartbeat_interval must be at most a third of lease_duration")
         } else if c.base_retry_delay > c.max_retry_delay {
@@ -228,6 +243,8 @@ impl<P: SchedulerPool> Scheduler<P> {
                 crash_retry_delay: Duration::from_secs(10),
                 retention: Retention::default(),
                 shutdown_timeout: Duration::from_secs(25),
+                registry_interval: Duration::from_secs(15),
+                label: std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()),
             },
         }
     }
@@ -410,7 +427,7 @@ mod tests {
         // Each setting, with any companion value its other rules need. heartbeat_interval is
         // absent: at most lease / 3, it can never reach the cap without the lease passing it.
         type Set = fn(SchedulerBuilder<FakePool>, Duration) -> SchedulerBuilder<FakePool>;
-        let settings: [Set; 11] = [
+        let settings: [Set; 12] = [
             |b, d| b.lease_duration(d),
             |b, d| b.max_poll_interval(d),
             |b, d| b.base_retry_delay(d).max_retry_delay(d),
@@ -419,6 +436,7 @@ mod tests {
             |b, d| b.reaper_interval(d),
             |b, d| b.crash_retry_delay(d),
             |b, d| b.shutdown_timeout(d),
+            |b, d| b.registry_interval(d),
             |b, d| {
                 b.retention(Retention {
                     done: d,
@@ -456,5 +474,10 @@ mod tests {
         assert!(rejected(builder().heartbeat_interval(Duration::ZERO)));
         assert!(rejected(builder().max_poll_interval(Duration::ZERO)));
         assert!(rejected(builder().reaper_interval(Duration::ZERO)));
+    }
+
+    #[test]
+    fn build_rejects_zero_registry_interval() {
+        assert!(rejected(builder().registry_interval(Duration::ZERO)));
     }
 }

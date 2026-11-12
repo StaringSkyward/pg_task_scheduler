@@ -19,6 +19,7 @@ pub enum TaskStatus {
     Running,
     Done,
     Dead,
+    Cancelled,
 }
 
 /// Outcome recorded on a closed `queue_task_attempts` row (stored as TEXT).
@@ -29,14 +30,15 @@ pub enum AttemptOutcome {
     Dead,
     LeaseExpired,
     Released,
+    Cancelled,
 }
 
 /// A stored status/outcome string that matches no known variant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {kind}: {value:?}")]
 pub struct ParseEnumError {
-    kind: &'static str,
-    value: String,
+    pub(crate) kind: &'static str,
+    pub(crate) value: String,
 }
 
 macro_rules! text_enum {
@@ -58,13 +60,15 @@ macro_rules! text_enum {
         }
     };
 }
+pub(crate) use text_enum;
 
 text_enum!(TaskStatus, "task status", {
     Queued => "queued", Running => "running", Done => "done", Dead => "dead",
+    Cancelled => "cancelled",
 });
 text_enum!(AttemptOutcome, "attempt outcome", {
     Done => "done", Retry => "retry", Dead => "dead", LeaseExpired => "lease_expired",
-    Released => "released",
+    Released => "released", Cancelled => "cancelled",
 });
 
 /// A task handed to a worker by `store::claim`.
@@ -119,6 +123,8 @@ pub struct TaskView {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// The admin action that last cancelled or replayed this task.
+    pub admin_action_id: Option<i64>,
 }
 
 /// One `queue_task_attempts` row.
@@ -286,6 +292,7 @@ mod task_enum_tests {
             TaskStatus::Running,
             TaskStatus::Done,
             TaskStatus::Dead,
+            TaskStatus::Cancelled,
         ] {
             assert_eq!(TaskStatus::from_str(s.as_str()), Ok(s));
         }
@@ -300,6 +307,7 @@ mod task_enum_tests {
             AttemptOutcome::Dead,
             AttemptOutcome::LeaseExpired,
             AttemptOutcome::Released,
+            AttemptOutcome::Cancelled,
         ] {
             assert_eq!(AttemptOutcome::from_str(o.as_str()), Ok(o));
         }
@@ -386,7 +394,7 @@ pub enum JobLifecycle {
 #[cfg(feature = "cron")]
 impl JobLifecycle {
     /// Boundary helper for the `is_paused` column. `pub(crate)` because `jobs`
-    /// and `admin` (sibling modules) call it — a plain `fn` is private to `models`.
+    /// (a sibling module) calls it — a plain `fn` is private to `models`.
     pub(crate) fn is_paused(self) -> bool {
         matches!(self, JobLifecycle::Paused)
     }

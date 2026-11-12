@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::error::{SchedulerError, TaskError};
 use crate::ids::QueueName;
-use crate::models::{ClaimedTask, RetryOutcome, TaskLease};
+use crate::models::{ClaimedTask, RetryOutcome, TaskLease, TaskStatus};
 use crate::pool::SchedulerPool;
 use crate::runtime::builder::{Config, Scheduler};
 use crate::runtime::context::TaskContext;
@@ -29,6 +29,10 @@ const MIN_WAIT: Duration = Duration::from_millis(10);
 /// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bound on each shutdown-time registry write (`stopping`, then the delete), so a stalled
+/// database adds at most 1 s to shutdown.
+const REGISTRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// The shutdown phases every dispatch watches.
 #[derive(Clone)]
 struct Shutdown {
@@ -39,9 +43,12 @@ struct Shutdown {
 }
 
 /// A served queue and the permits that limit its running handlers.
+#[derive(Clone)]
 struct WorkerQueue {
     name: QueueName,
     permits: Arc<Semaphore>,
+    /// When one of its dispatches last ended, for the registry.
+    last_finished: Arc<Mutex<Option<Instant>>>,
 }
 
 impl<P: SchedulerPool> Scheduler<P> {
@@ -65,6 +72,7 @@ impl<P: SchedulerPool> Scheduler<P> {
             .map(|(name, limit)| WorkerQueue {
                 name: name.clone(),
                 permits: Arc::new(Semaphore::new(limit.get())),
+                last_finished: Arc::default(),
             })
             .collect();
         let mut in_flight = JoinSet::new();
@@ -79,10 +87,19 @@ impl<P: SchedulerPool> Scheduler<P> {
         };
         let mut failures = 0u64;
         // A child token: cancelled together with `cancel`, or by the guard if this future is
-        // dropped (aborted, or a failed `try_join!` sibling) so maintenance never outlives it.
-        let maintenance_token = cancel.child_token();
-        let _stop_maintenance = maintenance_token.clone().drop_guard();
-        let maintenance = tokio::spawn(maintain(pool.clone(), config.clone(), maintenance_token));
+        // dropped (aborted, or a failed `try_join!` sibling) so maintenance and the registry
+        // never outlive it.
+        let background = cancel.child_token();
+        let _stop_background = background.clone().drop_guard();
+        let maintenance = tokio::spawn(maintain(pool.clone(), config.clone(), background.clone()));
+        let registration = tokio::spawn(keep_registered(
+            pool.clone(),
+            config.clone(),
+            names.clone(),
+            queues.clone(),
+            health.0.subscribe(),
+            background,
+        ));
         #[cfg(feature = "cron")]
         let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
@@ -181,6 +198,18 @@ impl<P: SchedulerPool> Scheduler<P> {
             }
         }
         in_flight.shutdown().await;
+        // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`. That bounds shutdown, not the
+        // server: a periodic upsert cut off by `cancel`, or a `stopping` write that timed out,
+        // may still execute after the delete below and re-create the row, which then reads
+        // live until its `lost_after` (AdminUI §6.11).
+        if let Err(error) = registration.await {
+            tracing::error!(%error, "registry task panicked");
+        }
+        registry_bounded(async {
+            let mut conn = acquire(&pool).await?;
+            store::remove_worker(&mut conn, &config.worker_id).await
+        })
+        .await;
         Ok(()) // `health` reports Stopped as it drops
     }
 }
@@ -336,7 +365,7 @@ async fn claim_cycle<P: SchedulerPool>(
                 .get(&task.task_name)
                 .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
             let deadline = sent + config.lease_duration;
-            in_flight.spawn(dispatch(
+            let run = dispatch(
                 pool.clone(),
                 config.clone(),
                 handler,
@@ -344,7 +373,13 @@ async fn claim_cycle<P: SchedulerPool>(
                 deadline,
                 permit,
                 shutdown.clone(),
-            ));
+            );
+            let last_finished = queue.last_finished.clone();
+            in_flight.spawn(async move {
+                run.await;
+                *last_finished.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Instant::now());
+            });
         }
         // A full batch only means "loop now" if this queue can still take more.
         full |= full_batch && queue.permits.available_permits() > 0;
@@ -463,17 +498,15 @@ fn dispatch<P: SchedulerPool>(
             () = keep_lease(&pool, &task.lease, &config, &name, deadline) => {
                 drop(cancel_on_drop); // cancel now, not after the check below
                 // A DB-contained handler may have committed its own completion while a
-                // heartbeat waited on the row lock; that heartbeat then matches no row.
-                // Bounded, so a database outage cannot hold the permit here.
-                let completed = async {
-                    store::completed_by(&mut *acquire(&pool).await?, &task.lease).await
+                // heartbeat waited on the row lock, or an operator cancelled the task; the
+                // heartbeat then matches no row. Bounded, so a database outage cannot hold
+                // the permit here.
+                let ended = async {
+                    let mut conn = acquire(&pool).await.ok()?;
+                    Some(ended_elsewhere(&mut conn, &task.lease, &name).await)
                 };
-                let completed = tokio::time::timeout(config.heartbeat_interval, completed).await;
-                if matches!(completed, Ok(Ok(true))) {
-                    metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name)
-                        .increment(1);
-                    tracing::debug!("handler completed the task itself");
-                } else {
+                let ended = tokio::time::timeout(config.heartbeat_interval, ended).await;
+                if !matches!(ended, Ok(Some(true))) {
                     metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
                         .increment(1);
                     tracing::warn!("lease lost; handler dropped");
@@ -553,24 +586,16 @@ async fn finish<P: SchedulerPool>(
     };
     let error = match result {
         Ok(()) => {
-            let completed = match timed("complete", store::complete(&mut conn, lease)).await {
-                Ok(()) => Ok(true),
-                // Benign when a DB-contained handler completed the task itself.
-                Err(SchedulerError::LostOwnership(_)) => store::completed_by(&mut conn, lease)
-                    .await
-                    .inspect(|&by_handler| {
-                        if by_handler {
-                            tracing::debug!("handler completed the task itself");
-                        }
-                    }),
-                Err(error) => Err(error),
-            };
-            match completed {
-                Ok(true) => {
+            match timed("complete", store::complete(&mut conn, lease)).await {
+                Ok(()) => {
                     metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name)
                         .increment(1);
                 }
-                Ok(false) => tracing::warn!("lost ownership before completion"),
+                Err(SchedulerError::LostOwnership(_)) => {
+                    if !ended_elsewhere(&mut conn, lease, &name).await {
+                        tracing::warn!("lost ownership before completion");
+                    }
+                }
                 Err(error) => tracing::error!(%error, "completion failed"),
             }
             return;
@@ -605,7 +630,10 @@ async fn finish<P: SchedulerPool>(
             tracing::error!(classification, error = %message, "task failed; marked dead");
         }
         Err(store_error) => {
-            tracing::warn!(classification, error = %message, %store_error, "task failed; result not recorded");
+            let lost = matches!(store_error, SchedulerError::LostOwnership(_));
+            if !(lost && ended_elsewhere(&mut conn, lease, &name).await) {
+                tracing::warn!(classification, error = %message, %store_error, "task failed; result not recorded");
+            }
         }
     }
 }
@@ -613,20 +641,51 @@ async fn finish<P: SchedulerPool>(
 /// Return the task to `queued` at shutdown without counting the attempt. On failure it stays
 /// `running` until the reaper recovers it after the lease, and that attempt counts.
 async fn release<P: SchedulerPool>(pool: &P, lease: &TaskLease, name: String) {
-    let released = async {
-        let mut conn = acquire(pool).await?;
-        timed("release", store::release(&mut conn, lease)).await
-    }
-    .await;
+    let released = match acquire(pool).await {
+        Ok(mut conn) => match timed("release", store::release(&mut conn, lease)).await {
+            Err(SchedulerError::LostOwnership(_)) => {
+                if !ended_elsewhere(&mut conn, lease, &name).await {
+                    tracing::warn!("lost ownership before release");
+                }
+                return;
+            }
+            released => released,
+        },
+        Err(error) => Err(error),
+    };
     match released {
         Ok(()) => {
             metrics::counter!("pg_task_scheduler_tasks_released_total", "task_name" => name)
                 .increment(1);
             tracing::info!("task released at shutdown; attempt not counted");
         }
-        Err(SchedulerError::LostOwnership(_)) => tracing::warn!("lost ownership before release"),
         Err(error) => {
             tracing::error!(%error, "release failed; the reaper recovers the task after the lease");
+        }
+    }
+}
+
+/// After a heartbeat or transition matched no row: if the task under this lease was completed
+/// by its own handler or cancelled by an operator, count that and return `true`. `false` means
+/// the lease was lost (or the check failed); the caller reports that its own way.
+async fn ended_elsewhere(conn: &mut AsyncPgConnection, lease: &TaskLease, name: &str) -> bool {
+    match store::lease_status(conn, lease).await {
+        Ok(Some(TaskStatus::Done)) => {
+            metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name.to_owned())
+                .increment(1);
+            tracing::debug!("handler completed the task itself");
+            true
+        }
+        Ok(Some(TaskStatus::Cancelled)) => {
+            metrics::counter!("pg_task_scheduler_tasks_cancelled_total", "task_name" => name.to_owned())
+                .increment(1);
+            tracing::info!("task cancelled by an operator; handler dropped");
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(%error, "lease check failed");
+            false
         }
     }
 }
@@ -653,6 +712,9 @@ async fn maintenance_pass<P: SchedulerPool>(
     config: &Config,
 ) -> Result<(), SchedulerError> {
     let mut conn = acquire(pool).await?;
+    if let Err(error) = store::prune_workers(&mut conn).await {
+        registry_failed(&error);
+    }
     let batch = config.retention.batch_size.get();
     let mut cleaning = true;
     loop {
@@ -679,6 +741,83 @@ async fn maintenance_pass<P: SchedulerPool>(
             return Ok(());
         }
     }
+}
+
+/// Keep this worker's display-only registry row (§5.2): upsert at once and every
+/// `registry_interval`. When `cancel` fires, write `stopping` once, within
+/// `REGISTRY_SHUTDOWN_TIMEOUT`, and return. Every other await races `cancel`, so a stalled
+/// pool never holds shutdown.
+async fn keep_registered<P: SchedulerPool>(
+    pool: P,
+    config: Arc<Config>,
+    task_names: Vec<String>,
+    queues: Vec<WorkerQueue>,
+    health: watch::Receiver<WorkerHealth>,
+    cancel: CancellationToken,
+) {
+    let registration = |stopping: bool| {
+        let health = health.borrow();
+        let status = match (stopping, health.status) {
+            (true, _) | (_, HealthStatus::Stopped) => store::WorkerStatus::Stopping,
+            (_, HealthStatus::Starting) => store::WorkerStatus::Starting,
+            (_, HealthStatus::Healthy) => store::WorkerStatus::Healthy,
+            (_, HealthStatus::Degraded) => store::WorkerStatus::Degraded,
+        };
+        let now = Instant::now();
+        store::WorkerRegistration {
+            worker_id: config.worker_id.clone(),
+            label: config.label.clone(),
+            status,
+            last_error: health.last_error.clone(),
+            queues: config
+                .queues
+                .iter()
+                .zip(&queues)
+                .map(|((_, limit), q)| store::QueueSlots {
+                    name: q.name.clone(),
+                    limit: limit.get(),
+                    in_use: limit.get().saturating_sub(q.permits.available_permits()),
+                    finished_ago: q
+                        .last_finished
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .map(|at| now.saturating_duration_since(at)),
+                })
+                .collect(),
+            task_names: task_names.clone(),
+            lost_after: config.registry_interval.saturating_mul(3),
+        }
+    };
+    let upsert = async |reg: store::WorkerRegistration| {
+        let mut conn = acquire(&pool).await?;
+        store::upsert_worker(&mut conn, &reg).await
+    };
+    let mut tick = tokio::time::interval(config.registry_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    while cancel.run_until_cancelled(tick.tick()).await.is_some() {
+        if let Some(Err(error)) = cancel
+            .run_until_cancelled(upsert(registration(false)))
+            .await
+        {
+            registry_failed(&error);
+        }
+    }
+    registry_bounded(upsert(registration(true))).await;
+}
+
+/// A shutdown-time registry write, bounded by `REGISTRY_SHUTDOWN_TIMEOUT`.
+async fn registry_bounded(write: impl Future<Output = Result<(), SchedulerError>>) {
+    match tokio::time::timeout(REGISTRY_SHUTDOWN_TIMEOUT, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => registry_failed(&error),
+        Err(elapsed) => registry_failed(&elapsed),
+    }
+}
+
+/// Registry failures are logged and counted; they never touch health or claiming.
+fn registry_failed(error: &dyn std::fmt::Display) {
+    metrics::counter!("pg_task_scheduler_registry_failures_total").increment(1);
+    tracing::warn!(%error, "worker registry write failed");
 }
 
 /// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)` (§11.2). Saturates

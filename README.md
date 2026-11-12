@@ -30,7 +30,9 @@ scheduled tasks, and retries all use the same `due_at` mechanism.
 
 See [Concurrency Model](docs/Concurrency.md) for races, fencing, and scaling,
 and [Scheduler Design](docs/SchedulerDesign.md) for the data model and state
-machine.
+machine. The optional admin UI is the separate `pg_task_scheduler_admin` crate
+([admin/README.md](admin/README.md)); [Admin UI decisions](docs/AdminUI.md)
+records what it, cancel, pause and the worker registry do, and why.
 
 ## Database Schema
 
@@ -39,8 +41,34 @@ Include it in the host application's migrations before starting workers:
 
 | File | Contents |
 | --- | --- |
-| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox`, `queue_task_replays` |
+| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
+| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions` (replaces `queue_task_replays`, keeping its rows); `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
+
+Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
+the worker registry are part of the core crate and always on.
+
+### Upgrading to `0003`
+
+1. Apply `0003` first.
+2. Then roll out workers built from this version.
+
+Workers from before the upgrade keep claiming and completing tasks against the
+new schema, but they:
+
+- ignore pauses, so a paused queue is still claimed until they are replaced;
+- don't register, so the admin UI shows their queues as having no live worker;
+- drop a cancelled running task through the usual fencing, but report it as a
+  lost lease (`leases_lost_total` and a warning), not a cancellation;
+- fail to replay: their `queue::replay` writes `queue_task_replays`, which
+  `0003` drops. Old code that loads a cancelled task (`store::task`) reports
+  an unknown status.
+
+`0003` replaces CHECK constraints on `queue_tasks` and `queue_task_attempts`,
+which locks each table exclusively and scans it, and builds its indexes without
+`CONCURRENTLY`. A migration runner that wraps it in one transaction holds those
+locks until it commits, so on a large `queue_tasks` enqueues and claims wait
+until it finishes. Apply it at a quiet time.
 
 ## Enqueue
 
@@ -115,8 +143,11 @@ scheduler.run_until_shutdown(CancellationToken::new()).await?;
 Each scheduler generates a unique UUID `worker_id` at startup. It claims due
 tasks for its registered names, heartbeats every `heartbeat_interval`, and
 completes or fails each task with ownership-guarded statements. If a heartbeat
-proves ownership was lost, it cancels `ctx.cancellation` and drops the handler.
-The handler must then stop issuing new non-idempotent side effects.
+proves ownership was lost (the lease expired, or an operator cancelled the
+task), it drops the handler future and then cancels `ctx.cancellation`. The
+handler itself never sees that token fire; only work it spawned with a clone of
+the token does, and that work must stop issuing new non-idempotent side
+effects.
 
 Handlers classify every failure:
 
@@ -191,6 +222,12 @@ bound a task that hangs (for example, stuck on a remote call with no timeout):
 it is released and reclaimed at every deploy and never reaches `dead`. Put
 timeouts on a handler's own awaits.
 
+With the `cron` feature, shutdown can also cut off a materializer transaction,
+which stays open on its pooled connection holding its schedule row lock. The
+transaction sets `idle_in_transaction_session_timeout` to 30 s, so the server
+ends it after 30 s idle; until then, if the host keeps its pool alive after
+`run_until_shutdown` returns, other workers skip that schedule.
+
 ```rust,no_run
 use std::time::Duration;
 use pg_task_scheduler::TaskError;
@@ -208,9 +245,39 @@ tokio::select! {
 ```
 
 Set the orchestrator's grace period (for example Kubernetes
-`terminationGracePeriodSeconds`) above `shutdown_timeout + 5 s`. A released task
+`terminationGracePeriodSeconds`) above `shutdown_timeout + 6 s`: up to 5 s of
+releases, then up to 0.5 s to delete the worker's registry row. A released task
 starts again from the beginning, so make long tasks resumable: keep their
 progress keyed by `task_key`.
+
+### Worker registry
+
+Each worker keeps a row in `queue_workers`, for display only: claims, ownership
+and health never read it. The row holds its label, status (`starting`,
+`healthy`, `degraded` or `stopping`), last error, task names, and per queue the
+limit, handlers in use, whether the queue is paused, and when one of its
+dispatches there last ended. The worker writes it at start and every
+`registry_interval`, marks it `stopping` when shutdown begins, and deletes it
+once the drain ends. Each shutdown write is bounded by 0.5 s, so a stalled
+database adds at most 1 s to shutdown. `store::workers` lists the rows, live
+workers first. A row not written for 3 × `registry_interval` reads as `lost`
+(for example, the process was killed), and every worker's maintenance deletes
+rows not written for 24 h. A failed registry write is logged and counted in
+`pg_task_scheduler_registry_failures_total`; it never affects claiming or
+health.
+
+- `.label("eu-1")` names the worker in the registry. It defaults to the
+  `HOSTNAME` environment variable when that is set and non-empty, and otherwise
+  the worker id is shown.
+- `.registry_interval(d)` sets how often the row is written (default 15 s;
+  `build()` rejects zero and anything over 5 years).
+
+Since the row is a periodic snapshot, it lags: a new worker reads `starting`
+until its second write, a draining worker's row is not refreshed after its
+`stopping` write (a drain longer than 3 × `registry_interval` reads as lost),
+and a write cut off at shutdown can land after the delete and re-create the row
+until it reads as lost and is pruned. See
+[Admin UI decisions](docs/AdminUI.md#6-worker-registry).
 
 ### PostgreSQL-contained work
 
@@ -300,6 +367,20 @@ Advice for choosing queues, sizing workers and deploying. The API is in
 - A task runs only on a worker that serves its queue **and** has a handler
   registered for its task name.
 
+### Pausing a queue
+
+`store::pause_queue(conn, &queue, operator, reason)` stops every worker, on
+every instance, claiming from that queue. It is a `queue_pauses` row, so it
+survives restarts and deploys. Running tasks finish; a task that fails, is
+released or is reaped while paused goes back to `queued` and waits. Producers
+and cron keep enqueuing. A claim that started before the pause committed may
+still take tasks, and idle workers stop waking for the paused queue's due
+tasks. `store::resume_queue` deletes the row and sends `NOTIFY
+queue_available`, so workers claim again at once. Both return whether the state
+changed, and write a `queue_admin_actions` row only when it did. The queue needs
+no tasks, only a valid name. `store::paused_queues` lists the pauses. Workers
+from before `0003` ignore pauses.
+
 ### Sizing workers
 
 - The handlers needed across all instances are about arrival rate × average
@@ -327,10 +408,15 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
 | `tasks_dead_total`, `leases_lost_total`, `leases_expired_total` | handler bugs, or a lease too short for the work | fix the handler or raise `lease_duration` |
 | `tasks_released_total` | rises at deploys, which is expected | outside deploys, look for restart loops |
 | one task name released at every deploy, with `running` above zero between deploys | probably hung: releases never count attempts | add a timeout in the handler |
+| `tasks_cancelled_total` | an operator cancelled running tasks | expected after a cancel; `queue_admin_actions` says who and why |
+
+The admin UI's overview turns the same signals into a status per queue, without
+scanning retained rows (see
+[admin/README.md](admin/README.md#queue-status-what-it-means-and-what-to-do)).
 
 ### Deploys and shutdown
 
-- Make the orchestrator's grace period longer than `shutdown_timeout` + 5 s.
+- Make the orchestrator's grace period longer than `shutdown_timeout` + 6 s.
 - Set `shutdown_timeout` at or above a typical task's duration in the queues
   that process serves.
 - Long handlers should watch `ctx.cancellation`, save progress keyed by
@@ -356,17 +442,54 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
 - **Reaper:** every worker runs it every `reaper_interval`. Expired leases go
   back to `queued` after `crash_retry_delay`, or to `dead` when no attempts
   remain. Running it on many instances is safe.
-- **Retention:** the same maintenance task deletes `done` and `dead` rows and
-  published outbox rows older than their `Retention` periods, in bounded
-  batches. Attempt history is deleted with its task. Each round reaps one batch
-  before it deletes one, so a retention backlog never delays lease recovery.
+- **Retention:** the same maintenance task deletes `done`, `dead` and
+  `cancelled` rows and published outbox rows older than their `Retention`
+  periods, in bounded batches. `cancelled` rows are kept for `Retention.dead`,
+  and the three task deletes share one `batch_size` budget, `done` first.
+  Attempt history is deleted with its task. Each round reaps one batch before
+  it deletes one, so a retention backlog never delays lease recovery.
 - **Replay:** `queue::replay(conn, task_id, operator, reason)` moves a `dead`
-  task back to `queued` with the same `task_key`, resets `attempts`, and bumps
-  `lock_token`. Each replay is recorded in `queue_task_replays`. Enqueue a new
-  `task_key` instead if you want a new external effect.
+  or `cancelled` task back to `queued`, due now, with the same `task_key`. It
+  resets `attempts`, clears `last_error`, bumps `lock_token`, and wakes workers.
+  Each replay is recorded in `queue_admin_actions` and linked from the task's
+  `admin_action_id`. Enqueue a new `task_key` instead if you want a new external
+  effect.
+- **Cancel:** `store::cancel(conn, task_id, operator, reason)` moves a `queued`
+  or `running` task to `cancelled`, recorded in `queue_admin_actions`. A running
+  task's attempt closes with outcome `cancelled`. Its worker's next heartbeat
+  (within `heartbeat_interval`) finds the lease gone and drops the handler;
+  anything it already did stays done. The worker counts this in
+  `tasks_cancelled_total`, not `leases_lost_total`. A handler that finishes
+  first gets `LostOwnership` on completion, and that is counted as a
+  cancellation too. The call never waits on a row lock: it returns
+  `NotCancellable` for a terminal or missing task, and `Busy` when another
+  transaction (for example a handler inside `lock_owned`) still holds the row
+  after 2 s of retries every 100 ms. A cancelled task keeps its `task_key` until
+  retention deletes it (after `Retention.dead`), so enqueueing that key again
+  returns the cancelled task and does not run it; replay does.
+- **Bulk:** `store::cancel_matching` (queued and running) and
+  `store::replay_matching` (dead and cancelled, optionally only those with an
+  exact `last_error`) act on a task name, and optionally one queue. They work in
+  batches of `BULK_BATCH` (500), each one statement and transaction, until a
+  batch comes back short, or until the budget (`BULK_BUDGET`, 10 s) has run out
+  after a full batch. Then `more_remain` is `true`: call again, which is a new
+  action. Each call records one `queue_admin_actions` row, with its `affected`
+  count and `max_task_id`, and touches only tasks with an id up to the highest
+  one when it started, so it ends even while producers keep enqueuing. Rows
+  locked elsewhere are skipped, so concurrent calls split the work; for the same
+  reason `more_remain = false` does not prove that nothing matching is left.
+  `count_cancellable` and `count_replayable` count up to a cap. Cancel by name
+  reads every queued and running row through their partial indexes (never the
+  retained done, dead and cancelled rows) and filters by name: an index on the
+  name there would tax every enqueue.
 - **Inspection:** `store::task`, `store::attempts`, and `store::queue_stats`
-  (counts by status, due count, oldest due age, depth by queue, name and
-  priority with due count and oldest due age, and outbox backlog).
+  (counts of queued, running, done and dead tasks, due count, oldest due age,
+  depth by queue, name and priority with due count and oldest due age, and
+  outbox backlog). The admin UI's read APIs (`store::overview`,
+  `store::queued_page`, `store::running_page`, `store::done_page`,
+  `store::failed_page`, `store::task_detail`, `store::workers`,
+  `store::admin_actions`) are bounded by page size, a count cap or the number of
+  queues and workers, so unlike `queue_stats` they are cheap to poll.
 - **Health:** `Scheduler::health()` reports starting, healthy, degraded, or
   stopped. Claim errors (and, with `cron`, materialize errors) set degraded;
   heartbeat and maintenance failures do not affect health. A worker with no free
@@ -410,11 +533,13 @@ them:
 | `pg_task_scheduler_tasks_retried_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_dead_total` | counter | `task_name` |
 | `pg_task_scheduler_tasks_released_total` | counter | `task_name` (released at shutdown; the attempt is not counted) |
+| `pg_task_scheduler_tasks_cancelled_total` | counter | `task_name` (an operator cancelled the running task; seen by its worker) |
 | `pg_task_scheduler_leases_lost_total` | counter | `task_name` |
 | `pg_task_scheduler_heartbeat_failures_total` | counter | `task_name` |
 | `pg_task_scheduler_leases_expired_total` | counter | (none; reaper) |
 | `pg_task_scheduler_tasks_materialized_total` | counter | (none; `cron` feature only) |
 | `pg_task_scheduler_cleanup_deleted_total` | counter | `kind` = `task` or `outbox` |
+| `pg_task_scheduler_registry_failures_total` | counter | (none; a failed worker registry write or prune) |
 | `pg_task_scheduler_claim_latency_seconds` | histogram | `task_name`, `queue` (claim time − `due_at`, database clock) |
 | `pg_task_scheduler_task_duration_seconds` | histogram | `task_name` |
 | `pg_task_scheduler_db_query_seconds` | histogram | `operation` = `claim`, `heartbeat`, `complete`, `retry`, `fail`, `release`, `reap`, `cleanup` or `materialize` (`materialize` is `cron` only) |
@@ -430,11 +555,13 @@ come from `store::queue_stats`. They are not emitted automatically because that
 query scans retained rows. Poll it at an interval that suits you and publish the
 values as gauges.
 
-### Admin router
+### Admin UI
 
-The optional Axum router (`axum` feature) serves `GET /tasks/:id` and
-`POST /tasks/:id/replay` (plus schedule routes with `cron`). The host must put
-authentication in front of it.
+The core crate has no HTTP dependencies. The admin UI, its JSON API (formerly
+this crate's `axum` feature) and the standalone `pg-task-admin` server are in
+the separate `pg_task_scheduler_admin` crate: see
+[admin/README.md](admin/README.md) for setup and
+[Admin UI decisions](docs/AdminUI.md) for what it does and why.
 
 ## Recurring Schedules
 
@@ -455,7 +582,6 @@ picks the queue for the tasks a schedule produces (default `default`).
 | `deadpool` | yes | Deadpool implementation of `SchedulerPool` |
 | `bb8` | no | bb8 implementation of `SchedulerPool` |
 | `mobc` | no | mobc implementation of `SchedulerPool` |
-| `axum` | no | Administration router |
 | `cron` | no | Recurring schedules as a queue producer |
 
 ## Tests
@@ -463,7 +589,7 @@ picks the queue for the tasks a schedule produces (default `default`).
 ```sh
 cp .env.example .env
 docker compose up -d db
-cargo test --all-features
+cargo test --workspace --all-features
 ```
 
 Every integration test installs the schema into an isolated PostgreSQL schema.

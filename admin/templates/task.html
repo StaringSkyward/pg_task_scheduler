@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Task {{ t.task.id.0 }}{% endblock %}
+{% block content %}
+<h2>Task {{ t.task.id.0 }}</h2>
+<table>
+<tr><th>Key</th><td>{{ t.task.task_key.as_str() }}</td></tr>
+<tr><th>Name</th><td>{{ t.task.task_name.as_str() }}</td></tr>
+<tr><th>Queue</th><td>{{ t.task.queue.as_str() }}</td></tr>
+<tr><th>Status</th><td>{{ status }}</td></tr>
+<tr><th>Priority</th><td>{{ t.task.priority }}</td></tr>
+<tr><th>Attempts</th><td>{{ t.task.attempts }} / {{ t.task.max_attempts }}</td></tr>
+<tr><th>Created</th><td>{{ created }}</td></tr>
+<tr><th>Updated</th><td>{{ updated }}</td></tr>
+<tr><th>Due</th><td>{{ due }}</td></tr>
+<tr><th>Completed</th><td>{{ completed }}</td></tr>
+<tr><th>Locked by</th><td>{% if let Some(w) = t.task.locked_by %}{{ w.as_str() }}{% else %}—{% endif %}</td></tr>
+<tr><th>Lock token</th><td>{{ t.task.lock_token.0 }}</td></tr>
+<tr><th>Lease expires</th><td>{{ locked_until }}</td></tr>
+<tr><th>Last error</th><td>{% if let Some(e) = t.task.last_error %}{{ e }}{% else %}—{% endif %}</td></tr>
+<tr><th>Admin action</th><td>{% if let Some(a) = t.task.admin_action_id %}{{ a }}{% else %}—{% endif %}</td></tr>
+</table>
+
+{% if status == "queued" || status == "running" %}
+<form method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/cancel">
+  <label>Reason <input name="reason" required></label>
+  <button type="submit">Cancel task</button>
+</form>
+{% else if status == "dead" || status == "cancelled" %}
+<form method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/replay">
+  <label>Reason <input name="reason" required></label>
+  <button type="submit">Replay task</button>
+</form>
+{% endif %}
+
+<h2>Payload</h2>
+<pre>{{ payload }}</pre>
+
+<h2>Attempts</h2>
+{% if attempts.is_empty() %}
+<p>No attempts.</p>
+{% else %}
+<table>
+<thead><tr><th>#</th><th>Worker</th><th>Started</th><th>Finished</th><th>Run time</th><th>Outcome</th><th>Error</th></tr></thead>
+<tbody>
+{% for a in attempts %}
+<tr><td>{{ a.no }}</td><td>{{ a.worker }}</td><td>{{ a.started }}</td><td>{{ a.finished }}</td><td>{{ a.run_time }}</td><td>{{ a.outcome }}</td><td>{{ a.error }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<h2>Actions</h2>
+{% if actions.is_empty() %}
+<p>No admin actions.</p>
+{% else %}
+<table>
+<thead><tr><th>When</th><th>Action</th><th>Operator</th><th>Reason</th><th>Affected</th></tr></thead>
+<tbody>
+{% for a in actions %}
+<tr><td>{{ a.at }}</td><td>{{ a.action }}</td><td>{{ a.operator }}</td><td>{{ a.reason }}</td><td>{{ a.affected }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

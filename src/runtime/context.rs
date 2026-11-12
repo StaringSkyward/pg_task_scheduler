@@ -11,8 +11,11 @@ pub struct TaskContext {
     /// Lease expiry as of claim; not updated by heartbeats.
     pub locked_until: DateTime<Utc>,
     /// Cancelled when worker shutdown begins, when a heartbeat proves this
-    /// worker no longer owns the task, or when the dispatch ends. A handler
-    /// that stops early because shutdown began should return
+    /// worker no longer owns the task (its lease was lost, or an operator
+    /// cancelled it), or when the dispatch ends. In the lost-ownership case the
+    /// handler future is dropped before the token fires, so the handler itself
+    /// never observes it; only work it spawned with a clone of the token does.
+    /// A handler that stops early because shutdown began should return
     /// `TaskError::interrupted()`.
     pub cancellation: tokio_util::sync::CancellationToken,
 }

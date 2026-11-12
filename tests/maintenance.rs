@@ -315,15 +315,17 @@ async fn replay_requeues_dead_task_and_audits() {
     assert_eq!(t.completed_at, None);
     let n = db
         .scalar(&format!(
-            "SELECT count(*) AS n FROM queue_task_replays WHERE task_id = {} \
-             AND operator = 'ops@example' AND reason = 'fixed config' AND lock_token = {} \
-             AND task_key = 'k'",
-            c.lease.task_id.0, t.lock_token.0
+            "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' AND task_id = {} \
+             AND operator = 'ops@example' AND reason = 'fixed config' AND affected = 1 \
+             AND task_name = 'email' AND queue = 'default' \
+             AND id = {}",
+            c.lease.task_id.0,
+            t.admin_action_id.unwrap()
         ))
         .await;
     assert_eq!(n, 1);
     assert_eq!(
-        db.scalar("SELECT count(*) AS n FROM queue_task_replays")
+        db.scalar("SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay'")
             .await,
         1
     );
@@ -343,7 +345,7 @@ async fn replay_refuses_non_dead_task() {
             .unwrap()
     );
     assert_eq!(
-        db.scalar("SELECT count(*) AS n FROM queue_task_replays")
+        db.scalar("SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay'")
             .await,
         0
     );
@@ -409,5 +411,47 @@ async fn queue_stats_reports_counts_depth_and_outbox() {
     assert_eq!(s.outbox_unpublished, 1);
     assert!(s.oldest_due_age.is_some());
     assert!(s.oldest_unpublished_age.is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn cleanup_deletes_expired_cancelled_tasks() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    insert_terminal(&mut conn, "cancelled-31", "cancelled", "31 days").await;
+    insert_terminal(&mut conn, "cancelled-1", "cancelled", "1 day").await;
+    let s = store::cleanup(&mut conn, &Retention::default())
+        .await
+        .unwrap();
+    assert_eq!(s.tasks, 1);
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM queue_tasks WHERE task_key = 'cancelled-1'")
+            .await,
+        1
+    );
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancelled_rows_obey_terminal_check() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let err = diesel::sql_query(
+        "INSERT INTO queue_tasks (task_key, task_name, status) VALUES ('c', 'email', 'cancelled')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::CheckViolation,
+                _
+            )
+        ),
+        "{err:?}"
+    );
     db.cleanup().await;
 }

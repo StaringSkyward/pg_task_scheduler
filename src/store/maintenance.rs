@@ -63,6 +63,18 @@ const CLEANUP_DEAD: &str = r#"
     DELETE FROM queue_tasks AS q USING doomed AS d WHERE q.id = d.id
 "#;
 
+#[doc(hidden)]
+pub const CLEANUP_CANCELLED: &str = r#"
+    WITH doomed AS (
+        SELECT id FROM queue_tasks
+        WHERE status = 'cancelled' AND completed_at < now() - $1::interval
+        ORDER BY completed_at ASC, id ASC
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM queue_tasks AS q USING doomed AS d WHERE q.id = d.id
+"#;
+
 const CLEANUP_OUTBOX: &str = r#"
     WITH doomed AS (
         SELECT id FROM queue_outbox
@@ -103,7 +115,7 @@ pub async fn reap_expired(
     })
 }
 
-/// Delete one bounded batch of expired terminal tasks (`done` first, then `dead`, at most
+/// Delete one bounded batch of expired terminal tasks (`done` first, then `dead`, then `cancelled`, at most
 /// `retention.batch_size` in all) and one of published outbox rows. Call repeatedly until
 /// both counts are below `retention.batch_size`.
 pub async fn cleanup(
@@ -127,13 +139,23 @@ pub async fn cleanup(
         }
         None => 0,
     };
+    let cancelled = match NonZeroUsize::new(batch.get().saturating_sub(done + dead)) {
+        Some(left) => {
+            diesel::sql_query(CLEANUP_CANCELLED)
+                .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
+                .bind::<sql_types::BigInt, _>(limit(left))
+                .execute(conn)
+                .await?
+        }
+        None => 0,
+    };
     let outbox = diesel::sql_query(CLEANUP_OUTBOX)
         .bind::<sql_types::Interval, _>(pg_interval(retention.outbox_published))
         .bind::<sql_types::BigInt, _>(limit(batch))
         .execute(conn)
         .await?;
     Ok(CleanupSummary {
-        tasks: done + dead,
+        tasks: done + dead + cancelled,
         outbox,
     })
 }
