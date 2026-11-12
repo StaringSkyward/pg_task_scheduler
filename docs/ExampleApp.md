@@ -92,7 +92,7 @@ repository), the entry says so. Each entry has a source:
 - **Source:** spec "One crate, one image, two roles" (call).
 - **Decision:** `example-app/` is its own crate with its own committed
   `Cargo.lock`. The root `Cargo.toml` has `exclude = ["example-app"]`. CI runs
-  clippy and fmt on it separately.
+  fmt, clippy and the tests on it separately, with `--locked` (see §6.4).
 - **Why:** As a member, its `cron` features would be merged into CI's
   `--workspace` default-feature builds, and the no-`cron` paths of core and
   admin would silently stop being checked.
@@ -263,13 +263,16 @@ repository), the entry says so. Each entry has a source:
 - **Source:** spec "The page" (call).
 - **Decision:** Each button enqueues and answers `303` to `/?kind=…&text=…&task=…`.
   The banner's link is derived from `task` alone: the task page for a single
-  task, `/admin` for a batch.
+  task, `/admin` for a batch. Only the green and blue banners carry it; the
+  amber and red ones have nothing to watch (§6.4).
 - **Why:** Reloading never re-submits. A crafted URL cannot make the banner link
   anywhere else.
 - **Expected behaviour:** Green banner after an enqueue; blue for an existing
   key (`inserted = false`); amber for an idempotency conflict; red for bad input
   or an error. A malformed query shows no banner, not a 400. Banner text is
-  escaped (`web::tests::index_page_escapes_flash_text`).
+  escaped (`web::tests::index_page_escapes_flash_text`), and only an enqueued or
+  existing banner links to the admin UI
+  (`web::tests::enqueued_banner_links_to_the_admin_ui`).
 
 ### 4.2 Order input is validated on the server
 
@@ -333,17 +336,26 @@ repository), the entry says so. Each entry has a source:
 
 ### 5.3 The outbox relay lives in the `web` role
 
-- **Source:** spec "Web role" (call).
-- **Decision:** A loop every 2 s takes unpublished `queue_outbox` rows created
-  at least 3 s ago (oldest first, up to 100), logs each as
-  `delivered order-placed for order <id> (command_key …)` and sets `published_at`, in one
-  transaction with `FOR UPDATE SKIP LOCKED`. The outbox command's `command_key`
-  is the JSON of `(task_key, "order-placed")`.
+- **Source:** spec "Web role" (call); delivery order by Ledger ruling (final
+  review).
+- **Decision:** A loop every 2 s runs one transaction: it selects unpublished
+  `queue_outbox` rows created at least 3 s ago (oldest first, up to 100) with
+  `FOR UPDATE SKIP LOCKED`, "delivers" each by logging
+  `delivered order-placed for order <id> (command_key …)`, then sets
+  `published_at` on those ids. The outbox command's `command_key` is the JSON of
+  `(task_key, "order-placed")`.
 - **Why:** `web` runs as one instance, and the 3 s delay lets the page show
-  *pending*. A comment says a real relay publishes to its broker before marking
-  a row, and consumers deduplicate by `command_key`.
+  *pending*. Delivering before marking, in the same transaction, is the
+  at-least-once order a real relay needs: a crash before the commit leaves the
+  rows unpublished, so they are delivered again, and consumers deduplicate by
+  `command_key`. A comment in `outbox.rs` says so.
+- **Divergence:** The plan prescribed a single
+  `UPDATE … SET published_at … RETURNING`, logging after it committed. That
+  marks first and delivers second, which loses messages on a crash once the log
+  line becomes a broker call. The final review caught it, and the shipped relay
+  uses the order above.
 - **Expected behaviour:** A message shows *pending* for about 3 to 5 s, then
-  *published HH:MM:SS*. The crashed first attempts leave no messages.
+  *published HH:MM:SS UTC*. The crashed first attempts leave no messages.
 
 ## 6. Tests and verification
 
@@ -351,11 +363,12 @@ repository), the entry says so. Each entry has a source:
 
 - **Source:** Ledger ruling 1.
 - **Decision:** The spec's non-goal says no automated tests. The plan's two pure
-  tests stay: the banner-escaping test and the order-input test.
+  tests stay: the banner-escaping test and the order-input test. The final
+  review's banner-link fix added a third, as small and as pure (§6.4).
 - **Why:** They guard the page's only trust boundaries (reflected banner text,
   the order input) at almost no cost. If wrong, delete two small tests.
 - **Expected behaviour:** `cargo test --manifest-path example-app/Cargo.toml`
-  runs 2 tests.
+  runs 3 tests.
 
 ### 6.2 Checks that count rows start from a fresh volume
 
@@ -375,3 +388,30 @@ repository), the entry says so. Each entry has a source:
 - **Why:** The page has no scripted browser test, and the README needs these
   steps to work as written.
 - **Expected behaviour:** Each README step behaves as written.
+
+### 6.4 What the final review changed
+
+- **Source:** Ledger ruling (final review).
+- **Decision:** The whole-branch review found one Important issue and some
+  polish. The fix wave took the Important one and the polish a template reader
+  would copy. It left out an inconsistency in which enqueue routes use a
+  transaction, and cosmetic items.
+  - CI runs the example's clippy and tests with `--locked`, as the Dockerfile
+    builds.
+  - The comments say how an operator cancel really works: the worker sees it at
+    its next heartbeat and drops the handler, and `bulk_import`'s `select!` on
+    `ctx.cancellation` is for shutdown (§3.3).
+  - The relay delivers before it marks (§5.3).
+  - The panel labels its times `UTC`.
+  - `.env.example` and the README warn that `POSTGRES_PASSWORD` goes into a URL
+    (letters and digits only), and that changing it after the first run needs
+    `docker compose down -v`.
+  - `compose.yml` says where to mount a new crate migration (`demo.sql` stays
+    last).
+  - The README says to run `docker compose up --build` after pulling new code.
+  - Only the green and blue banners link to the admin UI (§4.1).
+- **Why:** Without `--locked`, a routine change to the core or admin crates can
+  leave `example-app/Cargo.lock` stale. CI would re-resolve it and stay green,
+  while a newcomer's `docker compose up` fails at the locked build. The other
+  items are what a newcomer copies or trips on first.
+- **Expected behaviour:** A stale example lockfile fails CI, not the demo.
