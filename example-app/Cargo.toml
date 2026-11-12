@@ -1,0 +1,26 @@
+[package]
+name = "example-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pg_task_scheduler = { path = "..", features = ["cron"] }
+pg_task_scheduler_admin = { path = "../admin", features = ["cron"] }
+axum = "0.7"
+askama = "=0.12.1"
+serde_urlencoded = "=0.7.1"
+diesel = { version = "2.3", default-features = false, features = ["postgres_backend", "chrono"] }
+diesel-async = { version = "0.9", features = ["postgres", "deadpool"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+thiserror = "2"
+
+# Standalone: not a member of the repository workspace.
+[workspace]

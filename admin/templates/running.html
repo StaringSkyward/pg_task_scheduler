@@ -1,10 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Running{% endblock %}
+{% block page %}p-running{% endblock %}
 {% block content %}
+<section class="panel">
 <h2>Running</h2>
 {% if rows.is_empty() %}
-<p>Nothing running.</p>
+<div class="body"><p>Nothing running.</p></div>
 {% else %}
+<div class="scroll">
 <table>
 <thead><tr><th>Id</th><th>Task</th><th>Queue</th><th>Worker</th><th>Attempt</th><th>Run time</th><th>Lease expires</th></tr></thead>
 <tbody>
@@ -13,6 +16,8 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
-{% if let Some(n) = next %}<p><a href="{{ n }}">Next</a></p>{% endif %}
+{% if let Some(n) = next %}<p class="next"><a href="{{ n }}">Next</a></p>{% endif %}
+</section>
 {% endblock %}

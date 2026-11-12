@@ -1,8 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Confirm bulk {{ verb }}{% endblock %}
 {% block content %}
-<div data-busy>
+<section class="panel" data-busy>
 <h2>Bulk {{ verb }}</h2>
+<div class="body">
 <p>Task <code>{{ p.task_name }}</code>{% if !p.queue.is_empty() %} on queue <code>{{ p.queue }}</code>{% endif %}{% if !p.error.is_empty() %} with error <code>{{ p.error }}</code>{% endif %}:
 <strong class="match-count">{{ count }}</strong> matching tasks.</p>
 <form method="post" action="{{ base }}/bulk">
@@ -12,7 +13,8 @@
   <input type="hidden" name="error" value="{{ p.error }}">
   <p><label>Type the task name to confirm <input name="confirm_name" required autocomplete="off"></label></p>
   <p><label>Reason <input name="reason" required></label></p>
-  <button type="submit">{{ verb }} all</button>
+  <button type="submit"{% if p.action == "cancel" %} class="danger"{% endif %}>{{ verb }} all</button>
 </form>
 </div>
+</section>
 {% endblock %}

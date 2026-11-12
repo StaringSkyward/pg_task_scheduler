@@ -1256,6 +1256,40 @@ of the design spec; a bare "§N.M" is an entry in this document.
   mode) are ignored. A failed action's page carries `data-refresh="0"`
   (`actions::failed_action_page_does_not_auto_refresh`).
 
+### 7.10 Always dark, in the style of Grafana
+
+- **Source:** user.
+- **Decision:** One dark theme whatever the computer's setting
+  (`color-scheme: dark`), styled after Grafana:
+  - a top bar linking to every list, with the current page underlined;
+  - one panel per section, with a small uppercase title;
+  - compact tables with tabular figures, and the overview's number columns
+    right-aligned;
+  - status pills tinted green, amber, red or grey;
+  - themed inputs and buttons, with Pause, Cancel and bulk cancel in red.
+
+  It is still one stylesheet and no framework or web font (§7.1). Number
+  columns are aligned by position in CSS (`nth-child` on the table's class), so
+  cell markup stays plain `<th>`/`<td>`.
+- **Why:** The pages are information-dense and were hard to scan. The old dark
+  mode switched the background but left links in the browser's default blue
+  and form controls light-themed.
+- **Expected behaviour:** Links are a soft blue (`#6e9fff`) that is readable on
+  the dark background, and inputs, buttons and checkboxes render dark. Every
+  page shows the nav bar. The overview no longer ends with a "Lists" section,
+  because the nav bar replaced it.
+
+### 7.11 Basic viewport support, no responsive layouts
+
+- **Source:** user.
+- **Decision:** Below 700 px wide, the nav bar scrolls sideways under the brand,
+  and table rows stay one line high. Each table scrolls inside its panel. There
+  is no menu and no stacked "card" form of a table.
+- **Why:** The pages should be usable on a phone or a narrow window without
+  complex layouts.
+- **Expected behaviour:** The page itself never scrolls sideways; only a panel's
+  table does.
+
 ## 8. Standalone server
 
 ### 8.1 Two ways to run

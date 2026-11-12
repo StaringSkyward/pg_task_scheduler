@@ -2,3 +2,5 @@
 /docs/superpowers
 /target
 .env
+.superpowers/
+/example-app/target

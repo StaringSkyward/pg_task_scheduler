@@ -5,6 +5,10 @@ using Diesel, `diesel-async`, and Tokio. PostgreSQL is the system of record for
 task state, scheduling, retries, ownership, and completion. Immediate tasks,
 scheduled tasks, and retries all use the same `due_at` mechanism.
 
+Try it locally with the example app: `docker compose up` in
+[example-app/](example-app/README.md) starts a demo with a web page, two workers
+and the admin UI.
+
 ## Guarantees
 
 - **Idempotent enqueue:** each producer-supplied `task_key` maps to exactly one

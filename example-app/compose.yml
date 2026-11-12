@@ -1,0 +1,40 @@
+x-app: &app
+  build: { context: .., dockerfile: example-app/Dockerfile }
+  image: pg-task-scheduler-example
+  environment: &app-env
+    DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in example-app/.env (see README)}@db:5432/demo
+    RUST_LOG: ${RUST_LOG:-info}
+  depends_on: { db: { condition: service_healthy } }
+
+services:
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in example-app/.env (see README)}
+      POSTGRES_DB: demo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # When the crate adds a migration, mount it here in order, and keep
+      # demo.sql last.
+      - ../migrations/0001_create_queue_tables/up.sql:/docker-entrypoint-initdb.d/0001.sql:ro
+      - ../migrations/0002_create_schedule_tables/up.sql:/docker-entrypoint-initdb.d/0002.sql:ro
+      - ../migrations/0003_admin/up.sql:/docker-entrypoint-initdb.d/0003.sql:ro
+      - ./demo.sql:/docker-entrypoint-initdb.d/0004.sql:ro
+    healthcheck:
+      # TCP, not the socket: the init-time server listens only on the socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "demo"]
+      interval: 2s
+      retries: 60
+  worker-1: { <<: *app, command: ["worker"], hostname: worker-1, stop_grace_period: 35s }
+  worker-2: { <<: *app, command: ["worker"], hostname: worker-2, stop_grace_period: 35s }
+  web:
+    <<: *app
+    command: ["web"]
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      <<: *app-env
+      ADMIN_USER: ${ADMIN_USER:?set ADMIN_USER in example-app/.env (see README)}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in example-app/.env (see README)}
+
+volumes:
+  pgdata:

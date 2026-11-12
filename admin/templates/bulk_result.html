@@ -1,8 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Bulk result{% endblock %}
 {% block content %}
-<div data-busy>
+<section class="panel" data-busy>
 <h2>Bulk result</h2>
+<div class="body">
 <p id="bulk-result">{{ affected }} {{ verb }}</p>
 {% if more %}
 <p>More tasks match.</p>
@@ -18,4 +19,5 @@
 {% endif %}
 <p><a href="{{ base }}/overview">Back to overview</a></p>
 </div>
+</section>
 {% endblock %}
