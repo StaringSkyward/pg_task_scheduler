@@ -178,10 +178,13 @@ pub const DONE: &str = select!(
     "t.completed_at DESC, t.id DESC"
 );
 
-// Binds: $1 status, $2 last_error (NULL = any), $3 completed_at, $4 id, $5 limit.
+// Binds: $1 status, $2 last_error (NULL = any), $3 completed_at, $4 id, $5 limit. The literal
+// `status IN (...)` lets a generic plan (where `$1` is unknown) still prove the partial index's
+// predicate; without it, a repeated prepared statement can fall back to a seq scan.
 #[doc(hidden)]
 pub const FAILED: &str = select!(
-    "(SELECT * FROM queue_tasks WHERE status = $1 AND ($2::text IS NULL OR last_error = $2) \
+    "(SELECT * FROM queue_tasks WHERE status = $1 AND status IN ('dead', 'cancelled') \
+      AND ($2::text IS NULL OR last_error = $2) \
       AND (completed_at, id) < ($3, $4) ORDER BY completed_at DESC, id DESC LIMIT $5)",
     "t.completed_at DESC, t.id DESC"
 );
@@ -190,7 +193,7 @@ pub const FAILED: &str = select!(
 #[doc(hidden)]
 pub const FAILED_BY_NAME: &str = select!(
     "(SELECT * FROM queue_tasks WHERE task_name = $6 AND status = $1 \
-      AND ($2::text IS NULL OR last_error = $2) \
+      AND status IN ('dead', 'cancelled') AND ($2::text IS NULL OR last_error = $2) \
       AND (completed_at, id) < ($3, $4) ORDER BY completed_at DESC, id DESC LIMIT $5)",
     "t.completed_at DESC, t.id DESC"
 );

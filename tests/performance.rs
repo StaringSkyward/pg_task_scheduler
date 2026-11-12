@@ -531,18 +531,43 @@ async fn count_cancellable_reads_only_live_rows() {
     db.cleanup().await;
 }
 
+fn assert_index_no_seq_scan(plans: [String; 2], index: &str) {
+    for plan in plans {
+        assert!(
+            plan.contains(index) && !plan.contains("Seq Scan on queue_tasks"),
+            "unexpected query plan:\n{plan}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn count_replayable_uses_failed_name_index() {
     let db = production_shaped_db().await;
     let plans =
         custom_and_generic_plans(&db, store::COUNT_REPLAYABLE, "'name1', NULL, NULL, 10000").await;
-    for plan in plans {
-        assert!(
-            plan.contains("queue_tasks_failed_name_idx")
-                && !plan.contains("Seq Scan on queue_tasks"),
-            "unexpected query plan:\n{plan}"
-        );
-    }
+    assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    db.cleanup().await;
+}
+
+// `status = $1` alone can't prove a generic plan's `$1` lies inside the partial index's
+// predicate; the literal `status IN (...)` must carry it.
+#[tokio::test]
+async fn failed_page_generic_plan_uses_failed_index() {
+    let db = production_shaped_db().await;
+    // $1 status, $2 last_error, $3 completed_at, $4 id, $5 limit.
+    let args = "'dead', NULL, '9999-12-31', 0, 51";
+    let plans = custom_and_generic_plans(&db, store::FAILED, args).await;
+    assert_index_no_seq_scan(plans, "queue_tasks_failed_idx");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_page_by_name_generic_plan_uses_failed_name_index() {
+    let db = production_shaped_db().await;
+    // As FAILED, plus $6 task_name.
+    let args = "'dead', NULL, '9999-12-31', 0, 51, 'name1'";
+    let plans = custom_and_generic_plans(&db, store::FAILED_BY_NAME, args).await;
+    assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
     db.cleanup().await;
 }
 

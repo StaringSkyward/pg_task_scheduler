@@ -371,9 +371,11 @@ of the design spec; a bare "§N.M" is an entry in this document.
   `replay_matching_uses_failed_name_index`,
   `bulk_cancel_batch_reads_only_live_rows`,
   `count_cancellable_reads_only_live_rows`,
-  `count_replayable_uses_failed_name_index`. The last three run on an
-  `ANALYZE`d table of 20,000 done rows and a small live backlog, and check both
-  the custom and the generic plan. Without an EXPLAIN test: primary-key reads
+  `count_replayable_uses_failed_name_index`,
+  `failed_page_generic_plan_uses_failed_index`,
+  `failed_page_by_name_generic_plan_uses_failed_name_index`. The last five run
+  on an `ANALYZE`d table of 20,000 done rows and a small live backlog, and check
+  both the custom and the generic plan. Without an EXPLAIN test: primary-key reads
   (task detail, recent actions) and the small registry and pause tables
   (`store::workers`, `store::paused_queues`). The UI never calls
   `store::queue_stats`, which scans every retained row.
@@ -583,6 +585,27 @@ of the design spec; a bare "§N.M" is an entry in this document.
   feature). A transaction left idle that long ends with its session, releasing
   its locks; the pool discards the closed connection. Cost: a legitimately idle
   transaction over the limit would be ended too; neither path has one.
+
+### 3.14 The Failed and Cancelled lists repeat their status set as a literal
+
+- **Source:** PR #5 review (`docs/reviews/v2-review-002.md`, finding 1).
+- **Decision:** `FAILED` and `FAILED_BY_NAME` test `status = $1` and also the
+  literal `status IN ('dead', 'cancelled')`, the predicate of
+  `queue_tasks_failed_idx` and `queue_tasks_failed_name_idx`.
+- **Why:** A partial index is usable only when the planner can prove the
+  query's `WHERE` implies the index predicate. A custom plan sees `$1 = 'dead'`
+  and can; a generic plan sees an unknown `$1` and cannot, so a prepared
+  statement that switches to its generic plan read the Failed page as a seq
+  scan and sort of every retained row. `FailedStatus` admits only `Dead` and
+  `Cancelled`, so the literal never removes a row the caller asked for.
+- **Expected behaviour:** On an `ANALYZE`d table with 20,000 done and 1,000
+  dead rows, both lists use their failed index and no `Seq Scan on
+  queue_tasks`, under `force_custom_plan` and `force_generic_plan`
+  (`performance::failed_page_generic_plan_uses_failed_index`,
+  `performance::failed_page_by_name_generic_plan_uses_failed_name_index`).
+  Without the literal both tests fail with a seq scan. Any new query on a
+  partial index whose status is a bind parameter repeats the index predicate
+  as a literal the same way.
 
 ## 4. Health rules
 
