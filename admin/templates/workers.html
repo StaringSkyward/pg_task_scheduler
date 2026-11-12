@@ -1,10 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Workers{% endblock %}
+{% block page %}p-workers{% endblock %}
 {% block content %}
+<section class="panel">
 <h2>Workers</h2>
 {% if rows.is_empty() %}
-<p>No workers registered.</p>
+<div class="body"><p>No workers registered.</p></div>
 {% else %}
+<div class="scroll">
 <table>
 <thead><tr><th>Worker</th><th>Started</th><th>Last seen</th><th>Status</th><th>Queues</th><th>Task names</th></tr></thead>
 <tbody>
@@ -12,12 +15,14 @@
 <tr{% if r.lost %} class="lost"{% endif %}>
   <td>{{ r.name }}{% if r.lost %} <small>(lost)</small>{% endif %}</td>
   <td>{{ r.started }}</td><td>{{ r.seen }}</td>
-  <td>{{ r.status }}{% if !r.last_error.is_empty() %} <small>{{ r.last_error }}</small>{% endif %}</td>
+  <td><span class="status {{ r.status }}">{{ r.status }}</span>{% if !r.last_error.is_empty() %} <small>{{ r.last_error }}</small>{% endif %}</td>
   <td>{% for q in r.queues %}<div>{{ q }}</div>{% endfor %}</td>
   <td>{{ r.task_names }}</td>
 </tr>
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
+</section>
 {% endblock %}

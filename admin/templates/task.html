@@ -1,8 +1,10 @@
 {% extends "base.html" %}
 {% block title %}Task {{ t.task.id.0 }}{% endblock %}
 {% block content %}
+<section class="panel">
 <h2>Task {{ t.task.id.0 }}</h2>
-<table>
+<div class="scroll">
+<table class="details">
 <tr><th>Key</th><td>{{ t.task.task_key.as_str() }}</td></tr>
 <tr><th>Name</th><td>{{ t.task.task_name.as_str() }}</td></tr>
 <tr><th>Queue</th><td>{{ t.task.queue.as_str() }}</td></tr>
@@ -19,26 +21,31 @@
 <tr><th>Last error</th><td>{% if let Some(e) = t.task.last_error %}{{ e }}{% else %}—{% endif %}</td></tr>
 <tr><th>Admin action</th><td>{% if let Some(a) = t.task.admin_action_id %}{{ a }}{% else %}—{% endif %}</td></tr>
 </table>
-
+</div>
 {% if status == "queued" || status == "running" %}
-<form method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/cancel">
+<form class="inline body" method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/cancel">
   <label>Reason <input name="reason" required></label>
-  <button type="submit">Cancel task</button>
+  <button type="submit" class="danger">Cancel task</button>
 </form>
 {% else if status == "dead" || status == "cancelled" %}
-<form method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/replay">
+<form class="inline body" method="post" action="{{ base }}/tasks/{{ t.task.id.0 }}/replay">
   <label>Reason <input name="reason" required></label>
   <button type="submit">Replay task</button>
 </form>
 {% endif %}
+</section>
 
+<section class="panel">
 <h2>Payload</h2>
 <pre>{{ payload }}</pre>
+</section>
 
+<section class="panel">
 <h2>Attempts</h2>
 {% if attempts.is_empty() %}
-<p>No attempts.</p>
+<div class="body"><p>No attempts.</p></div>
 {% else %}
+<div class="scroll">
 <table>
 <thead><tr><th>#</th><th>Worker</th><th>Started</th><th>Finished</th><th>Run time</th><th>Outcome</th><th>Error</th></tr></thead>
 <tbody>
@@ -47,13 +54,17 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
+</section>
 
+<section class="panel">
 <h2>Actions</h2>
 {% if actions.is_empty() %}
-<p>No admin actions.</p>
+<div class="body"><p>No admin actions.</p></div>
 {% else %}
-<table>
+<div class="scroll">
+<table class="task-actions">
 <thead><tr><th>When</th><th>Action</th><th>Operator</th><th>Reason</th><th>Affected</th></tr></thead>
 <tbody>
 {% for a in actions %}
@@ -61,5 +72,7 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
+</section>
 {% endblock %}

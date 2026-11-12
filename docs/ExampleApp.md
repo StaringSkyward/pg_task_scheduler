@@ -307,6 +307,24 @@ repository), the entry says so. Each entry has a source:
 - **Expected behaviour:** The summary reads
   `demo_orders: N rows from M completed place-order tasks (A attempts)`.
 
+### 4.5 A generic look that follows the computer's theme
+
+- **Source:** user.
+- **Decision:** A neutral style:
+  - white cards on a light grey page, with the same layout in darker neutrals
+    when the computer is in dark mode (`color-scheme: light dark`);
+  - section 1 is a 2×2 grid, and section 2 is three cards in a row;
+  - one column below 760 px;
+  - blue primary buttons;
+  - banners with a coloured left edge.
+
+  The deliberate-failure markings keep their dashed amber border and badge.
+  Everything is in the page's one `<style>` block, with no framework.
+- **Why:** The admin UI carries the product look (Grafana-style dark). The
+  example page only needs to be clear.
+- **Expected behaviour:** The page is readable in both themes and on a phone.
+  The FAILS ON PURPOSE cards stand out in both.
+
 ## 5. The guarantees
 
 ### 5.1 Duplicate-safe enqueue

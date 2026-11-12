@@ -1,30 +1,43 @@
 {% extends "base.html" %}
 {% block title %}Overview{% endblock %}
+{% block page %}p-overview{% endblock %}
 {% block content %}
 {% if !alert.is_empty() %}
 <div class="alert" role="alert" data-alert-key="{{ alert_key }}">
-  <strong>Attention:</strong>
+  <div>
+  <strong>Attention</strong>
   <ul>
   {% for (name, what) in alert %}
     <li>queue <code>{{ name }}</code> is {{ what }}</li>
   {% endfor %}
   </ul>
+  </div>
   <button type="button" id="dismiss-alert">Dismiss</button>
 </div>
 {% endif %}
 
+<section class="panel">
 <h2>Workers</h2>
+<div class="body">
 {% if live + lost == 0 %}
 <p>No workers registered.</p>
 {% else %}
-<p>{{ live }} live, {{ lost }} lost. Last seen {{ last_seen }}.</p>
+<div class="stats">
+  <div><span class="v">{{ live }}</span> live</div>
+  <div><span class="v">{{ lost }}</span> lost</div>
+  <div><span class="v">{{ last_seen }}</span> last seen</div>
+</div>
 {% endif %}
+</div>
+</section>
 
+<section class="panel">
 <h2>Queues</h2>
 {% if rows.is_empty() %}
-<p>No queues have queued or running tasks.</p>
+<div class="body"><p>No queues have queued or running tasks.</p></div>
 {% else %}
-<table>
+<div class="scroll">
+<table class="queues">
 <thead><tr>
   <th>Queue</th><th>Status</th><th>Workers</th><th>Slots in use / total</th>
   <th>Queued</th><th>Due</th><th>Oldest due wait</th><th>{{ done_header }}</th><th>{{ dead_header }}</th><th>Pause</th>
@@ -36,22 +49,26 @@
   <td><span class="status {{ r.status }}">{{ r.status }}</span>{% if !r.reason.is_empty() %} <small>{{ r.reason }}</small>{% endif %}</td>
   <td>{{ r.workers }}</td><td>{{ r.slots }}</td><td>{{ r.queued }}</td><td>{{ r.due }}</td><td>{{ r.oldest }}</td>
   <td>{{ r.done }}</td><td>{{ r.dead }}</td>
-  <td><form method="post" action="{{ base }}/queues/{% if r.paused %}resume{% else %}pause{% endif %}">
+  <td><form class="inline" method="post" action="{{ base }}/queues/{% if r.paused %}resume{% else %}pause{% endif %}">
     <input type="hidden" name="queue" value="{{ r.name }}">
     <input name="reason" placeholder="reason" required>
-    <button type="submit">{% if r.paused %}Resume{% else %}Pause{% endif %}</button>
+    <button type="submit"{% if !r.paused %} class="danger"{% endif %}>{% if r.paused %}Resume{% else %}Pause{% endif %}</button>
   </form></td>
 </tr>
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
+</section>
 
+<section class="panel">
 <h2>Failure groups</h2>
 {% if groups.is_empty() %}
-<p>No failures in the window.</p>
+<div class="body"><p>No failures in the window.</p></div>
 {% else %}
-<table>
+<div class="scroll">
+<table class="failures">
 <thead><tr><th>Task</th><th>Error</th><th>Dead</th><th>{{ attempts_header }}</th><th></th></tr></thead>
 <tbody>
 {% for g in groups %}
@@ -59,23 +76,31 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
+</section>
 
 {% if !no_handler.is_empty() %}
+<section class="panel">
 <h2>No handler</h2>
+<div class="body">
 <p>Due tasks no live worker on their queue handles; they will not run.</p>
 <ul>
 {% for (queue, names) in no_handler %}
   <li><code>{{ queue }}</code>: {{ names }}</li>
 {% endfor %}
 </ul>
+</div>
+</section>
 {% endif %}
 
+<section class="panel">
 <h2>Recent admin actions</h2>
 {% if actions.is_empty() %}
-<p>None.</p>
+<div class="body"><p>None.</p></div>
 {% else %}
-<table>
+<div class="scroll">
+<table class="recent-actions">
 <thead><tr><th>When</th><th>Operator</th><th>Action</th><th>Affected</th><th>Reason</th></tr></thead>
 <tbody>
 {% for a in actions %}
@@ -83,15 +108,7 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
-
-<h2>Lists</h2>
-<nav>
-  <a href="{{ base }}/workers">Workers</a>
-  <a href="{{ base }}/queued">Queued</a>
-  <a href="{{ base }}/running">Running</a>
-  <a href="{{ base }}/completed">Completed</a>
-  <a href="{{ base }}/failed">Failed</a>
-  <a href="{{ base }}/cancelled">Cancelled</a>
-</nav>
+</section>
 {% endblock %}

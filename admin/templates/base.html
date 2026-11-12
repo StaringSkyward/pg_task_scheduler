@@ -3,12 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>{% block title %}Task scheduler{% endblock %}</title>
 <link rel="stylesheet" href="{{ base }}/assets/admin.css">
 </head>
-<body data-refresh="{{ refresh }}">
-<header>
-  <a href="{{ base }}/overview"><strong>Task scheduler</strong></a>
+<body class="{% block page %}{% endblock %}" data-refresh="{{ refresh }}">
+<header class="topbar">
+  <a class="brand" href="{{ base }}/overview">Task scheduler</a>
+  <nav>
+    <a class="nav-overview" href="{{ base }}/overview">Overview</a>
+    <a class="nav-workers" href="{{ base }}/workers">Workers</a>
+    <a class="nav-queued" href="{{ base }}/queued">Queued</a>
+    <a class="nav-running" href="{{ base }}/running">Running</a>
+    <a class="nav-completed" href="{{ base }}/completed">Completed</a>
+    <a class="nav-failed" href="{{ base }}/failed">Failed</a>
+    <a class="nav-cancelled" href="{{ base }}/cancelled">Cancelled</a>
+  </nav>
   <label class="refresh"><input type="checkbox" id="auto-refresh" checked> Auto-refresh</label>
 </header>
 <main>

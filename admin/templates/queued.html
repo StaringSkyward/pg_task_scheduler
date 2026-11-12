@@ -1,8 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Queued{% endblock %}
+{% block page %}p-queued{% endblock %}
 {% block content %}
+<section class="panel">
 {% if queue.is_empty() %}
 <h2>Queued: pick a queue</h2>
+<div class="body">
 {% if queues.is_empty() %}
 <p>No known queues.</p>
 {% else %}
@@ -12,11 +15,13 @@
 {% endfor %}
 </ul>
 {% endif %}
+</div>
 {% else %}
 <h2>Queued in <code>{{ queue }}</code></h2>
 {% if rows.is_empty() %}
-<p>Nothing queued.</p>
+<div class="body"><p>Nothing queued.</p></div>
 {% else %}
+<div class="scroll">
 <table>
 <thead><tr><th>#</th><th>Id</th><th>Task</th><th>Priority</th><th>Waiting</th><th>Attempts</th><th>Last error</th></tr></thead>
 <tbody>
@@ -25,7 +30,9 @@
 {% endfor %}
 </tbody>
 </table>
+</div>
 {% endif %}
-{% if let Some(n) = next %}<p><a href="{{ n }}">Next</a></p>{% endif %}
+{% if let Some(n) = next %}<p class="next"><a href="{{ n }}">Next</a></p>{% endif %}
 {% endif %}
+</section>
 {% endblock %}
