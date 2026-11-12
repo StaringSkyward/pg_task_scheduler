@@ -1,7 +1,7 @@
 # pg_task_scheduler_admin
 
 An optional admin UI and JSON API for
-[`pg_task_scheduler`](../README.md). Its first page answers one question: are
+[`pg_task_scheduler`](https://github.com/StaringSkyward/pg_task_scheduler). Its first page answers one question: are
 workers registered, are tasks being dequeued and completed, and if not, why not
 and how big is the problem? Below that it lists workers and tasks, shows a task's
 attempts and audit trail, and lets an operator cancel, replay, bulk cancel or
@@ -11,12 +11,11 @@ It is a separate crate so that an application that doesn't use it takes on none
 of its HTTP dependencies. Cancel, pause and the worker registry themselves live
 in the core crate; this crate only calls them. Why each part works the way it
 does, and what to expect from it, is recorded in
-[Admin UI decisions](../docs/AdminUI.md).
+[Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md).
 
 The UI reads the queue tables directly, so it needs migration `0003` (see the
-core README's [Database Schema](../README.md#database-schema)) and workers built
-from the same version: older workers don't register, so the UI shows their
-queues as having no live worker.
+core README's [Database Schema](https://github.com/StaringSkyward/pg_task_scheduler#database-schema)) and workers from the same
+`pg_task_scheduler` version.
 
 ## Two ways to run it
 
@@ -73,7 +72,7 @@ The `pg-task-admin` binary serves the same router with its own pool. It needs
 only database credentials, not your application's code.
 
 ```sh
-cargo install --path admin              # from the repository root
+cargo install pg_task_scheduler_admin
 pg-task-admin hash-password <<< 'secret' # prints an argon2id PHC string
 pg-task-admin --config admin.toml        # runs the server
 ```
@@ -347,7 +346,7 @@ live worker; dismissing it lasts until that set of queues changes.
 | Status (reason) | Meaning | What to do |
 | --- | --- | --- |
 | **paused** | An operator paused the queue. No worker claims from it; running tasks finish. | Resume it when ready. Recent actions show who paused it and why. |
-| **stalled** (no live worker) | Tasks are due and no live, registered worker serves the queue. | Start or fix a worker that serves this queue. On the Workers page, check for lost workers, and for workers from before `0003`, which never register. |
+| **stalled** (no live worker) | Tasks are due and no live, registered worker serves the queue. | Start or fix a worker that serves this queue. On the Workers page, check for lost workers. |
 | **stalled** (nothing finished in 5m) | Tasks are due, and every live worker serving the queue last finished a task there (or, if it never has, started) more than `stall_after` ago. | Look at the Running list: handlers that run for minutes or hang hold every slot. Check workers' status and last error on the Workers page (a `degraded` worker is failing to claim). For a queue whose normal tasks run longer than `stall_after`, raise its threshold. |
 | **backlog** (N task names have no handler) | The oldest due task has waited longer than `backlog_after`, and N due task names have no handler on any live worker serving the queue. Those tasks never run. | Register the handlers, or route those tasks to a queue whose workers have them. The "No handler" section names them. |
 | **backlog** (all N slots busy) | The oldest due task waited longer than `backlog_after`, and running tasks fill every slot the serving workers offer. | Add instances or raise the queue's limit, or find handlers that run too long. |
