@@ -1,7 +1,18 @@
 [package]
 name = "pg_task_scheduler_admin"
 version = "0.1.0"
-edition = "2024"
+description = "Admin UI and JSON API for pg_task_scheduler: an axum router or a standalone server"
+keywords = ["queue", "postgres", "admin", "axum", "jobs"]
+categories = ["database", "web-programming::http-server"]
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src", "assets", "templates", "README.md", "LICENSE"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[bin]]
 name = "pg-task-admin"
@@ -15,21 +26,21 @@ cron = ["pg_task_scheduler/cron"]
 
 [dependencies]
 pg_task_scheduler = { path = "..", version = "0.1.0", default-features = false }
-argon2 = "=0.6.0"
-askama = "=0.12.1"
+argon2 = "0.6.0"
+askama = "0.12.1"
 axum = "0.7"
-base64 = "=0.22.1"
+base64 = "0.22.1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 diesel = { version = "2.3.14", default-features = false, features = ["postgres_backend"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_urlencoded = "=0.7.1"
+serde_urlencoded = "0.7.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "signal", "net"] }
-toml = "=0.8.23"
+toml = "0.8.23"
 tracing = "0.1"
-tracing-subscriber = { version = "=0.3.23", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
