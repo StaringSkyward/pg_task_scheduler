@@ -19,10 +19,13 @@ use crate::models::TaskStatus;
 /// used for enqueueing and handler registration, preventing name/payload drift in
 /// normal Rust use.
 pub trait Task: Send + Sync + 'static {
+    /// The task name stored with each task and matched to its handler. Must be a valid
+    /// [`TaskName`].
     const NAME: &'static str;
     /// Queue this task type is enqueued to unless [`EnqueueOptions::queue`] overrides it.
     /// Workers serve it only if they run that queue.
     const QUEUE: &'static str = "default";
+    /// The task's arguments, stored as JSON.
     type Args: serde::Serialize + DeserializeOwned + Send + 'static;
 }
 
@@ -31,17 +34,22 @@ pub trait Task: Send + Sync + 'static {
 pub struct Priority(i32);
 
 impl Priority {
+    /// Priority 0, the default.
     pub const NORMAL: Self = Self(0);
 
+    /// A priority of `value`; negative values run after [`Priority::NORMAL`].
     pub const fn new(value: i32) -> Self {
         Self(value)
     }
 
+    /// The numeric value.
     pub const fn get(self) -> i32 {
         self.0
     }
 }
 
+/// When and how to run an enqueued task. Start from [`immediate`](Self::immediate) or
+/// [`at`](Self::at).
 #[derive(Debug, Clone)]
 pub struct EnqueueOptions {
     due_at: Option<DateTime<Utc>>,
@@ -62,10 +70,12 @@ impl Default for EnqueueOptions {
 }
 
 impl EnqueueOptions {
+    /// Due now, priority 0, 3 attempts, in `Task::QUEUE`.
     pub fn immediate() -> Self {
         Self::default()
     }
 
+    /// Like [`immediate`](Self::immediate), but not claimed before `due_at`.
     pub fn at(due_at: DateTime<Utc>) -> Self {
         Self {
             due_at: Some(due_at),
@@ -73,11 +83,13 @@ impl EnqueueOptions {
         }
     }
 
+    /// Sets the priority; higher is claimed first within the queue.
     pub fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
     }
 
+    /// Sets how many attempts the task gets before it is marked `dead` (default 3).
     pub fn max_attempts(mut self, max_attempts: MaxAttempts) -> Self {
         self.max_attempts = max_attempts;
         self
@@ -94,9 +106,13 @@ impl EnqueueOptions {
 /// the same task name and payload (the existing task is returned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Enqueued {
+    /// The task's id.
     pub id: TaskId,
+    /// Its status now; for an existing task this may be any status.
     pub status: TaskStatus,
+    /// When it is due.
     pub due_at: DateTime<Utc>,
+    /// `true` if this call created the task.
     pub inserted: bool,
 }
 
@@ -229,7 +245,7 @@ pub const REPLAY: &str = r#"
 "#;
 
 /// Requeue a dead or cancelled task with a fresh attempt budget and audit it. `false` if the task
-/// is missing or neither. Keeps the same `task_key`; use a new key for a genuinely new effect (§18).
+/// is missing or neither. Keeps the same `task_key`; use a new key for a genuinely new effect.
 pub async fn replay(
     conn: &mut AsyncPgConnection,
     id: TaskId,

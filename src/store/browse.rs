@@ -26,28 +26,44 @@ use crate::models::TaskView;
 /// One row of a task list.
 #[derive(Debug, Clone)]
 pub struct TaskRow {
+    /// Row id.
     pub id: TaskId,
+    /// Selects the handler.
     pub task_name: TaskName,
+    /// The queue it runs in.
     pub queue: QueueName,
+    /// Lifecycle state.
     pub status: TaskStatus,
+    /// Higher is claimed first, within its queue.
     pub priority: i32,
+    /// Earliest time a worker may claim it.
     pub due_at: DateTime<Utc>,
+    /// Attempts counted so far.
     pub attempts: i32,
+    /// Attempts allowed in total.
     pub max_attempts: i32,
+    /// Message of the latest failure.
     pub last_error: Option<String>,
+    /// When it was enqueued.
     pub created_at: DateTime<Utc>,
+    /// When it became `done`, `dead` or `cancelled`.
     pub completed_at: Option<DateTime<Utc>>,
+    /// The worker holding the lease, while `running`.
     pub locked_by: Option<WorkerId>,
+    /// Lease expiry, while `running`.
     pub locked_until: Option<DateTime<Utc>>,
-    /// From the attempt whose `lock_token` is the task's current one.
+    /// When the current attempt (the one whose `lock_token` is the task's) started.
     pub attempt_started_at: Option<DateTime<Utc>>,
+    /// When the current attempt ended; `None` while it runs.
     pub attempt_finished_at: Option<DateTime<Utc>>,
 }
 
 /// One page and, if more rows follow, the cursor for the next.
 #[derive(Debug, Clone)]
 pub struct Page<T, C> {
+    /// At most `limit` rows.
     pub items: Vec<T>,
+    /// Pass as `after` to get the next page; `None` on the last page.
     pub next: Option<C>,
 }
 
@@ -56,22 +72,31 @@ pub struct Page<T, C> {
 pub struct QueuedCursor {
     /// Resume in the due segment (else the not-yet-due one).
     pub due: bool,
+    /// Last row's priority.
     pub priority: i32,
+    /// Last row's `due_at`.
     pub due_at: DateTime<Utc>,
+    /// Last row's id.
     pub id: i64,
     /// Rows before the next page.
     pub position: i64,
 }
 
+/// Resume point in the running list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunningCursor {
+    /// Last row's `locked_until`.
     pub locked_until: DateTime<Utc>,
+    /// Last row's id.
     pub id: i64,
 }
 
+/// Resume point in the done, dead and cancelled lists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FinishedCursor {
+    /// Last row's `completed_at`.
     pub completed_at: DateTime<Utc>,
+    /// Last row's id.
     pub id: i64,
 }
 
@@ -334,14 +359,19 @@ pub async fn done_page(
     Ok(page(items, limit, finished))
 }
 
+/// Which terminal failure [`failed_page`] lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailedStatus {
+    /// `dead` tasks.
     Dead,
+    /// `cancelled` tasks.
     Cancelled,
 }
 
+/// Narrows [`failed_page`]; the default matches everything.
 #[derive(Debug, Clone, Default)]
 pub struct FailedFilter {
+    /// Only tasks with this name.
     pub task_name: Option<TaskName>,
     /// Exact match, as bulk replay's filter.
     pub last_error: Option<String>,
@@ -384,11 +414,15 @@ pub async fn failed_page(
 /// A task with its attempt history and the admin actions that touched it.
 #[derive(Debug, Clone)]
 pub struct TaskDetail {
+    /// The task.
     pub task: TaskView,
+    /// Its attempts, in order.
     pub attempts: Vec<Attempt>,
+    /// Admin actions that touched it.
     pub actions: Vec<AdminAction>,
 }
 
+/// The task with this id and its history, if it exists.
 pub async fn task_detail(
     conn: &mut AsyncPgConnection,
     id: TaskId,

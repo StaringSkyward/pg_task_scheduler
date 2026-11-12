@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +46,10 @@ impl<S: Send + Sync> FromRequestParts<S> for Operator {
 /// When a queue's backlog or lack of progress turns its status amber.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueThresholds {
+    /// The queue reads `backlog` once its oldest due task has waited longer (default 5 min).
     pub backlog_after: Duration,
+    /// A queue with due tasks reads `stalled` once no serving worker has finished one of
+    /// its tasks for this long (default 5 min).
     pub stall_after: Duration,
 }
 
@@ -58,18 +62,23 @@ impl Default for QueueThresholds {
     }
 }
 
+/// Status thresholds for every queue, with per-queue overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Thresholds {
+    /// Used for queues with no override.
     pub default: QueueThresholds,
+    /// Overrides, by queue name.
     pub per_queue: HashMap<String, QueueThresholds>,
 }
 
 impl Thresholds {
+    /// The thresholds that apply to queue `q`.
     pub fn for_queue(&self, q: &str) -> &QueueThresholds {
         self.per_queue.get(q).unwrap_or(&self.default)
     }
 }
 
+/// Settings for [`router`]. Start from `AdminConfig::default()` and set `base_path`.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     /// Prefix the router is mounted under, for links and redirects (e.g. `/admin`).
@@ -79,11 +88,15 @@ pub struct AdminConfig {
     pub public_origin: Option<String>,
     /// Page auto-refresh interval; 0 turns it off.
     pub refresh_seconds: u64,
+    /// The overview is computed at most once per this, shared by every viewer (default 5 s).
     pub overview_cache: Duration,
+    /// Rows per list page (default 50).
     pub page_size: i64,
     /// `statement_timeout` for every page read (see [`db::read`]).
     pub statement_timeout: Duration,
+    /// Bounds for the overview's queries.
     pub overview: OverviewParams,
+    /// When a queue's status turns amber.
     pub thresholds: Thresholds,
 }
 

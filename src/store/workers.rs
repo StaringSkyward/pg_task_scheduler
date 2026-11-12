@@ -19,9 +19,13 @@ use crate::models::text_enum;
 /// A registered worker's state, from its health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerStatus {
+    /// Running, with no claim cycle finished yet.
     Starting,
+    /// Its last claim cycle succeeded.
     Healthy,
+    /// Its last claim cycle failed.
     Degraded,
+    /// Shutting down; it claims nothing more.
     Stopping,
 }
 
@@ -32,8 +36,11 @@ text_enum!(WorkerStatus, "worker status", {
 /// One served queue as a worker reports it.
 #[derive(Debug, Clone)]
 pub struct QueueSlots {
+    /// The queue.
     pub name: QueueName,
+    /// Most handlers the worker runs at once for it.
     pub limit: usize,
+    /// Handlers running now.
     pub in_use: usize,
     /// Time since one of this worker's dispatches for the queue last ended, measured locally.
     pub finished_ago: Option<Duration>,
@@ -42,11 +49,17 @@ pub struct QueueSlots {
 /// What a worker writes to its registry row.
 #[derive(Debug, Clone)]
 pub struct WorkerRegistration {
+    /// The worker's id.
     pub worker_id: WorkerId,
+    /// Display name; the worker id is shown when `None`.
     pub label: Option<String>,
+    /// Its state.
     pub status: WorkerStatus,
+    /// Its latest health error.
     pub last_error: Option<String>,
+    /// The queues it serves.
     pub queues: Vec<QueueSlots>,
+    /// The task names it has handlers for.
     pub task_names: Vec<String>,
     /// The row reads as lost once this long passes without another write.
     pub lost_after: Duration,
@@ -133,23 +146,36 @@ pub async fn prune_workers(conn: &mut AsyncPgConnection) -> Result<usize, Schedu
 /// One entry of a worker row's `queues`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct WorkerQueueView {
+    /// The queue.
     pub name: QueueName,
+    /// Most handlers the worker runs at once for it.
     pub limit: i64,
+    /// Handlers running at the last write.
     pub in_use: i64,
+    /// Whether the queue was paused at the last write.
     pub paused: bool,
+    /// When one of the worker's dispatches for the queue last ended.
     pub last_finished_at: Option<DateTime<Utc>>,
 }
 
 /// A `queue_workers` row.
 #[derive(Debug, Clone)]
 pub struct WorkerView {
+    /// The worker's id.
     pub worker_id: WorkerId,
+    /// Display name; show the worker id when `None`.
     pub label: Option<String>,
+    /// When the row was first written.
     pub started_at: DateTime<Utc>,
+    /// When the row was last written.
     pub last_seen_at: DateTime<Utc>,
+    /// The worker's state at the last write.
     pub status: WorkerStatus,
+    /// Its latest health error at the last write.
     pub last_error: Option<String>,
+    /// The queues it serves.
     pub queues: Vec<WorkerQueueView>,
+    /// The task names it has handlers for.
     pub task_names: Vec<String>,
     /// Not written within 3 × its `registry_interval`: it never counts as serving a queue.
     pub lost: bool,
