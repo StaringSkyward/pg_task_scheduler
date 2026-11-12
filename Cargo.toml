@@ -9,7 +9,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
-diesel = { version = "2.3", default-features = false, features = ["postgres_backend", "uuid", "chrono", "serde_json", "32-column-tables"] }
+diesel = { version = "2.3.14", default-features = false, features = ["postgres_backend", "uuid", "chrono", "serde_json", "32-column-tables"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
 diesel-derive-newtype = "2"
 croner = { version = "2", optional = true }
