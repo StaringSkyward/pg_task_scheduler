@@ -19,9 +19,13 @@ use crate::models::text_enum;
 /// What an operator did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminActionKind {
+    /// Moved `dead` or `cancelled` tasks back to `queued`.
     Replay,
+    /// Cancelled `queued` or `running` tasks.
     Cancel,
+    /// Paused a queue.
     Pause,
+    /// Resumed a queue.
     Resume,
 }
 
@@ -32,17 +36,27 @@ text_enum!(AdminActionKind, "admin action", {
 /// One `queue_admin_actions` row.
 #[derive(Debug, Clone)]
 pub struct AdminAction {
+    /// Row id; a task's `admin_action_id` points here.
     pub id: i64,
+    /// What was done.
     pub action: AdminActionKind,
+    /// The task, for a single-task action.
     pub task_id: Option<TaskId>,
+    /// The task name acted on.
     pub task_name: Option<TaskName>,
+    /// The queue acted on, if the action named one.
     pub queue: Option<QueueName>,
+    /// For a bulk replay, the exact `last_error` it was limited to.
     pub last_error_filter: Option<String>,
     /// Bulk id bound: the action covered only tasks with `id <=` this.
     pub max_task_id: Option<i64>,
+    /// Tasks changed.
     pub affected: i64,
+    /// Who did it, as the caller passed it.
     pub operator: String,
+    /// Why, as the caller passed it.
     pub reason: String,
+    /// When.
     pub at: DateTime<Utc>,
 }
 
@@ -141,6 +155,7 @@ const CANCEL_RETRY: Duration = Duration::from_millis(100);
 /// What `cancel` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
+    /// The task is now `cancelled`.
     Cancelled,
     /// Already terminal, or no such task.
     NotCancellable,
@@ -233,6 +248,7 @@ pub const BULK_BUDGET: Duration = Duration::from_secs(10);
 /// Which tasks a bulk action targets.
 #[derive(Debug, Clone)]
 pub struct BulkFilter {
+    /// Only tasks with this name.
     pub task_name: TaskName,
     /// Any queue when `None`.
     pub queue: Option<QueueName>,
@@ -241,8 +257,11 @@ pub struct BulkFilter {
 /// What one bulk call did. `more_remain`: the budget ran out after a full batch; call again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BulkOutcome {
+    /// The `queue_admin_actions` row recording this call.
     pub action_id: i64,
+    /// Tasks changed.
     pub affected: i64,
+    /// Matching tasks may be left; `false` does not prove none are.
     pub more_remain: bool,
 }
 
@@ -508,12 +527,16 @@ pub async fn count_replayable(
 /// A paused queue.
 #[derive(Debug, Clone, diesel::QueryableByName)]
 pub struct QueuePause {
+    /// The paused queue.
     #[diesel(sql_type = sql_types::Text)]
     pub queue: QueueName,
+    /// Who paused it.
     #[diesel(sql_type = sql_types::Text)]
     pub operator: String,
+    /// Why.
     #[diesel(sql_type = sql_types::Text)]
     pub reason: String,
+    /// When.
     #[diesel(sql_type = sql_types::Timestamptz)]
     pub paused_at: DateTime<Utc>,
 }

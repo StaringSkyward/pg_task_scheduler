@@ -10,10 +10,14 @@ const MAX_IDENTIFIER_LEN: usize = 255;
 /// [`WorkerId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IdentifierError {
+    /// The string is empty.
     #[error("identifier must not be empty")]
     Empty,
+    /// The string starts or ends with whitespace.
     #[error("identifier must not have leading or trailing whitespace")]
     SurroundingWhitespace,
+    /// The string is longer than 255 characters.
+    //
     // The literal "255" must track `MAX_IDENTIFIER_LEN` (thiserror cannot
     // interpolate a const into the `#[error(..)]` message).
     #[error("identifier must be at most 255 characters")]
@@ -55,6 +59,7 @@ pub struct TaskId(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
 pub struct LockToken(pub i64);
 
+/// Identity of a recurring schedule (`scheduler_jobs.id`).
 #[cfg(feature = "cron")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
 pub struct JobId(pub Uuid);
@@ -67,6 +72,7 @@ macro_rules! validated_string {
         pub struct $name(String);
 
         impl $name {
+            /// The validated string.
             pub fn as_str(&self) -> &str {
                 &self.0
             }

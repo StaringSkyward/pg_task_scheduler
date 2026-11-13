@@ -5,9 +5,15 @@ using Diesel, `diesel-async`, and Tokio. PostgreSQL is the system of record for
 task state, scheduling, retries, ownership, and completion. Immediate tasks,
 scheduled tasks, and retries all use the same `due_at` mechanism.
 
+**Status: early alpha.** The API and the database schema may change between 0.x
+releases.
+
+Requires PostgreSQL 13 or later, Rust 1.88 or later, Tokio, Diesel 2.3 and
+`diesel-async` 0.9.
+
 Try it locally with the example app: `docker compose up` in
-[example-app/](example-app/README.md) starts a demo with a web page, two workers
-and the admin UI.
+[example-app/](https://github.com/StaringSkyward/pg_task_scheduler/tree/main/example-app) starts a demo with a web page, two
+workers and the admin UI.
 
 ## Guarantees
 
@@ -32,47 +38,30 @@ and the admin UI.
   high-priority task and run a lower one. Priority applies within a queue; use
   queues to isolate work that must not starve.
 
-See [Concurrency Model](docs/Concurrency.md) for races, fencing, and scaling,
-and [Scheduler Design](docs/SchedulerDesign.md) for the data model and state
-machine. The optional admin UI is the separate `pg_task_scheduler_admin` crate
-([admin/README.md](admin/README.md)); [Admin UI decisions](docs/AdminUI.md)
-records what it, cancel, pause and the worker registry do, and why.
+See [Concurrency Model](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/Concurrency.md) for races, fencing, and
+scaling, and [Scheduler Design](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/SchedulerDesign.md) for the data model
+and state machine. The optional admin UI is the separate
+[`pg_task_scheduler_admin`](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/admin/README.md) crate, available on GitHub
+(see [Admin UI](#admin-ui));
+[Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md) records what it, cancel, pause and the
+worker registry do, and why.
 
 ## Database Schema
 
 The crate ships forward-only SQL. It does not install schema automatically.
-Include it in the host application's migrations before starting workers:
+Include it in the host application's migrations before starting workers. The
+files are in the published crate, and in the repository's
+[`migrations/`](https://github.com/StaringSkyward/pg_task_scheduler/tree/v0.1.0/migrations) directory at the tag matching your
+version:
 
 | File | Contents |
 | --- | --- |
 | `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
-| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions` (replaces `queue_task_replays`, keeping its rows); `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
+| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions`; `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
 
 Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
 the worker registry are part of the core crate and always on.
-
-### Upgrading to `0003`
-
-1. Apply `0003` first.
-2. Then roll out workers built from this version.
-
-Workers from before the upgrade keep claiming and completing tasks against the
-new schema, but they:
-
-- ignore pauses, so a paused queue is still claimed until they are replaced;
-- don't register, so the admin UI shows their queues as having no live worker;
-- drop a cancelled running task through the usual fencing, but report it as a
-  lost lease (`leases_lost_total` and a warning), not a cancellation;
-- fail to replay: their `queue::replay` writes `queue_task_replays`, which
-  `0003` drops. Old code that loads a cancelled task (`store::task`) reports
-  an unknown status.
-
-`0003` replaces CHECK constraints on `queue_tasks` and `queue_task_attempts`,
-which locks each table exclusively and scans it, and builds its indexes without
-`CONCURRENTLY`. A migration runner that wraps it in one transaction holds those
-locks until it commits, so on a large `queue_tasks` enqueues and claims wait
-until it finishes. Apply it at a quiet time.
 
 ## Enqueue
 
@@ -121,8 +110,7 @@ within the horizon for a different logical task.
 
 ```rust,no_run
 use std::time::Duration;
-use pg_task_scheduler::{Scheduler, TaskError};
-use tokio_util::sync::CancellationToken;
+use pg_task_scheduler::{CancellationToken, Scheduler, TaskError};
 # use pg_task_scheduler::Task;
 # struct SendEmail;
 # impl Task for SendEmail { const NAME: &'static str = "send-email"; type Args = serde_json::Value; }
@@ -281,7 +269,7 @@ until its second write, a draining worker's row is not refreshed after its
 `stopping` write (a drain longer than 3 × `registry_interval` reads as lost),
 and a write cut off at shutdown can land after the delete and re-create the row
 until it reads as lost and is pruned. See
-[Admin UI decisions](docs/AdminUI.md#6-worker-registry).
+[Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md#6-worker-registry).
 
 ### PostgreSQL-contained work
 
@@ -382,8 +370,7 @@ still take tasks, and idle workers stop waking for the paused queue's due
 tasks. `store::resume_queue` deletes the row and sends `NOTIFY
 queue_available`, so workers claim again at once. Both return whether the state
 changed, and write a `queue_admin_actions` row only when it did. The queue needs
-no tasks, only a valid name. `store::paused_queues` lists the pauses. Workers
-from before `0003` ignore pauses.
+no tasks, only a valid name. `store::paused_queues` lists the pauses.
 
 ### Sizing workers
 
@@ -416,7 +403,7 @@ Poll `store::queue_stats` on a timer and publish the values as gauges (see
 
 The admin UI's overview turns the same signals into a status per queue, without
 scanning retained rows (see
-[admin/README.md](admin/README.md#queue-status-what-it-means-and-what-to-do)).
+[admin/README.md](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/admin/README.md#queue-status-what-it-means-and-what-to-do)).
 
 ### Deploys and shutdown
 
@@ -526,9 +513,10 @@ them:
   `attempt_no`, `worker_id`, and `lock_token`. Failure events add
   `classification` (`retryable` or `permanent`) and, for retries,
   `retry_due_at`. Install any subscriber you like.
-- **Metrics** use [`metrics`](https://docs.rs/metrics). Install a recorder or
-  exporter (Prometheus, StatsD, OpenTelemetry, …) in the application. Without
-  one, every metric call is a no-op.
+- **Metrics** use [`metrics`](https://docs.rs/metrics) 0.24. Install a recorder
+  or exporter (Prometheus, StatsD, OpenTelemetry, …) in the application. Without
+  one, every metric call is a no-op. The recorder must be built for `metrics`
+  0.24: one built for another 0.x version receives nothing.
 
 | Metric | Kind | Labels |
 | --- | --- | --- |
@@ -561,11 +549,27 @@ values as gauges.
 
 ### Admin UI
 
-The core crate has no HTTP dependencies. The admin UI, its JSON API (formerly
-this crate's `axum` feature) and the standalone `pg-task-admin` server are in
-the separate `pg_task_scheduler_admin` crate: see
-[admin/README.md](admin/README.md) for setup and
-[Admin UI decisions](docs/AdminUI.md) for what it does and why.
+The core crate has no HTTP dependencies. The admin UI, its JSON API and the
+standalone `pg-task-admin` server are in the separate `pg_task_scheduler_admin`
+crate: see [admin/README.md](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/admin/README.md) for setup and
+[Admin UI decisions](https://github.com/StaringSkyward/pg_task_scheduler/blob/main/docs/AdminUI.md) for what it does and why.
+
+The admin crate is available on GitHub but is not currently published to
+crates.io, pending feedback from users on its value and features. To embed it,
+take both crates from the same git tag, so the application builds one copy of
+the core crate:
+
+```toml
+[dependencies]
+pg_task_scheduler = { git = "https://github.com/StaringSkyward/pg_task_scheduler", tag = "v0.1.0" }
+pg_task_scheduler_admin = { git = "https://github.com/StaringSkyward/pg_task_scheduler", tag = "v0.1.0" }
+```
+
+To install the standalone server:
+`cargo install --locked --git https://github.com/StaringSkyward/pg_task_scheduler --tag v0.1.0 pg_task_scheduler_admin`.
+
+Feedback on whether the admin UI is useful, and what it should do, is welcome
+in [GitHub issues](https://github.com/StaringSkyward/pg_task_scheduler/issues).
 
 ## Recurring Schedules
 

@@ -5,11 +5,19 @@ use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::models::TaskLease;
 
+/// What a handler knows about the task it is running, passed as its first argument.
 #[derive(Debug, Clone)]
 pub struct TaskContext {
+    /// Ownership of this attempt. Pass it to [`store::complete`](crate::store::complete)
+    /// and [`store::lock_owned`](crate::store::lock_owned) to finish the task in the
+    /// handler's own transaction.
     pub lease: TaskLease,
+    /// The producer's idempotency key; stable across retries, so use it as the
+    /// idempotency key of external effects.
     pub task_key: TaskKey,
+    /// The task's name.
     pub task_name: TaskName,
+    /// Attempts allowed in total; `lease.attempt_no` is this attempt.
     pub max_attempts: i32,
     /// Lease expiry as of claim; not updated by heartbeats.
     pub locked_until: DateTime<Utc>,

@@ -25,6 +25,7 @@ use crate::ids::TaskName;
 use crate::models::interval_to_duration;
 use crate::models::pg_interval;
 
+/// Bounds for [`overview`]. The defaults suit a page refreshed every few seconds.
 #[derive(Debug, Clone)]
 pub struct OverviewParams {
     /// How far back the done/dead/failure figures look.
@@ -33,7 +34,9 @@ pub struct OverviewParams {
     pub count_cap: i64,
     /// Oldest due rows per queue checked for names no worker handles.
     pub no_handler_probe: i64,
+    /// Most failure groups returned.
     pub failure_groups: i64,
+    /// Most recent admin actions returned.
     pub recent_actions: i64,
 }
 
@@ -52,54 +55,80 @@ impl Default for OverviewParams {
 /// A count that is exact unless `capped`, when it means "at least `value`".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Count {
+    /// The count, or the cap it stopped at.
     pub value: i64,
+    /// Whether counting stopped at the cap.
     pub capped: bool,
 }
 
+/// One queue's figures.
 #[derive(Debug, Clone)]
 pub struct QueueOverview {
+    /// The queue.
     pub queue: QueueName,
+    /// Tasks in `queued`, due or not.
     pub queued: Count,
+    /// Queued tasks whose `due_at` has passed.
     pub due: Count,
+    /// Age of the oldest due task; `None` if none is due.
     pub oldest_due_age: Option<Duration>,
+    /// Tasks in `running`.
     pub running: i64,
     /// Done and dead within the window (see `Overview::done_covered`).
     pub done: Count,
+    /// See `done`.
     pub dead: Count,
 }
 
+/// Recent failures of one task name with one error message.
 #[derive(Debug, Clone)]
 pub struct FailureGroup {
+    /// The task name.
     pub task_name: TaskName,
+    /// The error message; empty if none was recorded.
     pub error: String,
+    /// Tasks that went `dead` with this error within the window.
     pub dead: Count,
+    /// Attempts that failed with this error and were retried or lost their lease,
+    /// within the window.
     pub failed_attempts: Count,
 }
 
 /// Due task names in `queue` that no live worker serving it handles.
 #[derive(Debug, Clone)]
 pub struct NoHandler {
+    /// The queue.
     pub queue: QueueName,
+    /// The unhandled names.
     pub task_names: Vec<TaskName>,
 }
 
+/// Everything the admin overview shows, from one [`overview`] call.
 #[derive(Debug, Clone)]
 pub struct Overview {
     /// The database's `now()`.
     pub generated_at: DateTime<Utc>,
+    /// The window asked for.
     pub window: Duration,
     /// How far back the done / dead counts really reach: `window`, or less when `count_cap`
     /// cut the scan short.
     pub done_covered: Duration,
+    /// As `done_covered`, for dead counts.
     pub dead_covered: Duration,
     /// How far back the failure groups' failed-attempt counts reach: `window`, or less when
     /// the newest `count_cap` attempts started within a shorter span.
     pub attempts_covered: Duration,
+    /// Each queue with queued or running tasks, a live worker serving it, or a pause.
     pub queues: Vec<QueueOverview>,
+    /// Registered workers, live ones first.
     pub workers: Vec<WorkerView>,
+    /// Paused queues.
     pub paused: Vec<QueuePause>,
+    /// The largest failure groups, most failures first.
     pub failure_groups: Vec<FailureGroup>,
+    /// Queues whose oldest due tasks include names no live worker handles.
     pub no_handler: Vec<NoHandler>,
+    /// The newest admin actions.
     pub recent_actions: Vec<AdminAction>,
 }
 
@@ -421,6 +450,8 @@ async fn no_handler(
     Ok(out)
 }
 
+/// Gathers the [`Overview`]. Every statement is bounded by `p`, the number of queues or
+/// the number of workers, so it stays cheap on large tables.
 pub async fn overview(
     conn: &mut AsyncPgConnection,
     p: &OverviewParams,
