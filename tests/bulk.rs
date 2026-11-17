@@ -1,5 +1,6 @@
 mod common;
 
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -225,21 +226,26 @@ async fn counts_are_capped() {
     insert_many(&db, "a", "queued", "", 30).await;
     insert_many(&db, "a", "dead", "x", 30).await;
     assert_eq!(
-        store::count_cancellable(&mut conn, &filter("a"), 10)
+        store::count_cancellable(&mut conn, &filter("a"), NonZeroU32::new(10).unwrap())
             .await
             .unwrap(),
         10
     );
     assert_eq!(
-        store::count_cancellable(&mut conn, &filter("a"), 100)
+        store::count_cancellable(&mut conn, &filter("a"), NonZeroU32::new(100).unwrap())
             .await
             .unwrap(),
         30
     );
     assert_eq!(
-        store::count_replayable(&mut conn, &filter("a"), Some("x"), 10)
-            .await
-            .unwrap(),
+        store::count_replayable(
+            &mut conn,
+            &filter("a"),
+            Some("x"),
+            NonZeroU32::new(10).unwrap()
+        )
+        .await
+        .unwrap(),
         10
     );
     drop(conn);

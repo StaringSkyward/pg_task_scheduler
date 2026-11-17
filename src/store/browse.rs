@@ -1,6 +1,8 @@
 //! Bounded, keyset-paged task lists and task detail for the admin pages. Every list reads at
 //! most `limit + 1` rows through an index, however large `queue_tasks` grows.
 
+use std::num::NonZeroU32;
+
 use chrono::DateTime;
 use chrono::TimeZone;
 use chrono::Utc;
@@ -50,7 +52,8 @@ pub struct TaskRow {
     pub last_error: Option<String>,
     /// When it was enqueued.
     pub created_at: DateTime<Utc>,
-    /// The current attempt; `None` if the task was never claimed.
+    /// The current attempt; `None` if no attempt carries the task's current `lock_token` (never
+    /// claimed, or replayed since).
     pub attempt: Option<AttemptRun>,
 }
 
@@ -246,6 +249,15 @@ fn latest() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0).unwrap()
 }
 
+/// The `limit + 1` rows fetched so the page can tell whether more follow. Cannot overflow.
+fn lookahead(limit: NonZeroU32) -> i64 {
+    i64::from(limit.get()) + 1
+}
+
+fn rows_len(items: &[TaskRow]) -> Result<i64, SchedulerError> {
+    i64::try_from(items.len()).map_err(|_| SchedulerError::Invariant("row count exceeds i64"))
+}
+
 fn rows(raw: Vec<Row>) -> Result<Vec<TaskRow>, SchedulerError> {
     raw.into_iter().map(TaskRow::try_from).collect()
 }
@@ -253,11 +265,13 @@ fn rows(raw: Vec<Row>) -> Result<Vec<TaskRow>, SchedulerError> {
 /// Keep `limit` of the `limit + 1` fetched rows; `next` is set iff one was left over.
 fn page<C>(
     mut items: Vec<TaskRow>,
-    limit: i64,
+    limit: NonZeroU32,
     cursor: impl Fn(&TaskRow, usize) -> Result<C, SchedulerError>,
 ) -> Result<Page<TaskRow, C>, SchedulerError> {
-    let more = items.len() as i64 > limit;
-    items.truncate(limit.max(0) as usize);
+    let limit = usize::try_from(limit.get())
+        .map_err(|_| SchedulerError::Invariant("page limit does not fit in usize"))?;
+    let more = items.len() > limit;
+    items.truncate(limit);
     let next = match items.last() {
         Some(r) if more => Some(cursor(r, items.len() - 1)?),
         _ => None,
@@ -271,9 +285,9 @@ pub async fn queued_page(
     conn: &mut AsyncPgConnection,
     queue: &QueueName,
     after: Option<&QueuedCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, QueuedCursor>, SchedulerError> {
-    let want = limit + 1;
+    let want = lookahead(limit);
     let mut items = Vec::new();
     let mut due_len = 0;
     if after.is_none_or(|c| c.due) {
@@ -293,7 +307,7 @@ pub async fn queued_page(
         )?;
         due_len = items.len();
     }
-    if (items.len() as i64) < want {
+    if rows_len(&items)? < want {
         let (d, i) = after
             .filter(|c| !c.due)
             .map_or((earliest(), 0), |c| (c.due_at, c.id));
@@ -302,7 +316,7 @@ pub async fn queued_page(
                 .bind::<sql_types::Text, _>(queue)
                 .bind::<sql_types::Timestamptz, _>(d)
                 .bind::<sql_types::BigInt, _>(i)
-                .bind::<sql_types::BigInt, _>(want - items.len() as i64)
+                .bind::<sql_types::BigInt, _>(want - rows_len(&items)?)
                 .get_results::<Row>(conn)
                 .await?,
         )?);
@@ -314,7 +328,12 @@ pub async fn queued_page(
             priority: r.priority,
             due_at: r.due_at,
             id: r.id.0,
-            position: base + idx as i64 + 1,
+            position: i64::try_from(idx)
+                .ok()
+                .and_then(|i| base.checked_add(i)?.checked_add(1))
+                .ok_or(SchedulerError::InvalidCursor(
+                    "queued cursor position overflow",
+                ))?,
         })
     })
 }
@@ -323,18 +342,22 @@ pub async fn queued_page(
 pub async fn running_page(
     conn: &mut AsyncPgConnection,
     after: Option<&RunningCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, RunningCursor>, SchedulerError> {
     let (u, i) = after.map_or((earliest(), 0), |c| (c.locked_until, c.id));
     let items = rows(
         diesel::sql_query(RUNNING)
             .bind::<sql_types::Timestamptz, _>(u)
             .bind::<sql_types::BigInt, _>(i)
-            .bind::<sql_types::BigInt, _>(limit + 1)
+            .bind::<sql_types::BigInt, _>(lookahead(limit))
             .get_results::<Row>(conn)
             .await?,
     )?;
-    page(items, limit, |r, _| match r.state {
+    page(items, limit, running)
+}
+
+fn running(r: &TaskRow, _: usize) -> Result<RunningCursor, SchedulerError> {
+    match r.state {
         TaskState::Running { locked_until, .. } => Ok(RunningCursor {
             locked_until,
             id: r.id.0,
@@ -342,7 +365,7 @@ pub async fn running_page(
         _ => Err(SchedulerError::Invariant(
             "running page returned a task in the wrong state",
         )),
-    })
+    }
 }
 
 fn finished(r: &TaskRow, _: usize) -> Result<FinishedCursor, SchedulerError> {
@@ -361,14 +384,14 @@ fn finished(r: &TaskRow, _: usize) -> Result<FinishedCursor, SchedulerError> {
 pub async fn done_page(
     conn: &mut AsyncPgConnection,
     after: Option<&FinishedCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, FinishedCursor>, SchedulerError> {
     let (c, i) = after.map_or((latest(), i64::MAX), |c| (c.completed_at, c.id));
     let items = rows(
         diesel::sql_query(DONE)
             .bind::<sql_types::Timestamptz, _>(c)
             .bind::<sql_types::BigInt, _>(i)
-            .bind::<sql_types::BigInt, _>(limit + 1)
+            .bind::<sql_types::BigInt, _>(lookahead(limit))
             .get_results::<Row>(conn)
             .await?,
     )?;
@@ -399,7 +422,7 @@ pub async fn failed_page(
     status: FailedStatus,
     filter: &FailedFilter,
     after: Option<&FinishedCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, FinishedCursor>, SchedulerError> {
     let (c, i) = after.map_or((latest(), i64::MAX), |c| (c.completed_at, c.id));
     let status = match status {
@@ -415,7 +438,7 @@ pub async fn failed_page(
     .bind::<sql_types::Nullable<sql_types::Text>, _>(filter.last_error.as_deref())
     .bind::<sql_types::Timestamptz, _>(c)
     .bind::<sql_types::BigInt, _>(i)
-    .bind::<sql_types::BigInt, _>(limit + 1);
+    .bind::<sql_types::BigInt, _>(lookahead(limit));
     let items = match &filter.task_name {
         Some(n) => rows(
             q.bind::<sql_types::Text, _>(n)
@@ -453,4 +476,32 @@ pub async fn task_detail(
         attempts,
         actions,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queued_row() -> TaskRow {
+        TaskRow {
+            id: TaskId(1),
+            task_name: TaskName::try_from("job").unwrap(),
+            queue: QueueName::default(),
+            state: TaskState::Queued,
+            priority: 0,
+            due_at: Utc::now(),
+            attempts: 0,
+            max_attempts: MaxAttempts::default_value(),
+            last_error: None,
+            created_at: Utc::now(),
+            attempt: None,
+        }
+    }
+
+    #[test]
+    fn cursor_builders_reject_a_row_in_the_wrong_state() {
+        let r = queued_row();
+        assert!(matches!(finished(&r, 0), Err(SchedulerError::Invariant(_))));
+        assert!(matches!(running(&r, 0), Err(SchedulerError::Invariant(_))));
+    }
 }

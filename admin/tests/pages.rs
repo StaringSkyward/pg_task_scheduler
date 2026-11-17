@@ -435,7 +435,7 @@ async fn failed_attempts_header_shows_covered_span() {
     assert!(body.contains("<th>Failed attempts (1h)</th>"), "{body}");
     let config = AdminConfig {
         overview: pg_task_scheduler::store::OverviewParams {
-            count_cap: 2,
+            count_cap: std::num::NonZeroU32::new(2).unwrap(),
             ..Default::default()
         },
         ..Default::default()

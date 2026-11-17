@@ -265,7 +265,7 @@ async fn confirm<P: SchedulerPool>(
                 refresh: state.config.refresh_seconds,
                 p: &p,
                 verb: if b.replay { "replay" } else { "cancel" },
-                count: if n >= cap {
+                count: if n >= i64::from(cap.get()) {
                     format!("{n}+")
                 } else {
                     n.to_string()

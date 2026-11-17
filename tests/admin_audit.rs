@@ -1,4 +1,6 @@
 mod common;
+use std::num::NonZeroU32;
+
 use common::TestDb;
 use diesel_async::RunQueryDsl;
 use pg_task_scheduler::TaskStatus;
@@ -97,9 +99,11 @@ async fn task_actions_include_linked_bulk_action() {
             ..
         }
     ));
-    let all = store::admin_actions(&mut conn, None, 10).await.unwrap();
+    let all = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
     assert_eq!(all.len(), 2);
-    let older = store::admin_actions(&mut conn, Some(all[0].id), 10)
+    let older = store::admin_actions(&mut conn, Some(all[0].id), NonZeroU32::new(10).unwrap())
         .await
         .unwrap();
     assert_eq!(older.len(), 1);
@@ -128,7 +132,9 @@ async fn bulk_replay_with_error_filter_records_it() {
     .await
     .unwrap();
     assert_eq!(out.affected, 1);
-    let a = store::admin_actions(&mut conn, None, 10).await.unwrap();
+    let a = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
     assert_eq!(a.len(), 1);
     let AdminActionTarget::Bulk {
         action: BulkAction::Replay { last_error },

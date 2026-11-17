@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -31,23 +32,34 @@ pub struct OverviewParams {
     /// How far back the done/dead/failure figures look.
     pub window: Duration,
     /// Rows any one count or window scan reads.
-    pub count_cap: i64,
+    pub count_cap: NonZeroU32,
     /// Oldest due rows per queue checked for names no worker handles.
-    pub no_handler_probe: i64,
+    pub no_handler_probe: NonZeroU32,
     /// Most failure groups returned.
-    pub failure_groups: i64,
+    pub failure_groups: NonZeroU32,
     /// Most recent admin actions returned.
-    pub recent_actions: i64,
+    pub recent_actions: NonZeroU32,
+}
+
+impl OverviewParams {
+    /// `count_cap` as the bound the queries bind and compare against.
+    fn cap(&self) -> i64 {
+        i64::from(self.count_cap.get())
+    }
+}
+
+const fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).unwrap()
 }
 
 impl Default for OverviewParams {
     fn default() -> Self {
         Self {
             window: Duration::from_secs(3600),
-            count_cap: 10_000,
-            no_handler_probe: 100,
-            failure_groups: 20,
-            recent_actions: 10,
+            count_cap: nz(10_000),
+            no_handler_probe: nz(100),
+            failure_groups: nz(20),
+            recent_actions: nz(10),
         }
     }
 }
@@ -321,10 +333,10 @@ async fn window_counts(
 ) -> Result<Window, SchedulerError> {
     let rows = diesel::sql_query(sql)
         .bind::<sql_types::Interval, _>(pg_interval(p.window))
-        .bind::<sql_types::BigInt, _>(p.count_cap)
+        .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<WindowRow>(conn)
         .await?;
-    let capped = rows.iter().map(|r| r.n).sum::<i64>() >= p.count_cap;
+    let capped = rows.iter().map(|r| r.n).sum::<i64>() >= p.cap();
     let covered = covered(p, now, capped, rows.iter().map(|r| r.oldest).min());
     Ok(Window {
         per_queue: rows.into_iter().map(|r| (r.queue, r.n)).collect(),
@@ -342,13 +354,13 @@ async fn failure_groups(
 ) -> Result<(Vec<FailureGroup>, Duration), SchedulerError> {
     let dead = diesel::sql_query(DEAD_GROUPS)
         .bind::<sql_types::Interval, _>(pg_interval(p.window))
-        .bind::<sql_types::BigInt, _>(p.count_cap)
+        .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<GroupRow>(conn)
         .await?;
-    let dead_capped = dead.iter().map(|r| r.n).sum::<i64>() >= p.count_cap;
+    let dead_capped = dead.iter().map(|r| r.n).sum::<i64>() >= p.cap();
     let attempts = diesel::sql_query(OVERVIEW_FAILED_ATTEMPTS)
         .bind::<sql_types::Interval, _>(pg_interval(p.window))
-        .bind::<sql_types::BigInt, _>(p.count_cap)
+        .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<AttemptGroupRow>(conn)
         .await?;
     // Every row repeats the scan's size and oldest start; there is always at least one.
@@ -356,7 +368,7 @@ async fn failure_groups(
         [r, ..] => (r.scanned, r.oldest),
         [] => (0, None),
     };
-    let attempts_capped = scanned >= p.count_cap;
+    let attempts_capped = scanned >= p.cap();
     let attempts_covered = covered(p, now, attempts_capped, oldest);
     let attempts = attempts.into_iter().filter_map(|r| {
         Some(GroupRow {
@@ -399,7 +411,9 @@ async fn failure_groups(
             .then_with(|| a.task_name.as_str().cmp(b.task_name.as_str()))
             .then_with(|| a.error.cmp(&b.error))
     });
-    groups.truncate(p.failure_groups.max(0) as usize);
+    let keep = usize::try_from(p.failure_groups.get())
+        .map_err(|_| SchedulerError::Invariant("failure group limit does not fit in usize"))?;
+    groups.truncate(keep);
     Ok((groups, attempts_covered))
 }
 
@@ -425,7 +439,7 @@ async fn no_handler(
     }
     let rows = diesel::sql_query(NO_HANDLER)
         .bind::<sql_types::Array<sql_types::Text>, _>(names(&served))
-        .bind::<sql_types::BigInt, _>(p.no_handler_probe)
+        .bind::<sql_types::BigInt, _>(i64::from(p.no_handler_probe.get()))
         .get_results::<NameRow>(conn)
         .await?;
     let mut out: Vec<NoHandler> = Vec::new();
@@ -480,7 +494,7 @@ pub async fn overview(
 
     let counts = diesel::sql_query(OVERVIEW_COUNTS)
         .bind::<sql_types::Array<sql_types::Text>, _>(names(&set))
-        .bind::<sql_types::BigInt, _>(p.count_cap)
+        .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<CountsRow>(conn)
         .await?;
     let done = window_counts(conn, OVERVIEW_DONE, p, generated_at).await?;
@@ -488,7 +502,7 @@ pub async fn overview(
 
     let cap = |value: i64| Count {
         value,
-        capped: value >= p.count_cap,
+        capped: value >= p.cap(),
     };
     let windowed = |w: &Window, q: &QueueName| Count {
         value: w.per_queue.get(q).copied().unwrap_or(0),

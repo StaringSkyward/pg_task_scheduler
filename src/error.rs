@@ -39,6 +39,9 @@ pub enum SchedulerError {
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+    /// A page cursor cannot advance (its position would overflow).
+    #[error("invalid cursor: {0}")]
+    InvalidCursor(&'static str),
     /// The same `task_key` was enqueued with a different task name or payload.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),

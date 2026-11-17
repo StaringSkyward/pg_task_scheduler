@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,7 +92,7 @@ pub struct AdminConfig {
     /// The overview is computed at most once per this, shared by every viewer (default 5 s).
     pub overview_cache: Duration,
     /// Rows per list page (default 50).
-    pub page_size: i64,
+    pub page_size: NonZeroU32,
     /// `statement_timeout` for every page read (see [`db::read`]).
     pub statement_timeout: Duration,
     /// Bounds for the overview's queries.
@@ -100,6 +101,8 @@ pub struct AdminConfig {
     pub thresholds: Thresholds,
 }
 
+const DEFAULT_PAGE_SIZE: NonZeroU32 = NonZeroU32::new(50).unwrap();
+
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
@@ -107,7 +110,7 @@ impl Default for AdminConfig {
             public_origin: None,
             refresh_seconds: 10,
             overview_cache: Duration::from_secs(5),
-            page_size: 50,
+            page_size: DEFAULT_PAGE_SIZE,
             statement_timeout: Duration::from_secs(5),
             overview: OverviewParams::default(),
             thresholds: Thresholds::default(),

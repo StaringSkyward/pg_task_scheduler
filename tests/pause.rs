@@ -1,5 +1,6 @@
 mod common;
 
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 use std::time::Instant;
@@ -146,7 +147,9 @@ async fn pause_is_idempotent_and_audited() {
     assert!(!resume(&db, "bulk").await);
     let mut conn = db.pool.get().await.unwrap();
     assert!(store::paused_queues(&mut conn).await.unwrap().is_empty());
-    let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
+    let actions = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
     let kinds: Vec<_> = actions.iter().map(|a| a.kind()).collect();
     assert_eq!(kinds, [AdminActionKind::Resume, AdminActionKind::Pause]);
     assert!(matches!(

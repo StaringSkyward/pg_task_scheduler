@@ -279,10 +279,10 @@ keys, which map onto it. Unknown TOML keys are an error.
 | `public_origin` | `public_origin` | none | Browser-facing origin accepted by the CSRF check when a proxy rewrites `Host`. Must match exactly. |
 | `refresh_seconds` | `refresh_seconds` | 10 | Page auto-refresh; 0 turns it off. |
 | `overview_cache` | `overview_cache_seconds` | 5 s | The overview is computed at most once per this, shared by every viewer. |
-| `page_size` | (none) | 50 | Rows per list page. |
+| `page_size` | (none) | 50 | Rows per list page; positive. |
 | `statement_timeout` | `statement_timeout_seconds` | 5 s | Limit on each page-read statement, and on idle time inside a page read's transaction. |
 | `overview.window` | `window_seconds` | 1 h | How far back the Done and Dead columns and the failure groups look. |
-| `overview.count_cap` | `count_cap` | 10,000 | Most rows any count reads; larger counts show as `10,000+`. Also caps the bulk confirm count. |
+| `overview.count_cap` | `count_cap` | 10,000 | Most rows any count reads (positive); larger counts show as `10,000+`. Also caps the bulk confirm count. |
 | `overview.no_handler_probe` | (none) | 100 | Oldest due tasks per queue checked for task names no live worker handles. |
 | `overview.failure_groups` | (none) | 20 | Failure groups shown. |
 | `overview.recent_actions` | (none) | 10 | Recent admin actions shown. |

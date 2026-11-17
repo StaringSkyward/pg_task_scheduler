@@ -1,5 +1,6 @@
 mod common;
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::TestDb;
@@ -94,7 +95,7 @@ async fn overview_caps_counts() {
     )
     .await;
     let p = OverviewParams {
-        count_cap: 5,
+        count_cap: NonZeroU32::new(5).unwrap(),
         ..Default::default()
     };
     let o = overview(&db, &p).await;
@@ -151,7 +152,7 @@ async fn overview_caps_failed_attempts() {
     )
     .await;
     let p = OverviewParams {
-        count_cap: 5,
+        count_cap: NonZeroU32::new(5).unwrap(),
         ..Default::default()
     };
     let o = overview(&db, &p).await;

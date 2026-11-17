@@ -237,6 +237,10 @@ async fn queued<P: SchedulerPool>(
     };
     let limit = config.page_size;
     let start = after.as_ref().map_or(0, |c| c.position);
+    // A forged cursor at the top of the range cannot number the next page.
+    if start.checked_add(i64::from(limit.get())).is_none() {
+        return bad("invalid cursor");
+    }
     let r = db::read(&state.pool, config.statement_timeout, {
         let name = name.clone();
         move |c| Box::pin(async move { store::queued_page(c, &name, after.as_ref(), limit).await })

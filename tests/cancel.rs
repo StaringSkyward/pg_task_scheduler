@@ -2,6 +2,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -96,7 +97,9 @@ async fn cancel_queued_task() {
 
     let t = store::task(&mut conn, id).await.unwrap().unwrap();
     assert_eq!(t.state.status(), TaskStatus::Cancelled); // Finished carries completed_at
-    let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
+    let actions = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
     assert_eq!(actions.len(), 1);
     let a = &actions[0];
     assert_eq!(a.kind(), AdminActionKind::Cancel);

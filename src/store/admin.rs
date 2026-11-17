@@ -1,5 +1,6 @@
 //! Admin operations and their audit: single-task cancel, `queue_admin_actions` rows and queries.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -249,14 +250,14 @@ const COLUMNS: &str = "id, action, task_id, task_name, queue, last_error_filter,
 pub async fn admin_actions(
     conn: &mut AsyncPgConnection,
     before: Option<i64>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Vec<AdminAction>, SchedulerError> {
     diesel::sql_query(format!(
         "SELECT {COLUMNS} FROM queue_admin_actions \
          WHERE ($1::bigint IS NULL OR id < $1) ORDER BY id DESC LIMIT $2"
     ))
     .bind::<sql_types::Nullable<sql_types::BigInt>, _>(before)
-    .bind::<sql_types::BigInt, _>(limit)
+    .bind::<sql_types::BigInt, _>(i64::from(limit.get()))
     .get_results::<ActionRow>(conn)
     .await?
     .into_iter()
@@ -640,12 +641,12 @@ pub const COUNT_REPLAYABLE: &str = "\
 pub async fn count_cancellable(
     conn: &mut AsyncPgConnection,
     filter: &BulkFilter,
-    cap: i64,
+    cap: NonZeroU32,
 ) -> Result<i64, SchedulerError> {
     Ok(diesel::sql_query(COUNT_CANCELLABLE)
         .bind::<sql_types::Text, _>(&filter.task_name)
         .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
-        .bind::<sql_types::BigInt, _>(cap)
+        .bind::<sql_types::BigInt, _>(i64::from(cap.get()))
         .get_result::<N>(conn)
         .await?
         .n)
@@ -656,13 +657,13 @@ pub async fn count_replayable(
     conn: &mut AsyncPgConnection,
     filter: &BulkFilter,
     last_error: Option<&str>,
-    cap: i64,
+    cap: NonZeroU32,
 ) -> Result<i64, SchedulerError> {
     Ok(diesel::sql_query(COUNT_REPLAYABLE)
         .bind::<sql_types::Text, _>(&filter.task_name)
         .bind::<sql_types::Nullable<sql_types::Text>, _>(&filter.queue)
         .bind::<sql_types::Nullable<sql_types::Text>, _>(last_error)
-        .bind::<sql_types::BigInt, _>(cap)
+        .bind::<sql_types::BigInt, _>(i64::from(cap.get()))
         .get_result::<N>(conn)
         .await?
         .n)
