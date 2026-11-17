@@ -10,6 +10,7 @@ use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
 use pg_task_scheduler::QueueName;
 use pg_task_scheduler::ScheduleName;
+use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::jobs::CreateJob;
@@ -313,5 +314,127 @@ async fn invalid_stored_queue_pauses_its_job_and_the_pass_continues() {
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
     assert!(db.is_paused(bad).await);
     assert_eq!(db.task_ids(good).await.len(), 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn job_args_that_serde_cannot_parse_are_copied_into_the_task() {
+    use diesel_async::RunQueryDsl;
+    let db = TestDb::new().await;
+    let job = db
+        .insert_job("huge", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    // Valid JSONB, but outside f64: serde_json cannot parse it.
+    diesel::sql_query(r#"UPDATE scheduler_jobs SET job_args = '{"x":1e500}' WHERE id = $1"#)
+        .bind::<diesel::sql_types::Uuid, _>(job)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let ids = db.task_ids(job).await;
+    assert_eq!(ids.len(), 1);
+    let payload = diesel::sql_query("SELECT payload::text AS v FROM queue_tasks WHERE id = $1")
+        .bind::<diesel::sql_types::BigInt, _>(ids[0])
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    let args = diesel::sql_query("SELECT job_args::text AS v FROM scheduler_jobs WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(job)
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    assert_eq!(payload, args);
+    assert!(!db.is_paused(job).await);
+    db.cleanup().await;
+}
+
+#[derive(diesel::QueryableByName)]
+struct DefaultIsolation {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    default_transaction_isolation: String,
+}
+
+/// Each job transaction begins at READ COMMITTED itself, so a REPEATABLE READ session default
+/// neither breaks the pause recheck nor turns into a configuration error. A trigger records the
+/// isolation from inside the transaction.
+#[tokio::test]
+async fn materialize_runs_read_committed_under_a_repeatable_read_session() {
+    use diesel_async::RunQueryDsl;
+    use diesel_async::SimpleAsyncConnection;
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "CREATE TABLE seen (v text); \
+         CREATE FUNCTION record_isolation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           INSERT INTO seen VALUES (current_setting('transaction_isolation')); \
+           RETURN NEW; END $$; \
+         CREATE TRIGGER record_isolation BEFORE INSERT ON queue_tasks \
+           FOR EACH ROW EXECUTE FUNCTION record_isolation(); \
+         SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    )
+    .await
+    .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let inside = diesel::sql_query("SELECT v FROM seen")
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    assert_eq!(inside, "read committed");
+    let level = diesel::sql_query("SHOW default_transaction_isolation")
+        .get_result::<DefaultIsolation>(&mut conn)
+        .await
+        .unwrap()
+        .default_transaction_isolation;
+    assert_eq!(level, "repeatable read");
+    db.cleanup().await;
+}
+
+/// The `BEGIN` goes through diesel-async's transaction manager, which does not see one sent with
+/// `batch_execute`. Inside such an untracked block our own `BEGIN ... READ COMMITTED` would
+/// switch it to READ COMMITTED (or fail, once it has run a query), never run at REPEATABLE READ.
+#[tokio::test]
+async fn materialize_inside_a_repeatable_read_transaction_is_a_config_error() {
+    use diesel_async::AnsiTransactionManager;
+    use diesel_async::TransactionManager;
+    let db = TestDb::new().await;
+    let job = db
+        .insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    AnsiTransactionManager::begin_transaction_sql(
+        &mut *conn,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    )
+    .await
+    .unwrap();
+    let r = store::materialize_due_jobs(&mut conn).await;
+    assert!(matches!(r, Err(SchedulerError::Config(_))), "{r:?}");
+    AnsiTransactionManager::rollback_transaction(&mut *conn)
+        .await
+        .unwrap();
+    assert!(db.task_ids(job).await.is_empty());
+    db.cleanup().await;
+}
+
+/// Inside a READ COMMITTED transaction each job runs in a savepoint of it.
+#[tokio::test]
+async fn materialize_inside_a_read_committed_transaction_runs() {
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let n = conn
+        .build_transaction()
+        .read_committed()
+        .run(async |c| store::materialize_due_jobs(c).await)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
     db.cleanup().await;
 }

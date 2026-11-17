@@ -9,7 +9,7 @@ CREATE TABLE scheduler_jobs (
                            AND task_name !~ '^[[:space:]]|[[:space:]]$'),
     cron_expression TEXT NOT NULL,
     job_args        JSONB NOT NULL DEFAULT '{}'::jsonb,
-    next_run_at     TIMESTAMPTZ NOT NULL,
+    next_run_at     TIMESTAMPTZ NOT NULL CHECK (isfinite(next_run_at)),
     max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
     queue           TEXT NOT NULL DEFAULT 'default',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

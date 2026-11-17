@@ -93,3 +93,18 @@ async fn infinite_due_at_is_rejected() {
     assert!(is_check_violation(&e), "{e:?}");
     db.cleanup().await;
 }
+
+#[cfg(feature = "cron")]
+#[tokio::test]
+async fn infinite_next_run_at_is_rejected() {
+    let db = TestDb::new().await;
+    let e = exec(
+        &db,
+        "INSERT INTO scheduler_jobs (name, task_name, cron_expression, next_run_at) \
+         VALUES ('j', 'j', '*/1 * * * *', '-infinity')",
+    )
+    .await
+    .unwrap_err();
+    assert!(is_check_violation(&e), "{e:?}");
+    db.cleanup().await;
+}

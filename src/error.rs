@@ -23,7 +23,9 @@ pub enum SchedulerError {
     #[cfg(feature = "cron")]
     #[error("cron parse error: {0}")]
     Cron(String),
-    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting.
+    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting, or (with
+    /// `cron`) `store::materialize_due_jobs` was called inside a transaction that is not READ
+    /// COMMITTED.
     #[error("configuration error: {0}")]
     Config(String),
     /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName),
