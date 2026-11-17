@@ -56,9 +56,9 @@ version:
 
 | File | Contents |
 | --- | --- |
-| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox` |
+| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks` (with the `cancelled` status and `admin_action_id`), `queue_task_attempts`, `queue_outbox` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
-| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions`; `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
+| `migrations/0003_admin/up.sql` | `queue_admin_actions`; `queue_pauses`; `queue_workers`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
 
 Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
 the worker registry are part of the core crate and always on.

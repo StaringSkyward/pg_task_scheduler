@@ -48,49 +48,13 @@ async fn replay_of_cancelled_task_requeues_it() {
 }
 
 #[tokio::test]
-async fn migration_keeps_replay_audit() {
-    let db = TestDb::bare().await;
-    db.install(include_str!(
-        "../migrations/0001_create_queue_tables/up.sql"
-    ))
-    .await;
-    exec(
-        &db,
-        "INSERT INTO queue_task_replays (task_id, task_key, lock_token, operator, reason) \
-         VALUES (7, 'k', 2, 'ops', 'r')",
-    )
-    .await;
-    db.install(include_str!("../migrations/0003_admin/up.sql"))
-        .await;
-    assert_eq!(
-        db.scalar(
-            "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' \
-             AND operator = 'ops' AND reason = 'r' AND task_id = 7 AND affected = 1"
-        )
-        .await,
-        1
-    );
-    assert_eq!(
-        db.scalar("SELECT count(*) AS n FROM queue_admin_actions")
-            .await,
-        1
-    );
-    assert_eq!(
-        db.scalar("SELECT (to_regclass('queue_task_replays') IS NULL)::int::bigint AS n")
-            .await,
-        1
-    );
-    db.cleanup().await;
-}
-
-#[tokio::test]
 async fn task_actions_include_linked_bulk_action() {
     let db = TestDb::new().await;
     let id = insert_task(&db, "cancelled").await;
     exec(
         &db,
-        "INSERT INTO queue_admin_actions (action, queue, affected, operator, reason) \
-         VALUES ('cancel', 'default', 5, 'ops', 'bulk')",
+        "INSERT INTO queue_admin_actions (action, task_name, max_task_id, affected, operator, reason) \
+         VALUES ('cancel', 'email', 100, 5, 'ops', 'bulk')",
     )
     .await;
     exec(

@@ -378,8 +378,8 @@ async fn task_data_is_escaped() {
     .await;
     sql(
         &db,
-        "INSERT INTO queue_admin_actions (action, task_id, affected, operator, reason) \
-         SELECT 'cancel', id, 1, 'op', '<i>r</i>' FROM queue_tasks",
+        "INSERT INTO queue_admin_actions (action, task_id, task_name, queue, affected, operator, reason) \
+         SELECT 'cancel', id, task_name, queue, 1, 'op', '<i>r</i>' FROM queue_tasks",
     )
     .await;
     sql(

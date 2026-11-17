@@ -12,7 +12,7 @@ CREATE TABLE queue_tasks (
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     status TEXT NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('queued', 'running', 'done', 'dead')),
+        CHECK (status IN ('queued', 'running', 'done', 'dead', 'cancelled')),
 
     -- Higher integer means higher priority.
     priority INTEGER NOT NULL DEFAULT 0,
@@ -42,6 +42,10 @@ CREATE TABLE queue_tasks (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
 
+    -- The admin action (queue_admin_actions) that last replayed or cancelled this task. No FK:
+    -- the audit outlives task retention.
+    admin_action_id BIGINT,
+
     -- A running row always has an owner and lease.
     -- A non-running row never retains an active owner or lease.
     CHECK (
@@ -56,7 +60,7 @@ CREATE TABLE queue_tasks (
 
     -- Terminal states have a completion timestamp; active states do not.
     CHECK (
-        (status IN ('done', 'dead') AND completed_at IS NOT NULL)
+        (status IN ('done', 'dead', 'cancelled') AND completed_at IS NOT NULL)
         OR
         (status IN ('queued', 'running') AND completed_at IS NULL)
     )
@@ -76,23 +80,26 @@ CREATE INDEX queue_tasks_expired_lease_idx
 
 CREATE INDEX queue_tasks_terminal_cleanup_idx
     ON queue_tasks (completed_at ASC, id ASC)
-    WHERE status IN ('done', 'dead');
+    WHERE status IN ('done', 'dead', 'cancelled');
 
 -- PRIMARY KEY is (task_id, lock_token), not (task_id, attempt_no): replay resets
 -- attempts to 0, so attempt_no repeats for a task but lock_token never does.
 CREATE TABLE queue_task_attempts (
     task_id BIGINT NOT NULL
         REFERENCES queue_tasks(id) ON DELETE CASCADE,
-    attempt_no INTEGER NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
     lock_token BIGINT NOT NULL,
     worker_id TEXT NOT NULL,
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ,
     outcome TEXT
-        CHECK (outcome IN ('done', 'retry', 'dead', 'lease_expired', 'released')),
+        CHECK (outcome IN ('done', 'retry', 'dead', 'lease_expired', 'released', 'cancelled')),
     error TEXT,
 
-    PRIMARY KEY (task_id, lock_token)
+    PRIMARY KEY (task_id, lock_token),
+
+    -- An attempt is closed exactly when it has an outcome.
+    CHECK ((finished_at IS NULL) = (outcome IS NULL))
 );
 
 CREATE INDEX queue_task_attempts_task_idx
@@ -123,14 +130,3 @@ CREATE INDEX queue_outbox_unpublished_idx
 CREATE INDEX queue_outbox_published_idx
     ON queue_outbox (published_at, id)
     WHERE published_at IS NOT NULL;
-
--- Audit of administrative replays. No FK: the audit outlives task retention.
-CREATE TABLE queue_task_replays (
-    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    task_id     BIGINT NOT NULL,
-    task_key    TEXT NOT NULL,
-    lock_token  BIGINT NOT NULL,
-    operator    TEXT NOT NULL,
-    reason      TEXT NOT NULL,
-    replayed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);

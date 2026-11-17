@@ -1,26 +1,4 @@
--- 1. cancelled status: a terminal state beside done and dead.
-ALTER TABLE queue_tasks DROP CONSTRAINT queue_tasks_status_check;
-ALTER TABLE queue_tasks ADD CONSTRAINT queue_tasks_status_check
-    CHECK (status IN ('queued', 'running', 'done', 'dead', 'cancelled'));
-
-ALTER TABLE queue_tasks DROP CONSTRAINT queue_tasks_check1;
-ALTER TABLE queue_tasks ADD CONSTRAINT queue_tasks_check1
-    CHECK (
-        (status IN ('done', 'dead', 'cancelled') AND completed_at IS NOT NULL)
-        OR
-        (status IN ('queued', 'running') AND completed_at IS NULL)
-    );
-
-ALTER TABLE queue_task_attempts DROP CONSTRAINT queue_task_attempts_outcome_check;
-ALTER TABLE queue_task_attempts ADD CONSTRAINT queue_task_attempts_outcome_check
-    CHECK (outcome IN ('done', 'retry', 'dead', 'lease_expired', 'released', 'cancelled'));
-
-DROP INDEX queue_tasks_terminal_cleanup_idx;
-CREATE INDEX queue_tasks_terminal_cleanup_idx
-    ON queue_tasks (completed_at ASC, id ASC)
-    WHERE status IN ('done', 'dead', 'cancelled');
-
--- 2. admin action audit: one row per operator action; replaces queue_task_replays.
+-- 1. admin action audit: one row per operator action.
 -- No FKs: the audit outlives task retention.
 CREATE TABLE queue_admin_actions (
     id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -33,25 +11,30 @@ CREATE TABLE queue_admin_actions (
     affected          BIGINT NOT NULL DEFAULT 0,
     operator          TEXT NOT NULL,
     reason            TEXT NOT NULL,
-    at                TIMESTAMPTZ NOT NULL DEFAULT now()
+    at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Shape per action: pause/resume name a queue only; a single replay/cancel names its task,
+    -- name and queue; a bulk one names the task name and the max_task_id bound (only a bulk
+    -- replay may filter on last_error).
+    CHECK (
+        (action IN ('pause', 'resume') AND queue IS NOT NULL AND task_id IS NULL
+            AND task_name IS NULL AND last_error_filter IS NULL AND max_task_id IS NULL)
+        OR (action IN ('replay', 'cancel') AND task_id IS NOT NULL AND task_name IS NOT NULL
+            AND queue IS NOT NULL AND last_error_filter IS NULL AND max_task_id IS NULL)
+        OR (action IN ('replay', 'cancel') AND task_id IS NULL AND task_name IS NOT NULL
+            AND max_task_id IS NOT NULL AND (last_error_filter IS NULL OR action = 'replay'))
+    )
 );
 CREATE INDEX queue_admin_actions_task_idx
     ON queue_admin_actions (task_id) WHERE task_id IS NOT NULL;
 
-ALTER TABLE queue_tasks ADD COLUMN admin_action_id BIGINT;
-
-INSERT INTO queue_admin_actions (action, task_id, affected, operator, reason, at)
-SELECT 'replay', task_id, 1, operator, reason, replayed_at
-FROM queue_task_replays ORDER BY id;
-DROP TABLE queue_task_replays;
-
--- 3. bulk replay and the failed-task browser find dead/cancelled rows by name. Partial, so
+-- 2. bulk replay and the failed-task browser find dead/cancelled rows by name. Partial, so
 -- enqueue, claim and completion never maintain it.
 CREATE INDEX queue_tasks_failed_name_idx
     ON queue_tasks (task_name, status, completed_at DESC, id DESC)
     WHERE status IN ('dead', 'cancelled');
 
--- 4. queue pauses: a row stops every worker claiming from that queue.
+-- 3. queue pauses: a row stops every worker claiming from that queue.
 CREATE TABLE queue_pauses (
     queue     TEXT PRIMARY KEY,
     operator  TEXT NOT NULL,
@@ -59,7 +42,7 @@ CREATE TABLE queue_pauses (
     paused_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 5. worker registry: display-only, never read by claims or ownership. Each worker upserts its
+-- 4. worker registry: display-only, never read by claims or ownership. Each worker upserts its
 -- row every registry_interval and deletes it after a clean shutdown. lost_after is
 -- now() + 3 × registry_interval at each write, so readers need no worker config.
 CREATE TABLE queue_workers (
@@ -74,8 +57,8 @@ CREATE TABLE queue_workers (
     task_names   TEXT[] NOT NULL
 );
 
--- 6. the failed/cancelled browser lists newest first without a task_name filter. Partial like
--- section 3's index, so enqueue, claim and completion never maintain it.
+-- 5. the failed/cancelled browser lists newest first without a task_name filter. Partial like
+-- section 2's index, so enqueue, claim and completion never maintain it.
 CREATE INDEX queue_tasks_failed_idx
     ON queue_tasks (status, completed_at DESC, id DESC)
     WHERE status IN ('dead', 'cancelled');
