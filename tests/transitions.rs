@@ -13,6 +13,7 @@ use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::LockToken;
 use pg_task_scheduler::MaxAttempts;
 use pg_task_scheduler::OutboxCommand;
+use pg_task_scheduler::OutboxWrite;
 use pg_task_scheduler::RetryOutcome;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
@@ -67,10 +68,10 @@ async fn claimed(db: &TestDb) -> ClaimedTask {
 
 fn cmd(effect: &str, key: &str) -> OutboxCommand {
     OutboxCommand {
-        effect_name: effect.to_owned(),
-        command_key: key.to_owned(),
-        topic: "t".to_owned(),
-        payload: json!({"a": 1}),
+        effect_name: effect.try_into().unwrap(),
+        command_key: key.try_into().unwrap(),
+        topic: "t".try_into().unwrap(),
+        payload: json!({}),
     }
 }
 
@@ -312,28 +313,80 @@ async fn stale_worker_cannot_emit_outbox_command() {
     db.cleanup().await;
 }
 
+async fn preinsert(conn: &mut AsyncPgConnection, command_key: &str, payload: &str) {
+    diesel::sql_query(
+        "INSERT INTO queue_outbox (task_key, effect_name, command_key, topic, payload) \
+         VALUES ('k', 'e', $1, 't', $2::jsonb)",
+    )
+    .bind::<diesel::sql_types::Text, _>(command_key)
+    .bind::<diesel::sql_types::Text, _>(payload)
+    .execute(conn)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
-async fn outbox_insert_is_idempotent_per_effect() {
+async fn same_effect_and_content_is_already_present() {
     let db = TestDb::new().await;
     let c = claimed(&db).await;
     let mut conn = db.pool.get().await.unwrap();
-    diesel::sql_query(
-        "INSERT INTO queue_outbox (task_key, effect_name, command_key, topic, payload) \
-         VALUES ('k', 'e', 'pre', 't', '{}')",
-    )
-    .execute(&mut conn)
-    .await
-    .unwrap();
-    let inserted = store::complete_with_outbox(&mut conn, &c.lease, &cmd("e", "ck"))
+    preinsert(&mut conn, "ck", "{}").await;
+    let w = store::complete_with_outbox(&mut conn, &c.lease, &cmd("e", "ck"))
         .await
         .unwrap();
-    assert!(!inserted);
+    assert_eq!(w, OutboxWrite::AlreadyPresent);
     let t = store::task(&mut conn, c.lease.task_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Done);
+    assert_eq!(t.status, TaskStatus::Done); // Task 9 changes this to t.state.status()
+    db.cleanup().await;
+}
 
+#[tokio::test]
+async fn same_effect_with_different_content_conflicts_and_rolls_back() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    preinsert(&mut conn, "older", "{}").await;
+    let r = store::complete_with_outbox(&mut conn, &c.lease, &cmd("e", "ck")).await;
+    assert!(
+        matches!(r, Err(SchedulerError::OutboxConflict { .. })),
+        "{r:?}"
+    );
+    let t = store::task(&mut conn, c.lease.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM queue_task_attempts WHERE finished_at IS NULL")
+            .await,
+        1
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn outbox_payload_key_order_is_not_a_conflict() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    preinsert(&mut conn, "ck", r#"{"b": 2,   "a": 1}"#).await;
+    let mut command = cmd("e", "ck");
+    command.payload = serde_json::json!({"a": 1, "b": 2});
+    let w = store::complete_with_outbox(&mut conn, &c.lease, &command)
+        .await
+        .unwrap();
+    assert_eq!(w, OutboxWrite::AlreadyPresent);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn command_key_collision_across_tasks_fails() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    preinsert(&mut conn, "pre", "{}").await;
     // A fresh task whose command_key collides with another task's row fails loudly.
     enqueue_key(&mut conn, "k2").await;
     let c2 = claim_one(&mut conn).await.unwrap();
@@ -348,14 +401,15 @@ async fn outbox_insert_is_idempotent_per_effect() {
 }
 
 #[tokio::test]
-async fn new_outbox_row_reports_true() {
+async fn new_outbox_row_is_inserted() {
     let db = TestDb::new().await;
     let c = claimed(&db).await;
     let mut conn = db.pool.get().await.unwrap();
-    assert!(
+    assert_eq!(
         store::complete_with_outbox(&mut conn, &c.lease, &cmd("e", "ck"))
             .await
-            .unwrap()
+            .unwrap(),
+        OutboxWrite::Inserted
     );
     assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_outbox").await, 1);
     db.cleanup().await;

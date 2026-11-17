@@ -1,7 +1,8 @@
 //! Crate error types.
 
-use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
+use crate::ids::EffectName;
+use crate::ids::IdentifierError;
 use crate::ids::JobId;
 use crate::ids::TaskId;
 use crate::ids::TaskKey;
@@ -41,6 +42,14 @@ pub enum SchedulerError {
     /// The same `task_key` was enqueued with a different task name or payload.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),
+    /// The task already recorded this effect with a different command key, topic or payload.
+    #[error("outbox conflict: effect {} of task key {} already exists with different content", .effect_name.as_str(), .task_key.as_str())]
+    OutboxConflict {
+        /// The task's key.
+        task_key: TaskKey,
+        /// The effect whose stored content differs.
+        effect_name: EffectName,
+    },
     /// A worker-owned mutation matched no row: the lease was lost or expired.
     #[error("lost ownership of task {0:?}")]
     LostOwnership(TaskId),

@@ -58,6 +58,7 @@ pub use crate::models::JobLifecycle;
 pub use crate::models::MaxAttempts;
 pub use crate::models::MaxAttemptsError;
 pub use crate::models::OutboxCommand;
+pub use crate::models::OutboxWrite;
 pub use crate::models::ParseEnumError;
 pub use crate::models::QueueDepth;
 pub use crate::models::QueueStats;

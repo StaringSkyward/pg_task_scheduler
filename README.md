@@ -311,20 +311,27 @@ To emit a command for later delivery, complete with
 ownership-guarded completion succeeds:
 
 ```rust,no_run
-# use pg_task_scheduler::{OutboxCommand, SchedulerError, TaskContext, store};
+# use pg_task_scheduler::{CommandKey, EffectName, OutboxCommand, OutboxWrite, SchedulerError, TaskContext, Topic, store};
 # async fn example(conn: &mut diesel_async::AsyncPgConnection, ctx: &TaskContext) -> Result<(), SchedulerError> {
 let command = OutboxCommand {
-    effect_name: "order-shipped".into(),
+    effect_name: EffectName::try_from("order-shipped")?,
     // Any unambiguous, stable encoding of (task_key, effect_name).
-    command_key: serde_json::to_string(&(ctx.task_key.as_str(), "order-shipped"))?,
-    topic: "orders".into(),
+    command_key: CommandKey::try_from(serde_json::to_string(&(ctx.task_key.as_str(), "order-shipped"))?)?,
+    topic: Topic::try_from("orders")?,
     payload: serde_json::json!({ "order": 12345 }),
 };
-let inserted = store::complete_with_outbox(conn, &ctx.lease, &command).await?;
-# let _ = inserted;
+match store::complete_with_outbox(conn, &ctx.lease, &command).await? {
+    OutboxWrite::Inserted => {}        // a new outbox row was written
+    OutboxWrite::AlreadyPresent => {}  // an earlier attempt wrote the same command
+}
 # Ok(())
 # }
 ```
+
+If the task already has a row for the same `effect_name` but with a different
+command key, topic or payload, `complete_with_outbox` returns
+`SchedulerError::OutboxConflict` and the completion rolls back. Propagating it
+with `?` fails the task permanently.
 
 Publishing `queue_outbox` rows is the application's job. The relay must set
 `published_at`, and receivers must deduplicate by `command_key`.

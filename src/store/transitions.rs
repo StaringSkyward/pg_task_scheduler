@@ -9,7 +9,9 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
+use crate::ids::TaskKey;
 use crate::models::OutboxCommand;
+use crate::models::OutboxWrite;
 use crate::models::RetryOutcome;
 use crate::models::TaskLease;
 use crate::models::TaskStatus;
@@ -58,7 +60,11 @@ const COMPLETE_WITH_OUTBOX: &str = concat!(
         RETURNING id
     )
     SELECT completed.id AS completed_task_id,
-           EXISTS (SELECT 1 FROM outbox_insert) AS inserted_outbox_row
+           completed.task_key AS completed_task_key,
+           EXISTS (SELECT 1 FROM outbox_insert) AS inserted_outbox_row,
+           EXISTS (SELECT 1 FROM queue_outbox o
+                   WHERE o.task_key = completed.task_key AND o.effect_name = $4
+                     AND o.command_key = $5 AND o.topic = $6 AND o.payload = $7) AS same_content
     FROM completed"
 );
 
@@ -114,8 +120,12 @@ struct OutboxRow {
     #[diesel(sql_type = sql_types::BigInt)]
     #[allow(dead_code)]
     completed_task_id: i64,
+    #[diesel(sql_type = sql_types::Text)]
+    completed_task_key: TaskKey,
     #[diesel(sql_type = sql_types::Bool)]
     inserted_outbox_row: bool,
+    #[diesel(sql_type = sql_types::Bool)]
+    same_content: bool,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -234,13 +244,17 @@ pub async fn release(
     .await
 }
 
-/// Complete and insert `command` into the outbox in one statement. `true` if a new outbox row was
-/// written, `false` if `(task_key, effect_name)` already existed.
+/// Complete and insert `command` into the outbox in one statement. Returns
+/// [`OutboxWrite::Inserted`] for a new row and [`OutboxWrite::AlreadyPresent`] when
+/// `(task_key, effect_name)` already exists with identical content. Existing content that
+/// differs fails with [`SchedulerError::OutboxConflict`] and rolls back the completion.
+///
+/// Propagating `OutboxConflict` with `?` into a `TaskError` fails the task permanently.
 pub async fn complete_with_outbox(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
     command: &OutboxCommand,
-) -> Result<bool, SchedulerError> {
+) -> Result<OutboxWrite, SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
         let rows = owned_query!(COMPLETE_WITH_OUTBOX, lease)
             .bind::<sql_types::Text, _>(&command.effect_name)
@@ -252,8 +266,18 @@ pub async fn complete_with_outbox(
         let Some(row) = rows.into_iter().next() else {
             return Err(lost(lease));
         };
-        close_attempt(c, lease, "done", None).await?;
-        Ok(row.inserted_outbox_row)
+        if row.inserted_outbox_row {
+            close_attempt(c, lease, "done", None).await?;
+            Ok(OutboxWrite::Inserted)
+        } else if row.same_content {
+            close_attempt(c, lease, "done", None).await?;
+            Ok(OutboxWrite::AlreadyPresent)
+        } else {
+            Err(SchedulerError::OutboxConflict {
+                task_key: row.completed_task_key,
+                effect_name: command.effect_name.clone(),
+            })
+        }
     })
     .await
 }

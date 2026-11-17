@@ -8,12 +8,15 @@ use diesel::sql_types::Integer;
 use diesel::sql_types::Text;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
+use pg_task_scheduler::CommandKey;
+use pg_task_scheduler::EffectName;
 use pg_task_scheduler::OutboxCommand;
 use pg_task_scheduler::Scheduler;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskContext;
 use pg_task_scheduler::TaskError;
+use pg_task_scheduler::Topic;
 use pg_task_scheduler::store;
 use serde::Deserialize;
 use serde::Serialize;
@@ -162,6 +165,8 @@ enum PlaceOrderError {
     Scheduler(#[from] SchedulerError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Identifier(#[from] pg_task_scheduler::IdentifierError),
 }
 
 #[derive(diesel::QueryableByName)]
@@ -196,9 +201,12 @@ async fn place_order(pool: Pool, ctx: TaskContext, args: OrderArgs) -> Result<()
             return Err(PlaceOrderError::Crash);
         }
         let command = OutboxCommand {
-            effect_name: "order-placed".into(),
-            command_key: serde_json::to_string(&(ctx.task_key.as_str(), "order-placed"))?,
-            topic: "orders".into(),
+            effect_name: EffectName::try_from("order-placed")?,
+            command_key: CommandKey::try_from(serde_json::to_string(&(
+                ctx.task_key.as_str(),
+                "order-placed",
+            ))?)?,
+            topic: Topic::try_from("orders")?,
             payload: serde_json::json!({"order_id": order.id, "amount_cents": args.amount_cents}),
         };
         store::complete_with_outbox(c, &ctx.lease, &command).await?;

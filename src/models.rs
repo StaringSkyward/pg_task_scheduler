@@ -13,12 +13,15 @@ use crate::cron::CronExpression;
 #[cfg(feature = "cron")]
 use crate::error::SchedulerError;
 #[cfg(feature = "cron")]
+use crate::ids::CommandKey;
+use crate::ids::EffectName;
 use crate::ids::JobId;
 use crate::ids::LockToken;
 use crate::ids::QueueName;
 use crate::ids::TaskId;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
+use crate::ids::Topic;
 use crate::ids::WorkerId;
 #[cfg(feature = "cron")]
 use crate::schema::scheduler_jobs;
@@ -134,14 +137,23 @@ pub enum RetryOutcome {
 pub struct OutboxCommand {
     /// Names the effect, for example `"order-shipped"`. A task records each effect at
     /// most once: the row is unique on `(task_key, effect_name)`.
-    pub effect_name: String,
+    pub effect_name: EffectName,
     /// Unique across the outbox. Receivers deduplicate by it, so derive it from the
     /// `task_key` and `effect_name`.
-    pub command_key: String,
+    pub command_key: CommandKey,
     /// Where the application's relay publishes the command.
-    pub topic: String,
+    pub topic: Topic,
     /// The command body.
     pub payload: serde_json::Value,
+}
+
+/// What `store::complete_with_outbox` did with the outbox row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxWrite {
+    /// A new outbox row was written.
+    Inserted,
+    /// The task already had this effect with identical content; nothing was written.
+    AlreadyPresent,
 }
 
 /// Every `queue_tasks` column as a domain type.
