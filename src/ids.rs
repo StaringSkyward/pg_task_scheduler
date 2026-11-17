@@ -9,6 +9,10 @@ pub(crate) const SCHEDULE_KEY_PREFIX: &str = "schedule:";
 /// Maximum length (in `char`s) of an identifier (see [`validate_identifier`]).
 const MAX_IDENTIFIER_LEN: usize = 255;
 
+/// Maximum length (in bytes) of a [`CommandKey`]: `queue_outbox.command_key` has a UNIQUE
+/// B-tree index, whose entries PostgreSQL limits to about 2704 bytes.
+const MAX_COMMAND_KEY_BYTES: usize = 2048;
+
 /// Why a string was rejected as an identifier, such as a [`TaskName`], [`QueueName`] or
 /// [`CommandKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -28,6 +32,11 @@ pub enum IdentifierError {
     /// The string contains a NUL character, which PostgreSQL text cannot store.
     #[error("identifier must not contain NUL")]
     ContainsNul,
+    /// A command key is longer than 2048 bytes.
+    //
+    // The literal "2048" must track `MAX_COMMAND_KEY_BYTES`.
+    #[error("command key must be at most 2048 bytes")]
+    CommandKeyTooLong,
 }
 
 /// Absurd conversion so `TaskName` itself satisfies the `register` bound
@@ -61,13 +70,16 @@ fn validate_identifier(s: &str) -> Result<(), IdentifierError> {
     Ok(())
 }
 
-/// Policy for [`CommandKey`]: non-empty and NUL-free, any length, whitespace allowed.
+/// Policy for [`CommandKey`]: non-empty, NUL-free, at most 2048 bytes, whitespace allowed.
 fn validate_command_key(s: &str) -> Result<(), IdentifierError> {
     if s.is_empty() {
         return Err(IdentifierError::Empty);
     }
     if s.contains('\0') {
         return Err(IdentifierError::ContainsNul);
+    }
+    if s.len() > MAX_COMMAND_KEY_BYTES {
+        return Err(IdentifierError::CommandKeyTooLong);
     }
     Ok(())
 }
@@ -155,7 +167,9 @@ validated_string!(
     Topic
 );
 validated_string!(
-    /// Idempotency key of an outbox command: non-empty, no NUL, any length.
+    /// Idempotency key of an outbox command: non-empty, no NUL, at most 2048 bytes (the
+    /// outbox's unique index cannot hold more). Hash a longer key, for example a hex SHA-256
+    /// of the `(task_key, effect_name)` tuple.
     CommandKey,
     validate_command_key
 );
@@ -289,6 +303,19 @@ mod identifier_tests {
         assert_eq!(
             CommandKey::try_from("a\0b"),
             Err(IdentifierError::ContainsNul)
+        );
+    }
+
+    #[test]
+    fn command_key_byte_limit() {
+        assert!(CommandKey::try_from("x".repeat(2048)).is_ok());
+        assert_eq!(
+            CommandKey::try_from("x".repeat(2049)),
+            Err(IdentifierError::CommandKeyTooLong)
+        );
+        assert_eq!(
+            CommandKey::try_from("\u{1F600}".repeat(600)),
+            Err(IdentifierError::CommandKeyTooLong)
         );
     }
 

@@ -320,7 +320,8 @@ ownership-guarded completion succeeds:
 # async fn example(conn: &mut diesel_async::AsyncPgConnection, ctx: &TaskContext) -> Result<(), SchedulerError> {
 let command = OutboxCommand {
     effect_name: EffectName::try_from("order-shipped")?,
-    // Any unambiguous, stable encoding of (task_key, effect_name).
+    // Any unambiguous, stable encoding of (task_key, effect_name), at most 2048 bytes;
+    // hash it (for example a hex SHA-256) if very long keys could exceed that.
     command_key: CommandKey::try_from(serde_json::to_string(&(ctx.task_key.as_str(), "order-shipped"))?)?,
     topic: Topic::try_from("orders")?,
     payload: serde_json::json!({ "order": 12345 }),

@@ -377,6 +377,21 @@ async fn stale_worker_cannot_emit_outbox_command() {
     db.cleanup().await;
 }
 
+#[tokio::test]
+async fn largest_command_key_is_stored() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut key: String = (0u32..4096).map(|i| format!("{i:x}")).collect();
+    key.truncate(2048);
+    assert_eq!(key.len(), 2048);
+    let mut conn = db.pool.get().await.unwrap();
+    let w = store::complete_with_outbox(&mut conn, &c.lease, &cmd("e", &key))
+        .await
+        .unwrap();
+    assert_eq!(w, OutboxWrite::Inserted);
+    db.cleanup().await;
+}
+
 async fn preinsert(conn: &mut AsyncPgConnection, command_key: &str, payload: &str) {
     diesel::sql_query(
         "INSERT INTO queue_outbox (task_key, effect_name, command_key, topic, payload) \

@@ -430,8 +430,8 @@ recreated.
 - **Decision:**
   - `EffectName` and `Topic` follow the identifier rule: 1 to 255 characters,
     no leading or trailing whitespace.
-  - `CommandKey` is non-empty with no length limit, so it can hold the JSON
-    encoding of `(task_key, effect_name)`.
+  - `CommandKey` is non-empty and at most 2048 bytes (the outbox unique index
+    cannot hold more); hash an over-long `(task_key, effect_name)` encoding.
   - Every identifier constructor rejects NUL (`IdentifierError::ContainsNul`).
 - **Why:** These values identify and route a command, so they get the same
   boundary as the queue's own identifiers.
