@@ -22,6 +22,7 @@ use pg_task_scheduler::TaskName;
 use pg_task_scheduler::replay;
 use pg_task_scheduler::store::BULK_BUDGET;
 use pg_task_scheduler::store::BulkFilter;
+use pg_task_scheduler::store::BulkStop;
 use pg_task_scheduler::store::CancelOutcome;
 use pg_task_scheduler::store::{self};
 use serde::Deserialize;
@@ -236,7 +237,7 @@ struct ResultPage<'a> {
     p: &'a BulkParams,
     verb: &'a str,
     affected: i64,
-    more: bool,
+    budget_spent: bool,
 }
 
 async fn confirm<P: SchedulerPool>(
@@ -321,7 +322,7 @@ async fn bulk<P: SchedulerPool>(
                 p: &p,
                 verb: if b.replay { "replayed" } else { "cancelled" },
                 affected: o.affected,
-                more: o.more_remain,
+                budget_spent: o.stopped == BulkStop::BudgetSpent,
             },
             StatusCode::OK,
         ),

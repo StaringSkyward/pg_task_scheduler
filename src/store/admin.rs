@@ -33,23 +33,77 @@ text_enum!(AdminActionKind, "admin action", {
     Replay => "replay", Cancel => "cancel", Pause => "pause", Resume => "resume",
 });
 
+/// A single-task action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskAction {
+    /// Moved the task back to `queued`.
+    Replay,
+    /// Cancelled the task.
+    Cancel,
+}
+
+/// A bulk action over a task name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkAction {
+    /// Requeued dead and cancelled tasks, limited to this exact `last_error` when given.
+    Replay {
+        /// The exact `last_error` the replay was limited to.
+        last_error: Option<String>,
+    },
+    /// Cancelled queued and running tasks.
+    Cancel,
+}
+
+/// A queue-wide action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAction {
+    /// Paused the queue.
+    Pause,
+    /// Resumed the queue.
+    Resume,
+}
+
+/// What an admin action was aimed at; the shape the table's CHECK allows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminActionTarget {
+    /// One task.
+    Task {
+        /// What was done.
+        action: TaskAction,
+        /// The task.
+        task_id: TaskId,
+        /// Its name.
+        task_name: TaskName,
+        /// Its queue.
+        queue: QueueName,
+    },
+    /// Every matching task of a name, up to a bound.
+    Bulk {
+        /// What was done.
+        action: BulkAction,
+        /// The task name acted on.
+        task_name: TaskName,
+        /// Limited to this queue, or any queue when `None`.
+        queue: Option<QueueName>,
+        /// The action covered only tasks with `id <=` this.
+        max_task_id: i64,
+    },
+    /// A whole queue.
+    Queue {
+        /// What was done.
+        action: QueueAction,
+        /// The queue.
+        queue: QueueName,
+    },
+}
+
 /// One `queue_admin_actions` row.
 #[derive(Debug, Clone)]
 pub struct AdminAction {
     /// Row id; a task's `admin_action_id` points here.
     pub id: i64,
-    /// What was done.
-    pub action: AdminActionKind,
-    /// The task, for a single-task action.
-    pub task_id: Option<TaskId>,
-    /// The task name acted on.
-    pub task_name: Option<TaskName>,
-    /// The queue acted on, if the action named one.
-    pub queue: Option<QueueName>,
-    /// For a bulk replay, the exact `last_error` it was limited to.
-    pub last_error_filter: Option<String>,
-    /// Bulk id bound: the action covered only tasks with `id <=` this.
-    pub max_task_id: Option<i64>,
+    /// What was done, and to what.
+    pub target: AdminActionTarget,
     /// Tasks changed.
     pub affected: i64,
     /// Who did it, as the caller passed it.
@@ -58,6 +112,26 @@ pub struct AdminAction {
     pub reason: String,
     /// When.
     pub at: DateTime<Utc>,
+}
+
+impl AdminAction {
+    /// The stored action tag.
+    pub fn kind(&self) -> AdminActionKind {
+        match &self.target {
+            AdminActionTarget::Task { action, .. } => match action {
+                TaskAction::Replay => AdminActionKind::Replay,
+                TaskAction::Cancel => AdminActionKind::Cancel,
+            },
+            AdminActionTarget::Bulk { action, .. } => match action {
+                BulkAction::Replay { .. } => AdminActionKind::Replay,
+                BulkAction::Cancel => AdminActionKind::Cancel,
+            },
+            AdminActionTarget::Queue { action, .. } => match action {
+                QueueAction::Pause => AdminActionKind::Pause,
+                QueueAction::Resume => AdminActionKind::Resume,
+            },
+        }
+    }
 }
 
 #[derive(diesel::QueryableByName)]
@@ -89,17 +163,77 @@ struct ActionRow {
 impl TryFrom<ActionRow> for AdminAction {
     type Error = SchedulerError;
     fn try_from(r: ActionRow) -> Result<Self, SchedulerError> {
+        let kind: AdminActionKind = r
+            .action
+            .parse()
+            .map_err(|_: ParseEnumError| SchedulerError::Invariant("unknown admin action"))?;
+        let bad = SchedulerError::Invariant("admin action row violates its shape");
+        let target = match (
+            kind,
+            r.task_id,
+            r.task_name,
+            r.queue,
+            r.last_error_filter,
+            r.max_task_id,
+        ) {
+            (
+                AdminActionKind::Pause | AdminActionKind::Resume,
+                None,
+                None,
+                Some(queue),
+                None,
+                None,
+            ) => {
+                let action = if kind == AdminActionKind::Pause {
+                    QueueAction::Pause
+                } else {
+                    QueueAction::Resume
+                };
+                AdminActionTarget::Queue { action, queue }
+            }
+            (
+                AdminActionKind::Replay | AdminActionKind::Cancel,
+                Some(task_id),
+                Some(task_name),
+                Some(queue),
+                None,
+                None,
+            ) => AdminActionTarget::Task {
+                action: if kind == AdminActionKind::Replay {
+                    TaskAction::Replay
+                } else {
+                    TaskAction::Cancel
+                },
+                task_id,
+                task_name,
+                queue,
+            },
+            (
+                AdminActionKind::Replay,
+                None,
+                Some(task_name),
+                queue,
+                last_error,
+                Some(max_task_id),
+            ) => AdminActionTarget::Bulk {
+                action: BulkAction::Replay { last_error },
+                task_name,
+                queue,
+                max_task_id,
+            },
+            (AdminActionKind::Cancel, None, Some(task_name), queue, None, Some(max_task_id)) => {
+                AdminActionTarget::Bulk {
+                    action: BulkAction::Cancel,
+                    task_name,
+                    queue,
+                    max_task_id,
+                }
+            }
+            _ => return Err(bad),
+        };
         Ok(Self {
             id: r.id,
-            action: r
-                .action
-                .parse()
-                .map_err(|_: ParseEnumError| SchedulerError::Invariant("unknown admin action"))?,
-            task_id: r.task_id,
-            task_name: r.task_name,
-            queue: r.queue,
-            last_error_filter: r.last_error_filter,
-            max_task_id: r.max_task_id,
+            target,
             affected: r.affected,
             operator: r.operator,
             reason: r.reason,
@@ -254,15 +388,25 @@ pub struct BulkFilter {
     pub queue: Option<QueueName>,
 }
 
-/// What one bulk call did. `more_remain`: the budget ran out after a full batch; call again.
+/// Why a bulk call stopped. Neither proves nothing matching is left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkStop {
+    /// The budget ran out after a full batch; call again.
+    BudgetSpent,
+    /// A batch came back short: the matches ran out, or rows locked by other work were
+    /// skipped. Calling again catches the skipped ones.
+    ShortBatch,
+}
+
+/// What one bulk call did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BulkOutcome {
     /// The `queue_admin_actions` row recording this call.
     pub action_id: i64,
     /// Tasks changed.
     pub affected: i64,
-    /// Matching tasks may be left; `false` does not prove none are.
-    pub more_remain: bool,
+    /// Why the call stopped.
+    pub stopped: BulkStop,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -407,14 +551,14 @@ pub async fn cancel_matching(
             return Ok(BulkOutcome {
                 action_id: act.id,
                 affected,
-                more_remain: false,
+                stopped: BulkStop::ShortBatch,
             });
         }
         if started.elapsed() >= budget {
             return Ok(BulkOutcome {
                 action_id: act.id,
                 affected,
-                more_remain: true,
+                stopped: BulkStop::BudgetSpent,
             });
         }
     }
@@ -462,14 +606,14 @@ pub async fn replay_matching(
             return Ok(BulkOutcome {
                 action_id: act.id,
                 affected,
-                more_remain: false,
+                stopped: BulkStop::ShortBatch,
             });
         }
         if started.elapsed() >= budget {
             return Ok(BulkOutcome {
                 action_id: act.id,
                 affected,
-                more_remain: true,
+                stopped: BulkStop::BudgetSpent,
             });
         }
     }

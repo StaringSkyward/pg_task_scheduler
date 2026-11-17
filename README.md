@@ -471,12 +471,13 @@ scanning retained rows (see
   exact `last_error`) act on a task name, and optionally one queue. They work in
   batches of `BULK_BATCH` (500), each one statement and transaction, until a
   batch comes back short, or until the budget (`BULK_BUDGET`, 10 s) has run out
-  after a full batch. Then `more_remain` is `true`: call again, which is a new
-  action. Each call records one `queue_admin_actions` row, with its `affected`
+  after a full batch. `BulkOutcome::stopped` says which: `BudgetSpent` (call
+  again, which is a new action) or `ShortBatch`. Each call records one `queue_admin_actions` row, with its `affected`
   count and `max_task_id`, and touches only tasks with an id up to the highest
   one when it started, so it ends even while producers keep enqueuing. Rows
   locked elsewhere are skipped, so concurrent calls split the work; for the same
-  reason `more_remain = false` does not prove that nothing matching is left.
+  reason a `ShortBatch` does not prove that nothing matching is left; calling
+  again catches the skipped rows.
   `count_cancellable` and `count_replayable` count up to a cap. Cancel by name
   reads every queued and running row through their partial indexes (never the
   retained done, dead and cancelled rows) and filters by name: an index on the

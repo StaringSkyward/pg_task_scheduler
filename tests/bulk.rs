@@ -12,7 +12,9 @@ use pg_task_scheduler::TaskKey;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
+use pg_task_scheduler::store::BULK_BUDGET;
 use pg_task_scheduler::store::BulkFilter;
+use pg_task_scheduler::store::BulkStop;
 use pg_task_scheduler::store::{self};
 use serde_json::json;
 
@@ -70,7 +72,7 @@ async fn cancel_matching_cancels_queued_and_running_of_that_name_only() {
     let out = store::cancel_matching(&mut conn, &filter("a"), "ops", "why", store::BULK_BUDGET)
         .await
         .unwrap();
-    assert_eq!((out.affected, out.more_remain), (3, false));
+    assert_eq!((out.affected, out.stopped), (3, BulkStop::ShortBatch));
     assert_eq!(count(&db, "a", "cancelled").await, 3);
     assert_eq!(count(&db, "b", "queued").await, 2);
     assert_eq!(
@@ -167,14 +169,17 @@ async fn bulk_stops_at_budget_and_continues() {
     let first = store::cancel_matching(&mut conn, &filter("a"), "ops", "why", Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!((first.affected, first.more_remain), (500, true));
+    assert_eq!(
+        (first.affected, first.stopped),
+        (500, BulkStop::BudgetSpent)
+    );
     let mut total = first.affected;
     loop {
         let o = store::cancel_matching(&mut conn, &filter("a"), "ops", "why", Duration::ZERO)
             .await
             .unwrap();
         total += o.affected;
-        if !o.more_remain {
+        if o.stopped == BulkStop::ShortBatch {
             break;
         }
     }
@@ -201,7 +206,7 @@ async fn replay_matching_filters_by_last_error() {
     )
     .await
     .unwrap();
-    assert_eq!((out.affected, out.more_remain), (3, false));
+    assert_eq!((out.affected, out.stopped), (3, BulkStop::ShortBatch));
     assert_eq!(count(&db, "a", "queued").await, 3);
     assert_eq!(count(&db, "a", "dead").await, 1);
     assert_eq!(
@@ -261,5 +266,24 @@ async fn concurrent_bulk_cancels_split_the_work() {
         2
     );
     drop((c1, c2));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn bulk_cancel_that_skips_a_locked_row_reports_short_batch() {
+    let db = TestDb::new().await;
+    insert_many(&db, "x", "queued", "", 1).await;
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute("BEGIN; SELECT 1 FROM queue_tasks WHERE task_name = 'x' FOR UPDATE")
+        .await
+        .unwrap();
+    let mut conn = db.pool.get().await.unwrap();
+    let out = store::cancel_matching(&mut conn, &filter("x"), "op", "r", BULK_BUDGET)
+        .await
+        .unwrap();
+    assert_eq!((out.affected, out.stopped), (0, BulkStop::ShortBatch));
+    assert_eq!(count(&db, "x", "queued").await, 1);
+    holder.batch_execute("ROLLBACK").await.unwrap();
     db.cleanup().await;
 }

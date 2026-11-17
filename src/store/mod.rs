@@ -16,10 +16,13 @@ mod workers;
 
 pub use admin::AdminAction;
 pub use admin::AdminActionKind;
+pub use admin::AdminActionTarget;
 pub use admin::BULK_BATCH;
 pub use admin::BULK_BUDGET;
+pub use admin::BulkAction;
 pub use admin::BulkFilter;
 pub use admin::BulkOutcome;
+pub use admin::BulkStop;
 #[doc(hidden)]
 pub use admin::CANCEL_BATCH;
 #[doc(hidden)]
@@ -27,9 +30,11 @@ pub use admin::COUNT_CANCELLABLE;
 #[doc(hidden)]
 pub use admin::COUNT_REPLAYABLE;
 pub use admin::CancelOutcome;
+pub use admin::QueueAction;
 pub use admin::QueuePause;
 #[doc(hidden)]
 pub use admin::REPLAY_BATCH;
+pub use admin::TaskAction;
 pub use admin::admin_actions;
 pub use admin::cancel;
 pub use admin::cancel_matching;

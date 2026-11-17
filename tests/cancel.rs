@@ -25,7 +25,9 @@ use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::AdminActionTarget;
 use pg_task_scheduler::store::CancelOutcome;
+use pg_task_scheduler::store::TaskAction;
 use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio::sync::Notify;
@@ -97,10 +99,20 @@ async fn cancel_queued_task() {
     let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
     assert_eq!(actions.len(), 1);
     let a = &actions[0];
-    assert_eq!(a.action, AdminActionKind::Cancel);
-    assert_eq!(a.task_id, Some(id));
-    assert_eq!(a.task_name.as_ref().map(|n| n.as_str()), Some("job"));
-    assert_eq!(a.queue, Some(QueueName::default()));
+    assert_eq!(a.kind(), AdminActionKind::Cancel);
+    let AdminActionTarget::Task {
+        action,
+        task_id,
+        task_name,
+        queue,
+    } = &a.target
+    else {
+        panic!("not a task target: {:?}", a.target)
+    };
+    assert_eq!(*action, TaskAction::Cancel);
+    assert_eq!(*task_id, id);
+    assert_eq!(task_name.as_str(), "job");
+    assert_eq!(*queue, QueueName::default());
     assert_eq!(a.affected, 1);
     assert_eq!(
         (a.operator.as_str(), a.reason.as_str()),

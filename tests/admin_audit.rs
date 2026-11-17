@@ -4,6 +4,9 @@ use diesel_async::RunQueryDsl;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::replay;
 use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::AdminActionTarget;
+use pg_task_scheduler::store::BulkAction;
+use pg_task_scheduler::store::TaskAction;
 use pg_task_scheduler::store::{self};
 
 async fn exec(db: &TestDb, sql: &str) {
@@ -69,8 +72,16 @@ async fn task_actions_include_linked_bulk_action() {
         .unwrap();
     let a = store::task_actions(&mut conn, &t).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].action, AdminActionKind::Cancel);
-    assert_eq!(a[0].task_id, None);
+    assert_eq!(a[0].kind(), AdminActionKind::Cancel);
+    assert!(matches!(
+        a[0].target,
+        AdminActionTarget::Bulk {
+            action: BulkAction::Cancel,
+            queue: None,
+            max_task_id: 100,
+            ..
+        }
+    ));
     assert_eq!(a[0].affected, 5);
     assert_eq!(a[0].reason, "bulk");
     // Replay relinks the task to its own row, which also names the task: listed once.
@@ -78,13 +89,20 @@ async fn task_actions_include_linked_bulk_action() {
     let t = store::task(&mut conn, t.id).await.unwrap().unwrap();
     let a = store::task_actions(&mut conn, &t).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].action, AdminActionKind::Replay);
+    assert_eq!(a[0].kind(), AdminActionKind::Replay);
+    assert!(matches!(
+        a[0].target,
+        AdminActionTarget::Task {
+            action: TaskAction::Replay,
+            ..
+        }
+    ));
     let all = store::admin_actions(&mut conn, None, 10).await.unwrap();
     assert_eq!(all.len(), 2);
     let older = store::admin_actions(&mut conn, Some(all[0].id), 10)
         .await
         .unwrap();
     assert_eq!(older.len(), 1);
-    assert_eq!(older[0].action, AdminActionKind::Cancel);
+    assert_eq!(older[0].kind(), AdminActionKind::Cancel);
     db.cleanup().await;
 }

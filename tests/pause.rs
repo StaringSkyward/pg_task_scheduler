@@ -13,6 +13,8 @@ use pg_task_scheduler::TaskKey;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::AdminActionTarget;
+use pg_task_scheduler::store::QueueAction;
 use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -145,13 +147,17 @@ async fn pause_is_idempotent_and_audited() {
     let mut conn = db.pool.get().await.unwrap();
     assert!(store::paused_queues(&mut conn).await.unwrap().is_empty());
     let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
-    let kinds: Vec<_> = actions.iter().map(|a| a.action).collect();
+    let kinds: Vec<_> = actions.iter().map(|a| a.kind()).collect();
     assert_eq!(kinds, [AdminActionKind::Resume, AdminActionKind::Pause]);
-    assert!(
-        actions
-            .iter()
-            .all(|a| a.affected == 0 && a.queue == Some(q("bulk")))
-    );
+    assert!(matches!(
+        actions[1].target,
+        AdminActionTarget::Queue {
+            action: QueueAction::Pause,
+            ..
+        }
+    ));
+    assert!(actions.iter().all(|a| a.affected == 0
+        && matches!(&a.target, AdminActionTarget::Queue { queue, .. } if *queue == q("bulk"))));
     db.cleanup().await;
 }
 

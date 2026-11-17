@@ -310,7 +310,19 @@ async fn bulk_cancel_runs_and_offers_continue() {
         "{}",
         r.body
     );
-    assert!(!r.body.contains("class=\"continue\""));
+    // A short batch offers a re-run of the same filter.
+    assert!(r.body.contains("class=\"continue\""), "{}", r.body);
+    assert!(r.body.contains("Run again"), "{}", r.body);
+    assert!(
+        r.body.contains("name=\"task_name\" value=\"a\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"reason\" value=\"cleanup\""),
+        "{}",
+        r.body
+    );
     let n = db
         .scalar(
             "SELECT count(*) AS n FROM queue_tasks WHERE status = 'cancelled' AND task_name = 'a'",

@@ -220,7 +220,7 @@ async fn task_detail_has_attempts_and_actions() {
     assert_eq!(d.task.state.status(), TaskStatus::Cancelled);
     assert_eq!(d.attempts.len(), 1);
     assert_eq!(common::outcome(&d.attempts[0]), Some(AttemptOutcome::Retry));
-    assert_eq!(d.actions[0].action, AdminActionKind::Cancel);
+    assert_eq!(d.actions[0].kind(), AdminActionKind::Cancel);
     assert!(
         store::task_detail(&mut conn, TaskId(id.0 + 1000))
             .await

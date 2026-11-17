@@ -634,7 +634,7 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
             .iter()
             .map(|a| ActionRow {
                 at: ts(a.at),
-                action: a.action.as_str().to_owned(),
+                action: a.kind().as_str().to_owned(),
                 operator: a.operator.clone(),
                 reason: a.reason.clone(),
                 affected: a.affected,
