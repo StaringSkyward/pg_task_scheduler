@@ -21,7 +21,7 @@ use crate::models::MaxAttempts;
 use crate::models::TaskLease;
 use crate::models::interval_to_duration;
 use crate::models::pg_interval;
-use crate::store::transitions::fail_permanently;
+use crate::store::transitions::fail_owned;
 
 #[derive(diesel::QueryableByName)]
 struct ClaimedRow {
@@ -99,41 +99,49 @@ pub async fn claim(
         .await?;
     let mut claimed = Vec::with_capacity(rows.len());
     for r in rows {
-        let mut lease = TaskLease {
-            task_id: r.id,
-            worker_id: worker.clone(),
-            lock_token: r.lock_token,
-            // Placeholder until parsed below: the dead-letter queries key on (task_id,
-            // lock_token) and never read it.
-            attempt_no: AttemptNo::FIRST,
-        };
         // The claim has already committed, so a row that fails conversion must not fail the call:
         // that would strand the whole batch running until its leases expire. `queue_tasks` has no
         // identifier CHECK and JSONB accepts numbers serde_json rejects, so a raw-SQL producer can
-        // store such rows. Dead-letter that one row and return the rest.
-        match AttemptNo::from_db_i32(r.attempts) {
-            Ok(n) => lease.attempt_no = n,
-            Err(_) => {
-                dead_letter(
-                    conn,
-                    &lease,
-                    "invalid attempt_no: stored value is not positive",
-                )
-                .await;
-                continue;
-            }
-        }
+        // store such rows. Dead-letter that one row (by ownership key) and return the rest.
+        let (id, lock_token) = (r.id, r.lock_token);
+        // Unreachable through the schema (`attempts >= 0` and the claim increments it); kept as a
+        // row-local guard.
+        let Ok(attempt_no) = AttemptNo::from_db_i32(r.attempts) else {
+            dead_letter(
+                conn,
+                id,
+                worker,
+                lock_token,
+                "invalid attempt_no: stored value is not positive",
+            )
+            .await;
+            continue;
+        };
         let task_key = match TaskKey::try_from(r.task_key) {
             Ok(key) => key,
             Err(e) => {
-                dead_letter(conn, &lease, &format!("invalid task_key: {e}")).await;
+                dead_letter(
+                    conn,
+                    id,
+                    worker,
+                    lock_token,
+                    &format!("invalid task_key: {e}"),
+                )
+                .await;
                 continue;
             }
         };
         let payload = match serde_json::from_str(&r.payload) {
             Ok(payload) => payload,
             Err(e) => {
-                dead_letter(conn, &lease, &format!("invalid payload: {e}")).await;
+                dead_letter(
+                    conn,
+                    id,
+                    worker,
+                    lock_token,
+                    &format!("invalid payload: {e}"),
+                )
+                .await;
                 continue;
             }
         };
@@ -142,12 +150,20 @@ pub async fn claim(
             Err(_) => {
                 dead_letter(
                     conn,
-                    &lease,
+                    id,
+                    worker,
+                    lock_token,
                     "invalid max_attempts: stored value is not positive",
                 )
                 .await;
                 continue;
             }
+        };
+        let lease = TaskLease {
+            task_id: id,
+            worker_id: worker.clone(),
+            lock_token,
+            attempt_no,
         };
         claimed.push(ClaimedTask {
             lease,
@@ -166,10 +182,16 @@ pub async fn claim(
 
 /// Dead-letter a claimed row that failed conversion. Logs and swallows its own error so the
 /// healthy rows of the batch are always returned.
-async fn dead_letter(conn: &mut AsyncPgConnection, lease: &TaskLease, reason: &str) {
-    tracing::error!(task_id = lease.task_id.0, %reason, "claimed task is unusable; marking it dead");
-    if let Err(e) = fail_permanently(conn, lease, reason).await {
-        tracing::error!(task_id = lease.task_id.0, error = %e, "could not dead-letter the task; skipping it");
+async fn dead_letter(
+    conn: &mut AsyncPgConnection,
+    task_id: TaskId,
+    worker: &WorkerId,
+    lock_token: LockToken,
+    reason: &str,
+) {
+    tracing::error!(task_id = task_id.0, %reason, "claimed task is unusable; marking it dead");
+    if let Err(e) = fail_owned(conn, task_id, worker, lock_token, reason).await {
+        tracing::error!(task_id = task_id.0, error = %e, "could not dead-letter the task; skipping it");
     }
 }
 

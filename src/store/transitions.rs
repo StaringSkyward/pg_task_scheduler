@@ -9,7 +9,10 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
+use crate::ids::LockToken;
+use crate::ids::TaskId;
 use crate::ids::TaskKey;
+use crate::ids::WorkerId;
 use crate::models::LeaseDuration;
 use crate::models::OutboxCommand;
 use crate::models::OutboxWrite;
@@ -171,12 +174,24 @@ async fn lock_task_row(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
 ) -> Result<(), SchedulerError> {
-    owned_query!(LOCK_ROW, lease)
+    lock_task_row_by(conn, lease.task_id, &lease.worker_id, lease.lock_token).await
+}
+
+async fn lock_task_row_by(
+    conn: &mut AsyncPgConnection,
+    task_id: TaskId,
+    worker: &WorkerId,
+    lock_token: LockToken,
+) -> Result<(), SchedulerError> {
+    diesel::sql_query(LOCK_ROW)
+        .bind::<sql_types::BigInt, _>(&task_id)
+        .bind::<sql_types::Text, _>(worker)
+        .bind::<sql_types::BigInt, _>(&lock_token)
         .get_result::<IdRow>(conn)
         .await
         .map(|_| ())
         .map_err(|e| match e {
-            diesel::result::Error::NotFound => lost(lease),
+            diesel::result::Error::NotFound => SchedulerError::LostOwnership(task_id),
             e => e.into(),
         })
 }
@@ -192,9 +207,19 @@ async fn close_attempt(
     outcome: &str,
     error: Option<&str>,
 ) -> Result<(), SchedulerError> {
+    close_attempt_by(conn, lease.task_id, lease.lock_token, outcome, error).await
+}
+
+async fn close_attempt_by(
+    conn: &mut AsyncPgConnection,
+    task_id: TaskId,
+    lock_token: LockToken,
+    outcome: &str,
+    error: Option<&str>,
+) -> Result<(), SchedulerError> {
     let n = diesel::sql_query(CLOSE_ATTEMPT)
-        .bind::<sql_types::BigInt, _>(&lease.task_id)
-        .bind::<sql_types::BigInt, _>(&lease.lock_token)
+        .bind::<sql_types::BigInt, _>(&task_id)
+        .bind::<sql_types::BigInt, _>(&lock_token)
         .bind::<sql_types::Text, _>(outcome)
         .bind::<sql_types::Nullable<sql_types::Text>, _>(error)
         .execute(conn)
@@ -355,16 +380,37 @@ pub async fn fail_permanently(
     lease: &TaskLease,
     error: &str,
 ) -> Result<(), SchedulerError> {
+    fail_owned(
+        conn,
+        lease.task_id,
+        &lease.worker_id,
+        lease.lock_token,
+        error,
+    )
+    .await
+}
+
+/// [`fail_permanently`] keyed by the ownership identity alone (the queries read no attempt number).
+pub(crate) async fn fail_owned(
+    conn: &mut AsyncPgConnection,
+    task_id: TaskId,
+    worker: &WorkerId,
+    lock_token: LockToken,
+    error: &str,
+) -> Result<(), SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
-        lock_task_row(c, lease).await?;
-        let rows = owned_query!(FAIL, lease)
+        lock_task_row_by(c, task_id, worker, lock_token).await?;
+        let rows = diesel::sql_query(FAIL)
+            .bind::<sql_types::BigInt, _>(&task_id)
+            .bind::<sql_types::Text, _>(worker)
+            .bind::<sql_types::BigInt, _>(&lock_token)
             .bind::<sql_types::Text, _>(error)
             .get_results::<IdRow>(c)
             .await?;
         if rows.is_empty() {
-            return Err(lost(lease));
+            return Err(SchedulerError::LostOwnership(task_id));
         }
-        close_attempt(c, lease, "dead", Some(error)).await
+        close_attempt_by(c, task_id, lock_token, "dead", Some(error)).await
     })
     .await
 }
