@@ -20,6 +20,7 @@ use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
@@ -92,8 +93,7 @@ async fn cancel_queued_task() {
     assert_eq!(outcome, CancelOutcome::Cancelled);
 
     let t = store::task(&mut conn, id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Cancelled);
-    assert!(t.completed_at.is_some());
+    assert_eq!(t.state.status(), TaskStatus::Cancelled); // Finished carries completed_at
     let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
     assert_eq!(actions.len(), 1);
     let a = &actions[0];
@@ -124,13 +124,14 @@ async fn cancel_running_task_closes_attempt_and_fences_worker() {
     assert_eq!(outcome, CancelOutcome::Cancelled);
 
     let t = store::task(&mut conn, id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Cancelled);
-    assert_eq!((t.locked_by, t.locked_until), (None, None));
+    assert_eq!(t.state.status(), TaskStatus::Cancelled); // and no lock fields
     let attempts = store::attempts(&mut conn, id).await.unwrap();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].outcome, Some(AttemptOutcome::Cancelled));
+    assert_eq!(
+        common::outcome(&attempts[0]),
+        Some(AttemptOutcome::Cancelled)
+    );
     assert_eq!(attempts[0].error.as_deref(), Some("cancelled by operator"));
-    assert!(attempts[0].finished_at.is_some());
 
     let beat = store::heartbeat(&mut conn, &claimed.lease, Duration::from_secs(60)).await;
     assert!(
@@ -211,8 +212,8 @@ async fn cancel_locked_row_is_busy() {
     assert!(waited < Duration::from_secs(3), "waited {waited:?}");
 
     let t = store::task(&mut conn, id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
-    assert_eq!((t.completed_at, t.admin_action_id), (None, None));
+    assert_eq!(t.state, TaskState::Queued);
+    assert_eq!(t.admin_action_id, None);
     assert_eq!(
         db.scalar("SELECT count(*) AS n FROM queue_admin_actions")
             .await,
@@ -377,7 +378,7 @@ async fn completion_after_cancel_counts_cancellation() {
     assert_eq!(counters.get("pg_task_scheduler_tasks_done_total"), 0);
     assert_eq!(counters.get("pg_task_scheduler_leases_lost_total"), 0);
     let t = store::task(&mut conn, id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Cancelled);
+    assert_eq!(t.state.status(), TaskStatus::Cancelled);
     drop(conn);
     db.cleanup().await;
 }

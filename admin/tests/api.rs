@@ -261,7 +261,7 @@ async fn replay_route_requeues_dead_task_and_409s_otherwise() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, pg_task_scheduler::TaskStatus::Queued);
+    assert_eq!(t.state.status(), pg_task_scheduler::TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     let n = db
         .scalar(&format!(
@@ -306,7 +306,7 @@ async fn replay_route_requires_reason() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, pg_task_scheduler::TaskStatus::Dead);
+    assert_eq!(t.state.status(), pg_task_scheduler::TaskStatus::Dead);
     let req = serde_json::json!({ "reason": "  fixed  " });
     let (status, _) = send(app(&db), Method::POST, uri, Some(req)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);

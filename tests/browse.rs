@@ -157,7 +157,7 @@ async fn done_and_failed_pages_newest_first_with_filters() {
         .unwrap();
     assert_eq!(ids(&p2.items), [id_of(&db, "d1").await]);
     assert!(p2.next.is_none());
-    assert_eq!(p2.items[0].status, TaskStatus::Done);
+    assert_eq!(p2.items[0].state.status(), TaskStatus::Done);
 
     let f = FailedFilter {
         task_name: Some(TaskName::try_from("a").unwrap()),
@@ -217,9 +217,9 @@ async fn task_detail_has_attempts_and_actions() {
     store::cancel(&mut conn, id, "ops", "why").await.unwrap();
 
     let d = store::task_detail(&mut conn, id).await.unwrap().unwrap();
-    assert_eq!(d.task.status, TaskStatus::Cancelled);
+    assert_eq!(d.task.state.status(), TaskStatus::Cancelled);
     assert_eq!(d.attempts.len(), 1);
-    assert_eq!(d.attempts[0].outcome, Some(AttemptOutcome::Retry));
+    assert_eq!(common::outcome(&d.attempts[0]), Some(AttemptOutcome::Retry));
     assert_eq!(d.actions[0].action, AdminActionKind::Cancel);
     assert!(
         store::task_detail(&mut conn, TaskId(id.0 + 1000))

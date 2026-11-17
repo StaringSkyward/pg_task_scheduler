@@ -15,6 +15,7 @@ use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::HealthStatus;
 use pg_task_scheduler::MaxAttempts;
@@ -94,13 +95,13 @@ async fn wait_for(db: &TestDb, id: TaskId, status: TaskStatus, timeout: Duration
             let mut conn = db.pool.get().await.unwrap();
             store::task(&mut conn, id).await.unwrap().unwrap()
         };
-        if t.status == status {
+        if t.state.status() == status {
             return t;
         }
         assert!(
             start.elapsed() < timeout,
             "task still {:?} after {timeout:?}, wanted {status:?}",
-            t.status
+            t.state
         );
         tokio::time::sleep(ms(20)).await;
     }
@@ -112,7 +113,7 @@ async fn outcomes(db: &TestDb, id: TaskId) -> Vec<Option<AttemptOutcome>> {
         .await
         .unwrap()
         .into_iter()
-        .map(|a| a.outcome)
+        .map(|a| common::outcome(&a))
         .collect()
 }
 
@@ -211,12 +212,15 @@ async fn retryable_error_requeues_with_backoff_then_dies() {
     assert_eq!(task.last_error.as_deref(), Some("flaky"));
     let mut conn = db.pool.get().await.unwrap();
     let attempts = store::attempts(&mut conn, id).await.unwrap();
-    let got: Vec<_> = attempts.iter().map(|a| a.outcome).collect();
+    let got: Vec<_> = attempts.iter().map(common::outcome).collect();
     assert_eq!(
         got,
         [Some(AttemptOutcome::Retry), Some(AttemptOutcome::Dead)]
     );
-    let gap = attempts[1].started_at - attempts[0].finished_at.unwrap();
+    let AttemptState::Closed { finished_at, .. } = attempts[0].state else {
+        panic!("first attempt still open");
+    };
+    let gap = attempts[1].started_at - finished_at;
     assert!(
         gap >= chrono::Duration::milliseconds(200),
         "backoff gap {gap}"
@@ -268,7 +272,7 @@ async fn interrupted_without_shutdown_is_a_counted_retry() {
     let mut conn = db.pool.get().await.unwrap();
     let task = store::task(&mut conn, id).await.unwrap().unwrap();
     drop(conn);
-    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.state.status(), TaskStatus::Queued);
     assert_eq!(task.attempts, 1, "outside shutdown the attempt counts");
     assert!(task.due_at > Utc::now() + chrono::Duration::minutes(30));
 
@@ -435,7 +439,7 @@ async fn worker_claims_only_its_configured_queues() {
         let mut conn = db.pool.get().await.unwrap();
         store::task(&mut conn, d).await.unwrap().unwrap()
     };
-    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.state.status(), TaskStatus::Queued);
     assert_eq!(task.attempts, 0);
 
     run.stop().await;
@@ -580,7 +584,7 @@ async fn aborted_run_stops_maintenance_and_unlistens() {
         store::task(&mut conn, other).await.unwrap().unwrap()
     };
     assert_eq!(
-        task.status,
+        task.state.status(),
         TaskStatus::Running,
         "maintenance outlived the run"
     );

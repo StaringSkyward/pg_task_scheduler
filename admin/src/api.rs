@@ -14,6 +14,7 @@ use pg_task_scheduler::JobId;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskView;
 #[cfg(feature = "cron")]
 use pg_task_scheduler::jobs::Applied;
@@ -134,7 +135,7 @@ struct TaskJson {
     queue: String,
     status: &'static str,
     attempts: i32,
-    max_attempts: i32,
+    max_attempts: u32,
     due_at: chrono::DateTime<chrono::Utc>,
     locked_by: Option<String>,
     last_error: Option<String>,
@@ -143,18 +144,23 @@ struct TaskJson {
 
 impl From<TaskView> for TaskJson {
     fn from(t: TaskView) -> Self {
+        let (locked_by, completed_at) = match &t.state {
+            TaskState::Queued => (None, None),
+            TaskState::Running { locked_by, .. } => (Some(locked_by.as_str().to_owned()), None),
+            TaskState::Finished { completed_at, .. } => (None, Some(*completed_at)),
+        };
         TaskJson {
             id: t.id.0,
             task_key: t.task_key.as_str().to_owned(),
             task_name: t.task_name.as_str().to_owned(),
             queue: t.queue.as_str().to_owned(),
-            status: t.status.as_str(),
+            status: t.state.status().as_str(),
             attempts: t.attempts,
-            max_attempts: t.max_attempts,
+            max_attempts: t.max_attempts.get(),
             due_at: t.due_at,
-            locked_by: t.locked_by.map(|w| w.as_str().to_owned()),
+            locked_by,
             last_error: t.last_error,
-            completed_at: t.completed_at,
+            completed_at,
         }
     }
 }

@@ -37,7 +37,7 @@ async fn replay_of_cancelled_task_requeues_it() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     assert_eq!(t.last_error, None);
     let action_id = db

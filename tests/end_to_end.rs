@@ -99,7 +99,7 @@ async fn wait_done(
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if let Some(t) = store::task(conn, id).await.unwrap()
-            && t.status == TaskStatus::Done
+            && t.state.status() == TaskStatus::Done
         {
             return true;
         }

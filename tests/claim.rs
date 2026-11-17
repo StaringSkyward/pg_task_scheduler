@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
+use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::LockToken;
 use pg_task_scheduler::Priority;
@@ -12,6 +13,7 @@ use pg_task_scheduler::QueueName;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
@@ -70,18 +72,24 @@ async fn claim_marks_running_and_records_attempt() {
     assert_eq!(c.lease.lock_token, LockToken(1));
 
     let t = store::task(&mut conn, e.id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Running);
     assert_eq!(t.attempts, 1);
     assert_eq!(t.lock_token, LockToken(1));
-    assert_eq!(t.locked_by, Some(worker.clone()));
-    assert!(t.locked_until.unwrap() > c.claimed_at);
+    let TaskState::Running {
+        locked_by,
+        locked_until,
+    } = &t.state
+    else {
+        panic!("not running: {:?}", t.state);
+    };
+    assert_eq!(locked_by, &worker);
+    assert!(*locked_until > c.claimed_at);
 
     let attempts = store::attempts(&mut conn, e.id).await.unwrap();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].attempt_no, 1);
     assert_eq!(attempts[0].lock_token, LockToken(1));
     assert_eq!(attempts[0].worker_id, worker);
-    assert_eq!(attempts[0].outcome, None);
+    assert_eq!(attempts[0].state, AttemptState::Open);
     db.cleanup().await;
 }
 
@@ -193,7 +201,7 @@ async fn higher_priority_due_task_is_claimed_first() {
     assert_eq!(claimed[0].lease.task_id, high.id);
     for id in [low.id, delayed.id] {
         let t = store::task(&mut conn, id).await.unwrap().unwrap();
-        assert_eq!(t.status, TaskStatus::Queued);
+        assert_eq!(t.state.status(), TaskStatus::Queued);
     }
     db.cleanup().await;
 }
@@ -217,7 +225,7 @@ async fn unregistered_task_name_is_never_claimed() {
     .unwrap();
     assert!(claimed.is_empty());
     let t = store::task(&mut conn, e.id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     db.cleanup().await;
 }

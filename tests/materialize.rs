@@ -43,7 +43,7 @@ async fn materializes_missed_slot_and_advances() {
     assert_eq!(task.task_name.as_str(), "j");
     assert_eq!(task.due_at, old_next_run_at);
     assert_eq!(task.payload, serde_json::json!({}));
-    assert_eq!(task.max_attempts, 3);
+    assert_eq!(task.max_attempts.get(), 3);
     assert!(db.job_next_run_at(job).await > Utc::now());
     // second pass: next_run_at now future → nothing
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 0);

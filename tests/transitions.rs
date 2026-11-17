@@ -19,7 +19,9 @@ use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskKey;
 use pg_task_scheduler::TaskLease;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
+use pg_task_scheduler::TerminalStatus;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store;
@@ -92,12 +94,16 @@ async fn complete_marks_done_and_closes_attempt() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Done);
-    assert_eq!(t.locked_by, None);
-    assert_eq!(t.locked_until, None);
-    assert!(t.completed_at.is_some());
+    // Finished carries completed_at and no lock fields.
+    assert!(matches!(
+        t.state,
+        TaskState::Finished {
+            status: TerminalStatus::Done,
+            ..
+        }
+    ));
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
-    assert_eq!(a[0].outcome, Some(AttemptOutcome::Done));
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Done));
     db.cleanup().await;
 }
 
@@ -129,10 +135,10 @@ async fn retry_requeues_with_db_time_delay_then_dies() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.last_error.as_deref(), Some("boom"));
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
-    assert_eq!(a[0].outcome, Some(AttemptOutcome::Retry));
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Retry));
 
     diesel::sql_query("UPDATE queue_tasks SET due_at = now()")
         .execute(&mut conn)
@@ -148,10 +154,9 @@ async fn retry_requeues_with_db_time_delay_then_dies() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Dead);
-    assert!(t.completed_at.is_some());
+    assert_eq!(t.state.status(), TaskStatus::Dead); // Finished carries completed_at
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
-    assert_eq!(a[1].outcome, Some(AttemptOutcome::Dead));
+    assert_eq!(common::outcome(&a[1]), Some(AttemptOutcome::Dead));
     db.cleanup().await;
 }
 
@@ -167,9 +172,9 @@ async fn fail_permanently_marks_dead() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Dead);
+    assert_eq!(t.state.status(), TaskStatus::Dead);
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
-    assert_eq!(a[0].outcome, Some(AttemptOutcome::Dead));
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Dead));
     assert_eq!(a[0].error.as_deref(), Some("bad input"));
     db.cleanup().await;
 }
@@ -193,7 +198,7 @@ async fn every_transition_fails_after_hard_lease_expiry() {
     lost(store::fail_permanently(&mut conn, l, "e").await, l);
     lost(store::lock_owned(&mut conn, l).await, l);
     let t = store::task(&mut conn, l.task_id).await.unwrap().unwrap();
-    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(t.state.status(), TaskStatus::Running);
     db.cleanup().await;
 }
 
@@ -266,7 +271,7 @@ async fn db_contained_effect_commits_atomically() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Done);
+    assert_eq!(t.state.status(), TaskStatus::Done);
     db.cleanup().await;
 }
 
@@ -294,7 +299,7 @@ async fn db_contained_failure_rolls_back_effect_and_completion() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(t.state.status(), TaskStatus::Running);
     assert_eq!(t.lock_token, c.lease.lock_token);
     db.cleanup().await;
 }
@@ -339,7 +344,7 @@ async fn same_effect_and_content_is_already_present() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Done); // Task 9 changes this to t.state.status()
+    assert_eq!(t.state.status(), TaskStatus::Done);
     db.cleanup().await;
 }
 
@@ -358,7 +363,7 @@ async fn same_effect_with_different_content_conflicts_and_rolls_back() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(t.state.status(), TaskStatus::Running);
     assert_eq!(
         db.scalar("SELECT count(*) AS n FROM queue_task_attempts WHERE finished_at IS NULL")
             .await,
@@ -396,7 +401,7 @@ async fn command_key_collision_across_tasks_fails() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(t.state.status(), TaskStatus::Running);
     db.cleanup().await;
 }
 
@@ -441,15 +446,15 @@ async fn release_requeues_and_refunds_the_attempt() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     assert_eq!(t.due_at, c.due_at); // keeps its place in line
     assert_eq!(t.lock_token, c.lease.lock_token);
-    assert!(t.locked_by.is_none() && t.locked_until.is_none() && t.last_error.is_none());
+    assert!(t.last_error.is_none()); // Queued carries no lock fields
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].outcome, Some(AttemptOutcome::Released));
-    assert!(a[0].finished_at.is_some() && a[0].error.is_none());
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Released));
+    assert!(a[0].error.is_none());
     // The next claim reuses attempt_no 1 under a new token.
     let again = claim_one(&mut conn).await.unwrap();
     assert_eq!(
@@ -475,6 +480,6 @@ async fn release_with_stale_or_expired_lease_is_lost_ownership() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((t.status, t.attempts), (TaskStatus::Running, 1));
+    assert_eq!((t.state.status(), t.attempts), (TaskStatus::Running, 1));
     db.cleanup().await;
 }

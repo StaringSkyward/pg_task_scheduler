@@ -20,6 +20,10 @@ use crate::ids::TaskId;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::Attempt;
+use crate::models::AttemptRun;
+use crate::models::AttemptState;
+use crate::models::MaxAttempts;
+use crate::models::TaskState;
 use crate::models::TaskStatus;
 use crate::models::TaskView;
 
@@ -32,8 +36,8 @@ pub struct TaskRow {
     pub task_name: TaskName,
     /// The queue it runs in.
     pub queue: QueueName,
-    /// Lifecycle state.
-    pub status: TaskStatus,
+    /// Lifecycle state, with the lease while running and the completion time once finished.
+    pub state: TaskState,
     /// Higher is claimed first, within its queue.
     pub priority: i32,
     /// Earliest time a worker may claim it.
@@ -41,21 +45,13 @@ pub struct TaskRow {
     /// Attempts counted so far.
     pub attempts: i32,
     /// Attempts allowed in total.
-    pub max_attempts: i32,
+    pub max_attempts: MaxAttempts,
     /// Message of the latest failure.
     pub last_error: Option<String>,
     /// When it was enqueued.
     pub created_at: DateTime<Utc>,
-    /// When it became `done`, `dead` or `cancelled`.
-    pub completed_at: Option<DateTime<Utc>>,
-    /// The worker holding the lease, while `running`.
-    pub locked_by: Option<WorkerId>,
-    /// Lease expiry, while `running`.
-    pub locked_until: Option<DateTime<Utc>>,
-    /// When the current attempt (the one whose `lock_token` is the task's) started.
-    pub attempt_started_at: Option<DateTime<Utc>>,
-    /// When the current attempt ended; `None` while it runs.
-    pub attempt_finished_at: Option<DateTime<Utc>>,
+    /// The current attempt; `None` if the task was never claimed.
+    pub attempt: Option<AttemptRun>,
 }
 
 /// One page and, if more rows follow, the cursor for the next.
@@ -132,6 +128,8 @@ struct Row {
     attempt_started_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
     attempt_finished_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    attempt_outcome: Option<String>,
 }
 
 impl TryFrom<Row> for TaskRow {
@@ -141,21 +139,25 @@ impl TryFrom<Row> for TaskRow {
             id: r.id,
             task_name: r.task_name,
             queue: r.queue,
-            status: r
-                .status
-                .parse()
-                .map_err(|_| SchedulerError::Invariant("unknown task status"))?,
+            state: TaskState::from_columns(&r.status, r.locked_by, r.locked_until, r.completed_at)?,
             priority: r.priority,
             due_at: r.due_at,
             attempts: r.attempts,
-            max_attempts: r.max_attempts,
+            max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
+                .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
             last_error: r.last_error,
             created_at: r.created_at,
-            completed_at: r.completed_at,
-            locked_by: r.locked_by,
-            locked_until: r.locked_until,
-            attempt_started_at: r.attempt_started_at,
-            attempt_finished_at: r.attempt_finished_at,
+            // A join miss nulls all three; `started_at` is NOT NULL, so it alone decides.
+            attempt: match r.attempt_started_at {
+                Some(started_at) => Some(AttemptRun {
+                    started_at,
+                    state: AttemptState::from_columns(
+                        r.attempt_finished_at,
+                        r.attempt_outcome.as_deref(),
+                    )?,
+                }),
+                None => None,
+            },
         })
     }
 }
@@ -167,7 +169,7 @@ macro_rules! select {
             "SELECT t.id, t.task_name, t.queue, t.status, t.priority, t.due_at, t.attempts, \
              t.max_attempts, t.last_error, t.created_at, t.completed_at, t.locked_by, \
              t.locked_until, a.started_at AS attempt_started_at, \
-             a.finished_at AS attempt_finished_at FROM ",
+             a.finished_at AS attempt_finished_at, a.outcome AS attempt_outcome FROM ",
             $from,
             " AS t LEFT JOIN queue_task_attempts a \
              ON a.task_id = t.id AND a.lock_token = t.lock_token ORDER BY ",
@@ -235,7 +237,8 @@ pub const FAILED_BY_NAME: &str = select!(
     "t.completed_at DESC, t.id DESC"
 );
 
-/// Stand-ins for "no cursor" that keep every keyset predicate a plain index bound.
+/// Stand-ins for "no cursor" that keep every keyset predicate a plain index bound. Only the
+/// no-cursor bounds: a page's own cursor comes from its last row's state.
 fn earliest() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).unwrap()
 }
@@ -251,14 +254,15 @@ fn rows(raw: Vec<Row>) -> Result<Vec<TaskRow>, SchedulerError> {
 fn page<C>(
     mut items: Vec<TaskRow>,
     limit: i64,
-    cursor: impl Fn(&TaskRow, usize) -> C,
-) -> Page<TaskRow, C> {
+    cursor: impl Fn(&TaskRow, usize) -> Result<C, SchedulerError>,
+) -> Result<Page<TaskRow, C>, SchedulerError> {
     let more = items.len() as i64 > limit;
     items.truncate(limit.max(0) as usize);
-    let next = more
-        .then(|| items.last().map(|r| cursor(r, items.len() - 1)))
-        .flatten();
-    Page { items, next }
+    let next = match items.last() {
+        Some(r) if more => Some(cursor(r, items.len() - 1)?),
+        _ => None,
+    };
+    Ok(Page { items, next })
 }
 
 /// Queued tasks of one queue in dequeue order: due tasks by `(priority DESC, due_at, id)` (the
@@ -304,13 +308,15 @@ pub async fn queued_page(
         )?);
     }
     let base = after.map_or(0, |c| c.position);
-    Ok(page(items, limit, |r, idx| QueuedCursor {
-        due: idx < due_len,
-        priority: r.priority,
-        due_at: r.due_at,
-        id: r.id.0,
-        position: base + idx as i64 + 1,
-    }))
+    page(items, limit, |r, idx| {
+        Ok(QueuedCursor {
+            due: idx < due_len,
+            priority: r.priority,
+            due_at: r.due_at,
+            id: r.id.0,
+            position: base + idx as i64 + 1,
+        })
+    })
 }
 
 /// Running tasks by lease expiry, soonest first.
@@ -328,16 +334,26 @@ pub async fn running_page(
             .get_results::<Row>(conn)
             .await?,
     )?;
-    Ok(page(items, limit, |r, _| RunningCursor {
-        locked_until: r.locked_until.unwrap_or_else(earliest),
-        id: r.id.0,
-    }))
+    page(items, limit, |r, _| match r.state {
+        TaskState::Running { locked_until, .. } => Ok(RunningCursor {
+            locked_until,
+            id: r.id.0,
+        }),
+        _ => Err(SchedulerError::Invariant(
+            "running page returned a task in the wrong state",
+        )),
+    })
 }
 
-fn finished(r: &TaskRow, _: usize) -> FinishedCursor {
-    FinishedCursor {
-        completed_at: r.completed_at.unwrap_or_else(latest),
-        id: r.id.0,
+fn finished(r: &TaskRow, _: usize) -> Result<FinishedCursor, SchedulerError> {
+    match r.state {
+        TaskState::Finished { completed_at, .. } => Ok(FinishedCursor {
+            completed_at,
+            id: r.id.0,
+        }),
+        _ => Err(SchedulerError::Invariant(
+            "finished page returned a task in the wrong state",
+        )),
     }
 }
 
@@ -356,7 +372,7 @@ pub async fn done_page(
             .get_results::<Row>(conn)
             .await?,
     )?;
-    Ok(page(items, limit, finished))
+    page(items, limit, finished)
 }
 
 /// Which terminal failure [`failed_page`] lists.
@@ -408,7 +424,7 @@ pub async fn failed_page(
         )?,
         None => rows(q.get_results::<Row>(conn).await?)?,
     };
-    Ok(page(items, limit, finished))
+    page(items, limit, finished)
 }
 
 /// A task with its attempt history and the admin actions that touched it.

@@ -96,6 +96,7 @@ mod tests {
     use crate::ids::TaskId;
     use crate::ids::TaskKey;
     use crate::ids::WorkerId;
+    use crate::models::MaxAttempts;
     use crate::models::TaskLease;
 
     fn ctx() -> TaskContext {
@@ -108,7 +109,7 @@ mod tests {
             },
             task_key: TaskKey::try_from("k").unwrap(),
             task_name: TaskName::try_from("t").unwrap(),
-            max_attempts: 3,
+            max_attempts: MaxAttempts::try_from(3u32).unwrap(),
             locked_until: Utc::now(),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }

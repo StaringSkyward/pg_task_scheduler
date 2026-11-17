@@ -125,13 +125,13 @@ async fn done(db: &TestDb, id: TaskId) {
     loop {
         let mut conn = db.pool.get().await.unwrap();
         let task = store::task(&mut conn, id).await.unwrap().unwrap();
-        if task.status == TaskStatus::Done {
+        if task.state.status() == TaskStatus::Done {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "task {id:?} not done: {:?}",
-            task.status
+            task.state
         );
         tokio::time::sleep(ms(20)).await;
     }

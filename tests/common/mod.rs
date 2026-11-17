@@ -307,3 +307,11 @@ impl TestDb {
         .unwrap();
     }
 }
+
+/// How the attempt closed; `None` while it is open.
+pub fn outcome(a: &pg_task_scheduler::Attempt) -> Option<pg_task_scheduler::AttemptOutcome> {
+    match a.state {
+        pg_task_scheduler::AttemptState::Open => None,
+        pg_task_scheduler::AttemptState::Closed { outcome, .. } => Some(outcome),
+    }
+}

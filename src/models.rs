@@ -10,7 +10,6 @@ use diesel::prelude::*;
 
 #[cfg(feature = "cron")]
 use crate::cron::CronExpression;
-#[cfg(feature = "cron")]
 use crate::error::SchedulerError;
 use crate::ids::CommandKey;
 use crate::ids::EffectName;
@@ -99,6 +98,132 @@ text_enum!(AttemptOutcome, "attempt outcome", {
     Released => "released", Cancelled => "cancelled",
 });
 
+/// How a finished task ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalStatus {
+    /// The handler succeeded.
+    Done,
+    /// Failed permanently or used up its attempts; replayable.
+    Dead,
+    /// Cancelled by an operator; replayable.
+    Cancelled,
+}
+
+/// A task's lifecycle state with the columns that state carries: an owner and lease
+/// while running, a completion time once finished. Mirrors the `queue_tasks` CHECKs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskState {
+    /// Waiting for its `due_at` and a worker that serves its queue and name.
+    Queued,
+    /// Claimed; a worker holds its lease.
+    Running {
+        /// The worker holding the lease.
+        locked_by: WorkerId,
+        /// Lease expiry.
+        locked_until: DateTime<Utc>,
+    },
+    /// Done, dead or cancelled.
+    Finished {
+        /// How it ended.
+        status: TerminalStatus,
+        /// When it finished. Retention counts from here.
+        completed_at: DateTime<Utc>,
+    },
+}
+
+impl TaskState {
+    /// The stored status.
+    pub fn status(&self) -> TaskStatus {
+        match self {
+            Self::Queued => TaskStatus::Queued,
+            Self::Running { .. } => TaskStatus::Running,
+            Self::Finished { status, .. } => match status {
+                TerminalStatus::Done => TaskStatus::Done,
+                TerminalStatus::Dead => TaskStatus::Dead,
+                TerminalStatus::Cancelled => TaskStatus::Cancelled,
+            },
+        }
+    }
+
+    /// Read boundary: every shape the `queue_tasks` CHECKs forbid is an `Invariant`.
+    pub(crate) fn from_columns(
+        status: &str,
+        locked_by: Option<WorkerId>,
+        locked_until: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, SchedulerError> {
+        let status: TaskStatus = status
+            .parse()
+            .map_err(|_| SchedulerError::Invariant("unknown task status"))?;
+        let finished = |status, completed_at| Self::Finished {
+            status,
+            completed_at,
+        };
+        Ok(match (status, locked_by, locked_until, completed_at) {
+            (TaskStatus::Queued, None, None, None) => Self::Queued,
+            (TaskStatus::Running, Some(locked_by), Some(locked_until), None) => Self::Running {
+                locked_by,
+                locked_until,
+            },
+            (TaskStatus::Done, None, None, Some(at)) => finished(TerminalStatus::Done, at),
+            (TaskStatus::Dead, None, None, Some(at)) => finished(TerminalStatus::Dead, at),
+            (TaskStatus::Cancelled, None, None, Some(at)) => {
+                finished(TerminalStatus::Cancelled, at)
+            }
+            _ => {
+                return Err(SchedulerError::Invariant(
+                    "task lock or completion columns do not match its status",
+                ));
+            }
+        })
+    }
+}
+
+/// Whether an attempt is still running. Mirrors the `queue_task_attempts` CHECK that
+/// `finished_at` and `outcome` are set together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptState {
+    /// Still running.
+    Open,
+    /// Closed.
+    Closed {
+        /// When it closed.
+        finished_at: DateTime<Utc>,
+        /// How it closed.
+        outcome: AttemptOutcome,
+    },
+}
+
+impl AttemptState {
+    /// Read boundary: an unknown outcome, or only one of the pair set, is an `Invariant`.
+    pub(crate) fn from_columns(
+        finished_at: Option<DateTime<Utc>>,
+        outcome: Option<&str>,
+    ) -> Result<Self, SchedulerError> {
+        match (finished_at, outcome) {
+            (None, None) => Ok(Self::Open),
+            (Some(finished_at), Some(outcome)) => Ok(Self::Closed {
+                finished_at,
+                outcome: outcome
+                    .parse()
+                    .map_err(|_| SchedulerError::Invariant("unknown attempt outcome"))?,
+            }),
+            _ => Err(SchedulerError::Invariant(
+                "attempt finished_at and outcome are not set together",
+            )),
+        }
+    }
+}
+
+/// A task's current attempt (the one whose `lock_token` is the task's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptRun {
+    /// When it was claimed.
+    pub started_at: DateTime<Utc>,
+    /// Open or closed.
+    pub state: AttemptState,
+}
+
 /// A task handed to a worker by `store::claim`.
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
@@ -113,7 +238,7 @@ pub struct ClaimedTask {
     /// The task's arguments as JSON.
     pub payload: serde_json::Value,
     /// Attempts allowed in total.
-    pub max_attempts: i32,
+    pub max_attempts: MaxAttempts,
     /// When the task became due.
     pub due_at: DateTime<Utc>,
     /// Database time of the claim.
@@ -171,8 +296,8 @@ pub struct TaskView {
     pub queue: QueueName,
     /// The task's arguments as JSON.
     pub payload: serde_json::Value,
-    /// Lifecycle state.
-    pub status: TaskStatus,
+    /// Lifecycle state, with the lease while running and the completion time once finished.
+    pub state: TaskState,
     /// Higher is claimed first, within its queue.
     pub priority: i32,
     /// Earliest time a worker may claim it.
@@ -180,21 +305,15 @@ pub struct TaskView {
     /// Attempts counted so far.
     pub attempts: i32,
     /// Attempts allowed in total.
-    pub max_attempts: i32,
-    /// The worker holding the lease, while `running`.
-    pub locked_by: Option<WorkerId>,
+    pub max_attempts: MaxAttempts,
     /// Fencing token of the latest claim.
     pub lock_token: LockToken,
-    /// Lease expiry, while `running`.
-    pub locked_until: Option<DateTime<Utc>>,
     /// Message of the latest failure.
     pub last_error: Option<String>,
     /// When it was enqueued.
     pub created_at: DateTime<Utc>,
     /// When the row last changed.
     pub updated_at: DateTime<Utc>,
-    /// When it became `done`, `dead` or `cancelled`. Retention counts from here.
-    pub completed_at: Option<DateTime<Utc>>,
     /// The admin action that last cancelled or replayed this task.
     pub admin_action_id: Option<i64>,
 }
@@ -210,10 +329,8 @@ pub struct Attempt {
     pub worker_id: WorkerId,
     /// When it was claimed.
     pub started_at: DateTime<Utc>,
-    /// When it closed; `None` while it runs.
-    pub finished_at: Option<DateTime<Utc>>,
-    /// How it closed; `None` while it runs.
-    pub outcome: Option<AttemptOutcome>,
+    /// Open, or when and how it closed.
+    pub state: AttemptState,
     /// The failure message, if it failed.
     pub error: Option<String>,
 }
@@ -368,7 +485,6 @@ impl MaxAttempts {
         Self(NonZeroI32::new(3).unwrap())
     }
     /// Read boundary: parse the stored signed count. Rejects `<= 0`.
-    #[cfg_attr(not(feature = "cron"), allow(dead_code))]
     pub(crate) fn from_db_i32(i: i32) -> Result<Self, MaxAttemptsError> {
         NonZeroI32::new(i)
             .filter(|n| n.get() > 0)
@@ -438,6 +554,57 @@ mod task_enum_tests {
         );
         let day = PgInterval::new(0, 1, 0);
         assert_eq!(interval_to_duration(day), Duration::from_secs(86_400));
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn task_state_accepts_each_checked_shape() {
+        let w = WorkerId::try_from("w").unwrap();
+        let t = Utc::now();
+        assert_eq!(
+            TaskState::from_columns("queued", None, None, None).unwrap(),
+            TaskState::Queued
+        );
+        assert!(matches!(
+            TaskState::from_columns("running", Some(w), Some(t), None).unwrap(),
+            TaskState::Running { .. }
+        ));
+        assert_eq!(
+            TaskState::from_columns("cancelled", None, None, Some(t)).unwrap(),
+            TaskState::Finished {
+                status: TerminalStatus::Cancelled,
+                completed_at: t
+            }
+        );
+    }
+
+    #[test]
+    fn task_state_rejects_shapes_the_checks_forbid() {
+        let t = Utc::now();
+        for (s, by, until, done) in [
+            ("running", None, Some(t), None),
+            ("queued", None, None, Some(t)),
+            ("done", None, None, None),
+            ("pending", None, None, None),
+        ] {
+            let r = TaskState::from_columns(s, by, until, done);
+            assert!(matches!(r, Err(SchedulerError::Invariant(_))), "{s}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn attempt_state_pairs_finish_and_outcome() {
+        let t = Utc::now();
+        assert_eq!(
+            AttemptState::from_columns(None, None).unwrap(),
+            AttemptState::Open
+        );
+        assert!(AttemptState::from_columns(Some(t), None).is_err());
+        assert!(AttemptState::from_columns(None, Some("done")).is_err());
     }
 }
 

@@ -15,6 +15,7 @@ use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::ClaimedTask;
+use crate::models::MaxAttempts;
 use crate::models::TaskLease;
 use crate::models::interval_to_duration;
 use crate::models::pg_interval;
@@ -92,25 +93,28 @@ pub async fn claim(
         .bind::<sql_types::Text, _>(queue)
         .get_results::<ClaimedRow>(conn)
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| ClaimedTask {
-            lease: TaskLease {
-                task_id: r.id,
-                worker_id: worker.clone(),
-                lock_token: r.lock_token,
-                attempt_no: r.attempts,
-            },
-            task_key: r.task_key,
-            task_name: r.task_name,
-            queue: r.queue,
-            payload: r.payload,
-            max_attempts: r.max_attempts,
-            due_at: r.due_at,
-            claimed_at: r.claimed_at,
-            locked_until: r.locked_until,
+    rows.into_iter()
+        .map(|r| {
+            Ok(ClaimedTask {
+                lease: TaskLease {
+                    task_id: r.id,
+                    worker_id: worker.clone(),
+                    lock_token: r.lock_token,
+                    attempt_no: r.attempts,
+                },
+                task_key: r.task_key,
+                task_name: r.task_name,
+                queue: r.queue,
+                payload: r.payload,
+                max_attempts: MaxAttempts::from_db_i32(r.max_attempts).map_err(|_| {
+                    SchedulerError::Invariant("stored max_attempts is not positive")
+                })?,
+                due_at: r.due_at,
+                claimed_at: r.claimed_at,
+                locked_until: r.locked_until,
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[derive(diesel::QueryableByName)]

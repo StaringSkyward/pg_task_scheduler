@@ -94,7 +94,8 @@ async fn status_of(db: &TestDb, id: i64) -> String {
         .await
         .unwrap()
         .unwrap()
-        .status
+        .state
+        .status()
         .as_str()
         .to_owned()
 }

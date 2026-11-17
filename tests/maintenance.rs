@@ -94,10 +94,9 @@ async fn reaper_requeues_with_crash_retry_delay() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.last_error.as_deref(), Some("worker lease expired"));
     assert_eq!(t.lock_token, c.lease.lock_token);
-    assert_eq!(t.locked_by, None);
     let ok = db
         .scalar(&format!(
             "SELECT count(*) AS n FROM queue_tasks WHERE id = {} \
@@ -108,8 +107,7 @@ async fn reaper_requeues_with_crash_retry_delay() {
     assert_eq!(ok, 1);
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].outcome, Some(AttemptOutcome::LeaseExpired));
-    assert!(a[0].finished_at.is_some());
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::LeaseExpired));
     db.cleanup().await;
 }
 
@@ -133,8 +131,7 @@ async fn reaper_kills_exhausted_task() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Dead);
-    assert!(t.completed_at.is_some());
+    assert_eq!(t.state.status(), TaskStatus::Dead); // Finished carries completed_at
     db.cleanup().await;
 }
 
@@ -320,11 +317,10 @@ async fn replay_requeues_dead_task_and_audits() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     assert_eq!(t.lock_token, LockToken(c.lease.lock_token.0 + 1));
     assert_eq!(t.last_error, None);
-    assert_eq!(t.completed_at, None);
     let n = db
         .scalar(&format!(
             "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' AND task_id = {} \
