@@ -381,8 +381,25 @@ async fn stale_worker_cannot_emit_outbox_command() {
 async fn largest_command_key_is_stored() {
     let db = TestDb::new().await;
     let c = claimed(&db).await;
-    let mut key: String = (0u32..4096).map(|i| format!("{i:x}")).collect();
-    key.truncate(2048);
+    // Fixed-seed xorshift64 so the key is high-entropy (incompressible) yet deterministic.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut key = String::new();
+    while key.len() < 2048 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let ch = match x % 4 {
+            0 => char::from_u32(0x21 + u32::try_from((x >> 8) % 94).unwrap()).unwrap(),
+            1 => char::from_u32(0xA1 + u32::try_from((x >> 8) % 0x500).unwrap()).unwrap(),
+            2 => char::from_u32(0x4E00 + u32::try_from((x >> 8) % 0x2000).unwrap()).unwrap(),
+            _ => char::from_u32(0x1F300 + u32::try_from((x >> 8) % 0x300).unwrap()).unwrap(),
+        };
+        if key.len() + ch.len_utf8() <= 2048 {
+            key.push(ch);
+        } else {
+            key.push('a');
+        }
+    }
     assert_eq!(key.len(), 2048);
     let mut conn = db.pool.get().await.unwrap();
     let w = store::complete_with_outbox(&mut conn, &c.lease, &cmd("e", &key))

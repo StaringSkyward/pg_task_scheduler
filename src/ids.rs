@@ -309,6 +309,7 @@ mod identifier_tests {
     #[test]
     fn command_key_byte_limit() {
         assert!(CommandKey::try_from("x".repeat(2048)).is_ok());
+        assert!(CommandKey::try_from("\u{1F600}".repeat(512)).is_ok());
         assert_eq!(
             CommandKey::try_from("x".repeat(2049)),
             Err(IdentifierError::CommandKeyTooLong)
