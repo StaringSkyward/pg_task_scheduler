@@ -10,7 +10,10 @@ use crate::cron::CronExpression;
 use crate::error::SchedulerError;
 use crate::ids::IdentifierError;
 use crate::ids::JobId;
+use crate::ids::QueueName;
 use crate::ids::TaskKey;
+use crate::ids::TaskName;
+use crate::models::MaxAttempts;
 
 #[derive(diesel::QueryableByName)]
 struct DueJob {
@@ -23,7 +26,7 @@ struct DueJob {
     #[diesel(sql_type = sql_types::Timestamptz)]
     db_now: DateTime<Utc>,
     #[diesel(sql_type = sql_types::Text)]
-    name: String,
+    task_name: String,
     #[diesel(sql_type = sql_types::Jsonb)]
     job_args: serde_json::Value,
     #[diesel(sql_type = sql_types::Integer)]
@@ -32,12 +35,15 @@ struct DueJob {
     queue: String,
 }
 
+/// The task columns stay raw so [`parse_due`] can pause a job with a bad value
+/// instead of a decode error ending the pass.
 const SELECT_DUE: &str = "\
-    SELECT id, next_run_at, cron_expression, now() AS db_now, name, job_args, \
-           max_attempts, queue \
-    FROM scheduler_jobs \
-    WHERE next_run_at <= now() AND is_paused = false \
-    ORDER BY next_run_at ASC FOR UPDATE SKIP LOCKED LIMIT 1";
+    SELECT j.id, j.next_run_at, j.cron_expression, now() AS db_now, j.task_name, \
+           j.job_args, j.max_attempts, j.queue \
+    FROM scheduler_jobs j \
+    WHERE j.next_run_at <= now() \
+      AND NOT EXISTS (SELECT 1 FROM scheduler_job_pauses p WHERE p.job_id = j.id) \
+    ORDER BY j.next_run_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT 1";
 const INSERT_TASK: &str = "\
     INSERT INTO queue_tasks (task_key, task_name, payload, due_at, max_attempts, queue) \
     VALUES ($1, $2, $3, $4, $5, $6) \
@@ -45,7 +51,7 @@ const INSERT_TASK: &str = "\
 const NOTIFY: &str = "SELECT pg_notify('queue_available', '')";
 const ADVANCE: &str =
     "UPDATE scheduler_jobs SET next_run_at = $1, updated_at = now() WHERE id = $2";
-const PAUSE: &str = "UPDATE scheduler_jobs SET is_paused = true, updated_at = now() WHERE id = $1";
+const PAUSE: &str = "INSERT INTO scheduler_job_pauses (job_id) VALUES ($1) ON CONFLICT DO NOTHING";
 /// A transaction cut off mid-way (shutdown drops the future) stays open on its pooled
 /// connection, holding the job's row lock; the server ends that session after 30 s idle.
 const IDLE_GUARD: &str = "SELECT set_config('idle_in_transaction_session_timeout', '30s', true)";
@@ -73,8 +79,9 @@ pub(crate) fn schedule_task_key(
 /// future occurrence — both in the same transaction, so pod death cannot turn
 /// into a missed run (`run_once` misfire).
 ///
-/// A stored cron that fails to parse or has no next occurrence (corruption — it
-/// was validated on create) pauses its job and logs the error; it is never
+/// A job-local defect pauses its job and logs the error: a stored cron that fails to
+/// parse or has no next occurrence, or an invalid task name, queue or `max_attempts`
+/// (all validated on create, so only direct SQL stores one). Such a job is never
 /// silently advanced, and only database errors end the pass.
 pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize, SchedulerError> {
     let mut inserted = 0;
@@ -85,6 +92,29 @@ pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize,
         }
     }
     Ok(inserted)
+}
+
+/// What a due job's row yields once every job-local column has parsed.
+struct Occurrence {
+    next: DateTime<Utc>,
+    task_name: TaskName,
+    queue: QueueName,
+    max_attempts: MaxAttempts,
+}
+
+/// Parse a due job's stored values; `Err` describes the first defect.
+fn parse_due(job: &DueJob) -> Result<Occurrence, String> {
+    // Base the next run on the DB clock, never the Rust clock.
+    let next = CronExpression::parse(&job.cron_expression)
+        .and_then(|cron| cron.next_after(job.db_now))
+        .map_err(|e| e.to_string())?;
+    Ok(Occurrence {
+        next,
+        task_name: TaskName::try_from(job.task_name.as_str())
+            .map_err(|e| format!("task name: {e}"))?,
+        queue: QueueName::try_from(job.queue.as_str()).map_err(|e| format!("queue: {e}"))?,
+        max_attempts: MaxAttempts::from_db_i32(job.max_attempts).map_err(|e| e.to_string())?,
+    })
 }
 
 /// Process the earliest due job: `None` when none is due, else the tasks inserted (0 or 1).
@@ -100,41 +130,36 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, 
             return Ok(None);
         };
 
-        // Base the next run on the DB clock, never the Rust clock.
-        let next = CronExpression::parse(&job.cron_expression)
-            .and_then(|cron| cron.next_after(job.db_now));
-        let inserted = match next {
-            Ok(next) => {
-                // run_once misfire: the occurrence is for the OLD next_run_at.
-                let key = schedule_task_key(JobId(job.id), job.next_run_at)?;
-                let inserted = diesel::sql_query(INSERT_TASK)
-                    .bind::<sql_types::Text, _>(key.as_str())
-                    .bind::<sql_types::Text, _>(job.name)
-                    .bind::<sql_types::Jsonb, _>(job.job_args)
-                    .bind::<sql_types::Timestamptz, _>(job.next_run_at)
-                    .bind::<sql_types::Integer, _>(job.max_attempts)
-                    .bind::<sql_types::Text, _>(job.queue)
-                    .execute(c)
-                    .await?;
-                if inserted == 1 {
-                    diesel::sql_query(NOTIFY).execute(c).await?;
-                }
-                diesel::sql_query(ADVANCE)
-                    .bind::<sql_types::Timestamptz, _>(next)
-                    .bind::<sql_types::Uuid, _>(job.id)
-                    .execute(c)
-                    .await?;
-                inserted
-            }
+        let occurrence = match parse_due(&job) {
+            Ok(occurrence) => occurrence,
             Err(e) => {
-                tracing::error!(job_id = %job.id, error = %e, "unschedulable cron; pausing job");
+                tracing::error!(job_id = %job.id, error = %e, "unschedulable job; pausing it");
                 diesel::sql_query(PAUSE)
                     .bind::<sql_types::Uuid, _>(job.id)
                     .execute(c)
                     .await?;
-                0
+                return Ok(Some(0));
             }
         };
+        // run_once misfire: the occurrence is for the OLD next_run_at.
+        let key = schedule_task_key(JobId(job.id), job.next_run_at)?;
+        let inserted = diesel::sql_query(INSERT_TASK)
+            .bind::<sql_types::Text, _>(key.as_str())
+            .bind::<sql_types::Text, _>(occurrence.task_name.as_str())
+            .bind::<sql_types::Jsonb, _>(job.job_args)
+            .bind::<sql_types::Timestamptz, _>(job.next_run_at)
+            .bind::<sql_types::Integer, _>(occurrence.max_attempts.to_i32())
+            .bind::<sql_types::Text, _>(occurrence.queue.as_str())
+            .execute(c)
+            .await?;
+        if inserted == 1 {
+            diesel::sql_query(NOTIFY).execute(c).await?;
+        }
+        diesel::sql_query(ADVANCE)
+            .bind::<sql_types::Timestamptz, _>(occurrence.next)
+            .bind::<sql_types::Uuid, _>(job.id)
+            .execute(c)
+            .await?;
         Ok(Some(inserted))
     })
     .await

@@ -36,6 +36,8 @@ pub use crate::ids::IdentifierError;
 pub use crate::ids::JobId;
 pub use crate::ids::LockToken;
 pub use crate::ids::QueueName;
+#[cfg(feature = "cron")]
+pub use crate::ids::ScheduleName;
 pub use crate::ids::TaskId;
 pub use crate::ids::TaskKey;
 pub use crate::ids::TaskName;

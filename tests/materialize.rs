@@ -9,6 +9,7 @@ use pg_task_scheduler::CronExpression;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
 use pg_task_scheduler::QueueName;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::jobs::CreateJob;
@@ -58,6 +59,7 @@ async fn skips_not_due_and_paused() {
     let paused = db
         .insert_job_full(
             "paused",
+            "paused",
             "*/1 * * * *",
             Utc::now() - Duration::minutes(1),
             3,
@@ -99,6 +101,7 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
     let mut conn = db.pool.get().await.unwrap();
     let make_spec = |version| {
         CreateJob::new(
+            ScheduleName::try_from("snapshot").unwrap(),
             TaskName::try_from("snapshot").unwrap(),
             CronExpression::parse("*/5 * * * *").unwrap(),
             MaxAttempts::try_from(3).unwrap(),
@@ -177,6 +180,7 @@ async fn materialized_task_uses_the_job_queue() {
     let job = jobs::create(
         &mut conn,
         CreateJob::new(
+            ScheduleName::try_from("bulk-job").unwrap(),
             TaskName::try_from("bulk-job").unwrap(),
             CronExpression::parse("*/1 * * * *").unwrap(),
             MaxAttempts::try_from(3u32).unwrap(),
@@ -265,6 +269,49 @@ async fn unsatisfiable_cron_pauses_its_job_and_later_jobs_still_materialize() {
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
     assert!(db.is_paused(bad).await);
     assert!(db.task_ids(bad).await.is_empty());
+    assert_eq!(db.task_ids(good).await.len(), 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn occurrence_runs_the_task_name_not_the_schedule_name() {
+    let db = TestDb::new().await;
+    let job = db
+        .insert_job_full(
+            "nightly",
+            "report",
+            "*/1 * * * *",
+            Utc::now() - Duration::minutes(1),
+            3,
+            false,
+        )
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let id = db.task_ids(job).await[0];
+    let t = store::task(&mut conn, TaskId(id)).await.unwrap().unwrap();
+    assert_eq!(t.task_name.as_str(), "report");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn invalid_stored_queue_pauses_its_job_and_the_pass_continues() {
+    use diesel_async::RunQueryDsl;
+    let db = TestDb::new().await;
+    let past = Utc::now() - Duration::minutes(2);
+    let bad = db.insert_job("bad-queue", "*/1 * * * *", past).await;
+    let good = db
+        .insert_job("good", "*/1 * * * *", past + Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    // scheduler_jobs has no CHECK on queue; only direct SQL can store an invalid one.
+    diesel::sql_query("UPDATE scheduler_jobs SET queue = '' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(bad)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    assert!(db.is_paused(bad).await);
     assert_eq!(db.task_ids(good).await.len(), 1);
     db.cleanup().await;
 }

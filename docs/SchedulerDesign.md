@@ -105,9 +105,11 @@ tell a lost worker without knowing the worker's configuration.
 
 ### `scheduler_jobs` (`cron` feature)
 
-Recurring definitions: name (which is also the produced `task_name`), cron
-expression, payload template, `max_attempts`, pause state, and the `next_run_at`
-cursor. It is not part of the queue protocol.
+Recurring definitions: a unique schedule name, the `task_name` each occurrence
+runs (several schedules may share one), cron expression, payload template,
+`max_attempts`, queue, and the `next_run_at` cursor. A row in
+`scheduler_job_pauses` pauses its job. Neither table is part of the queue
+protocol.
 
 ### Deviations from the specification
 

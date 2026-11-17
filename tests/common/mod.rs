@@ -139,34 +139,45 @@ impl TestDb {
             .n
     }
 
-    /// Insert a job; returns its id. Cron validated by the DB only — pass valid cron.
+    /// Insert a job whose task name is its schedule name; returns its id. Cron validated
+    /// by the DB only — pass valid cron.
     pub async fn insert_job(&self, name: &str, cron: &str, next_run_at: DateTime<Utc>) -> Uuid {
-        self.insert_job_full(name, cron, next_run_at, 3, false)
+        self.insert_job_full(name, name, cron, next_run_at, 3, false)
             .await
     }
 
+    /// Insert a job, plus a pause row when `is_paused`; returns its id.
     pub async fn insert_job_full(
         &self,
         name: &str,
+        task_name: &str,
         cron: &str,
         next_run_at: DateTime<Utc>,
         max_attempts: i32,
         is_paused: bool,
     ) -> Uuid {
         let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query(
-            "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at, max_attempts, is_paused) \
+        let id = diesel::sql_query(
+            "INSERT INTO scheduler_jobs (name, task_name, cron_expression, next_run_at, max_attempts) \
              VALUES ($1,$2,$3,$4,$5) RETURNING id",
         )
         .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(task_name)
         .bind::<diesel::sql_types::Text, _>(cron)
         .bind::<diesel::sql_types::Timestamptz, _>(next_run_at)
         .bind::<diesel::sql_types::Integer, _>(max_attempts)
-        .bind::<diesel::sql_types::Bool, _>(is_paused)
         .get_result::<IdRow>(&mut conn)
         .await
         .unwrap()
-        .id
+        .id;
+        if is_paused {
+            diesel::sql_query("INSERT INTO scheduler_job_pauses (job_id) VALUES ($1)")
+                .bind::<diesel::sql_types::Uuid, _>(id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        id
     }
 
     pub async fn job_next_run_at(&self, job_id: Uuid) -> DateTime<Utc> {
@@ -181,12 +192,14 @@ impl TestDb {
 
     pub async fn is_paused(&self, job_id: Uuid) -> bool {
         let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query("SELECT is_paused AS flag FROM scheduler_jobs WHERE id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(job_id)
-            .get_result::<BoolRow>(&mut conn)
-            .await
-            .unwrap()
-            .flag
+        diesel::sql_query(
+            "SELECT EXISTS (SELECT 1 FROM scheduler_job_pauses WHERE job_id = $1) AS flag",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job_id)
+        .get_result::<BoolRow>(&mut conn)
+        .await
+        .unwrap()
+        .flag
     }
 
     /// Ids of the `queue_tasks` materialized for a job, oldest occurrence first.

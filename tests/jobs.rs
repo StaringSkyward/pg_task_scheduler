@@ -9,7 +9,9 @@ use pg_task_scheduler::JobId;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
 use pg_task_scheduler::QueueName;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::jobs::Applied;
 use pg_task_scheduler::jobs::CreateJob;
@@ -17,22 +19,34 @@ use pg_task_scheduler::jobs::ScheduleUpdate;
 use pg_task_scheduler::jobs::{self};
 use pg_task_scheduler::store;
 
-fn spec(name: &str, cron: &str) -> CreateJob {
+fn spec(name: &str, task_name: &str, cron: &str) -> CreateJob {
+    spec_with(name, task_name, cron, JobLifecycle::Active)
+}
+
+fn spec_with(name: &str, task_name: &str, cron: &str, lifecycle: JobLifecycle) -> CreateJob {
     CreateJob::new(
-        TaskName::try_from(name).unwrap(),
+        ScheduleName::try_from(name).unwrap(),
+        TaskName::try_from(task_name).unwrap(),
         CronExpression::parse(cron).unwrap(),
         MaxAttempts::try_from(3u32).unwrap(),
-        JobLifecycle::Active,
+        lifecycle,
         serde_json::json!({"k": "v"}),
     )
     .unwrap()
+}
+
+struct Report;
+impl Task for Report {
+    const NAME: &'static str = "report";
+    const QUEUE: &'static str = "reports";
+    type Args = serde_json::Value;
 }
 
 #[tokio::test]
 async fn create_sets_future_next_run() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let job = jobs::create(&mut conn, spec("digest", "*/5 * * * *"))
+    let job = jobs::create(&mut conn, spec("digest", "digest", "*/5 * * * *"))
         .await
         .unwrap();
     assert!(job.next_run_at > Utc::now());
@@ -43,11 +57,11 @@ async fn create_sets_future_next_run() {
 async fn ensure_job_inserts_then_reconciles_config() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let a = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *"))
+    let a = jobs::ensure_job(&mut conn, spec("sync", "sync", "*/5 * * * *"))
         .await
         .unwrap();
     assert!(a.next_run_at > Utc::now()); // insert path: cursor in the future
-    let b = jobs::ensure_job(&mut conn, spec("sync", "0 * * * *"))
+    let b = jobs::ensure_job(&mut conn, spec("sync", "sync", "0 * * * *"))
         .await
         .unwrap();
     assert_eq!(a.id, b.id); // idempotent by name — same row
@@ -67,7 +81,7 @@ async fn ensure_job_preserves_due_cursor_and_no_slot_skipped() {
 
     // ensure_job with a CHANGED cron must NOT advance the cursor.
     let mut conn = db.pool.get().await.unwrap();
-    let job = jobs::ensure_job(&mut conn, spec("sync", "0 * * * *"))
+    let job = jobs::ensure_job(&mut conn, spec("sync", "sync", "0 * * * *"))
         .await
         .unwrap();
     assert_eq!(job.id, JobId(id)); // updated the existing row
@@ -92,15 +106,16 @@ async fn ensure_job_preserves_is_paused_on_conflict() {
     let id = db
         .insert_job_full(
             "p",
+            "p",
             "*/5 * * * *",
             Utc::now() + chrono::Duration::hours(1),
             3,
             true,
         )
         .await;
-    // ensure_job carries is_paused=false (the spec() default); it must NOT resume.
+    // ensure_job with an Active spec (the spec() default) must NOT resume it.
     let mut conn = db.pool.get().await.unwrap();
-    jobs::ensure_job(&mut conn, spec("p", "*/5 * * * *"))
+    jobs::ensure_job(&mut conn, spec("p", "p", "*/5 * * * *"))
         .await
         .unwrap();
     assert!(
@@ -114,7 +129,7 @@ async fn ensure_job_preserves_is_paused_on_conflict() {
 async fn pause_resume_list_get_delete() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let job = jobs::create(&mut conn, spec("p", "*/5 * * * *"))
+    let job = jobs::create(&mut conn, spec("p", "p", "*/5 * * * *"))
         .await
         .unwrap();
     assert_eq!(
@@ -280,14 +295,109 @@ async fn pause_resume_delete_missing_is_not_found() {
 async fn ensure_job_reconciles_queue() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let a = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *"))
+    let a = jobs::ensure_job(&mut conn, spec("sync", "sync", "*/5 * * * *"))
         .await
         .unwrap();
     assert_eq!(a.queue, QueueName::default());
     let bulk = QueueName::try_from("bulk").unwrap();
-    let b = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *").queue(bulk))
+    let b = jobs::ensure_job(&mut conn, spec("sync", "sync", "*/5 * * * *").queue(bulk))
         .await
         .unwrap();
     assert_eq!(b.queue.as_str(), "bulk");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_schedules_can_run_one_task() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let a = jobs::create(&mut conn, spec("digest-hourly", "digest", "0 * * * *"))
+        .await
+        .unwrap();
+    let b = jobs::create(&mut conn, spec("digest-daily", "digest", "0 0 * * *"))
+        .await
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(
+        (a.task_name.as_str(), b.task_name.as_str()),
+        ("digest", "digest")
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn for_task_takes_name_and_queue_from_the_task() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let spec = CreateJob::for_task::<Report>(
+        ScheduleName::try_from("nightly-report").unwrap(),
+        CronExpression::parse("0 3 * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        serde_json::json!({}),
+    )
+    .unwrap();
+    let job = jobs::create(&mut conn, spec).await.unwrap();
+    assert_eq!(
+        (job.task_name.as_str(), job.queue.as_str()),
+        ("report", "reports")
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn created_paused_job_is_paused_and_ensure_keeps_it_paused() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = jobs::create(
+        &mut conn,
+        spec_with("p", "p", "*/5 * * * *", JobLifecycle::Paused),
+    )
+    .await
+    .unwrap();
+    assert_eq!(job.lifecycle, JobLifecycle::Paused);
+    let again = jobs::ensure_job(&mut conn, spec("p", "p", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(again.lifecycle, JobLifecycle::Paused);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_ensure_job_creates_one_job() {
+    let db = TestDb::new().await;
+    let (mut c1, mut c2) = (db.pool.get().await.unwrap(), db.pool.get().await.unwrap());
+    let (a, b) = tokio::join!(
+        jobs::ensure_job(
+            &mut c1,
+            spec_with("race", "race", "*/5 * * * *", JobLifecycle::Paused)
+        ),
+        jobs::ensure_job(
+            &mut c2,
+            spec_with("race", "race", "*/5 * * * *", JobLifecycle::Paused)
+        ),
+    );
+    assert_eq!(a.unwrap().id, b.unwrap().id);
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM scheduler_job_pauses")
+            .await,
+        1
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn recreated_schedule_is_not_paused() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = jobs::create(&mut conn, spec("again", "again", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let _ = jobs::pause(&mut conn, job.id).await.unwrap();
+    let _ = jobs::delete(&mut conn, job.id).await.unwrap();
+    let fresh = jobs::create(&mut conn, spec("again", "again", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(fresh.lifecycle, JobLifecycle::Active);
     db.cleanup().await;
 }

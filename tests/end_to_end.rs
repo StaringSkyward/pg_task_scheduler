@@ -12,6 +12,7 @@ use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::HealthStatus;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::Scheduler;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
@@ -35,6 +36,7 @@ async fn runs_due_job_end_to_end() {
     let job = jobs::create(
         &mut conn,
         CreateJob::new(
+            ScheduleName::try_from("counter").unwrap(),
             TaskName::try_from("counter").unwrap(),
             CronExpression::parse("*/1 * * * *").unwrap(),
             MaxAttempts::try_from(3u32).unwrap(),
@@ -120,7 +122,7 @@ async fn materialize_failure_degrades_health_without_slowing_claims() {
     let mut conn = db.pool.get().await.unwrap();
     {
         use diesel_async::RunQueryDsl;
-        diesel::sql_query("DROP TABLE scheduler_jobs")
+        diesel::sql_query("DROP TABLE scheduler_jobs CASCADE")
             .execute(&mut conn)
             .await
             .unwrap();

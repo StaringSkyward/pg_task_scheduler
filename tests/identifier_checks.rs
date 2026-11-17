@@ -12,15 +12,20 @@ use pg_task_scheduler::TaskId;
 use pg_task_scheduler::store;
 
 #[cfg(feature = "cron")]
-/// Raw insert of a job with the given name, bypassing the Rust JobName
-/// constructor so the SQL CHECK is what is under test.
-async fn insert_job_with_name(db: &TestDb, name: &str) -> Result<usize, DieselError> {
+/// Raw insert of a job with the given names, bypassing the Rust `ScheduleName` and
+/// `TaskName` constructors so the SQL CHECK is what is under test.
+async fn insert_job_with_names(
+    db: &TestDb,
+    name: &str,
+    task_name: &str,
+) -> Result<usize, DieselError> {
     let mut conn = db.pool.get().await.unwrap();
     diesel::sql_query(
-        "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at) \
-         VALUES ($1, '*/5 * * * *', now())",
+        "INSERT INTO scheduler_jobs (name, task_name, cron_expression, next_run_at) \
+         VALUES ($1, $2, '*/5 * * * *', now())",
     )
     .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(task_name)
     .execute(&mut conn)
     .await
 }
@@ -37,7 +42,7 @@ fn is_check_violation(err: &DieselError) -> bool {
 #[tokio::test]
 async fn empty_job_name_is_rejected_by_check() {
     let db = TestDb::new().await;
-    let err = insert_job_with_name(&db, "")
+    let err = insert_job_with_names(&db, "", "t")
         .await
         .expect_err("empty name must violate the CHECK");
     assert!(is_check_violation(&err), "got: {err:?}");
@@ -46,9 +51,20 @@ async fn empty_job_name_is_rejected_by_check() {
 
 #[cfg(feature = "cron")]
 #[tokio::test]
+async fn empty_task_name_is_rejected_by_check() {
+    let db = TestDb::new().await;
+    let err = insert_job_with_names(&db, "ok", "")
+        .await
+        .expect_err("empty task name must violate the CHECK");
+    assert!(is_check_violation(&err), "got: {err:?}");
+    db.cleanup().await;
+}
+
+#[cfg(feature = "cron")]
+#[tokio::test]
 async fn leading_whitespace_job_name_is_rejected_by_check() {
     let db = TestDb::new().await;
-    let err = insert_job_with_name(&db, " x")
+    let err = insert_job_with_names(&db, " x", "t")
         .await
         .expect_err("leading-whitespace name must violate the CHECK");
     assert!(is_check_violation(&err), "got: {err:?}");
@@ -59,7 +75,7 @@ async fn leading_whitespace_job_name_is_rejected_by_check() {
 #[tokio::test]
 async fn valid_job_name_is_accepted() {
     let db = TestDb::new().await;
-    let n = insert_job_with_name(&db, "ok")
+    let n = insert_job_with_names(&db, "ok", "t")
         .await
         .expect("valid name should insert");
     assert_eq!(n, 1);

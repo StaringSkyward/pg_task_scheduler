@@ -18,6 +18,8 @@ use crate::ids::EffectName;
 use crate::ids::JobId;
 use crate::ids::LockToken;
 use crate::ids::QueueName;
+#[cfg(feature = "cron")]
+use crate::ids::ScheduleName;
 use crate::ids::TaskId;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
@@ -493,8 +495,8 @@ mod max_attempts_tests {
 }
 
 #[cfg(feature = "cron")]
-/// A job's lifecycle state. Used at both the creation and read boundaries; the
-/// stored `is_paused` boolean never escapes the row mapping.
+/// A job's lifecycle state. Used at both the creation and read boundaries; it is
+/// `Paused` exactly when the job has a `scheduler_job_pauses` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobLifecycle {
     /// Creates a task for each occurrence.
@@ -504,33 +506,18 @@ pub enum JobLifecycle {
 }
 
 #[cfg(feature = "cron")]
-impl JobLifecycle {
-    /// Boundary helper for the `is_paused` column. `pub(crate)` because `jobs`
-    /// (a sibling module) calls it — a plain `fn` is private to `models`.
-    pub(crate) fn is_paused(self) -> bool {
-        matches!(self, JobLifecycle::Paused)
-    }
-
-    pub(crate) fn from_paused(paused: bool) -> Self {
-        if paused {
-            JobLifecycle::Paused
-        } else {
-            JobLifecycle::Active
-        }
-    }
-}
-
-#[cfg(feature = "cron")]
-/// Public domain projection of a `scheduler_jobs` row. Every field is a domain
-/// type; `job_args` is intentionally omitted (reading is untyped — the handler
-/// argument type is not recoverable from a runtime `TaskName`). Not `Serialize`:
-/// it must not become an accidental wire contract.
+/// Public domain projection of a `scheduler_jobs` row and its pause state. Every
+/// field is a domain type; `job_args` is intentionally omitted (reading is untyped —
+/// the handler argument type is not recoverable from a runtime `TaskName`). Not
+/// `Serialize`: it must not become an accidental wire contract.
 #[derive(Debug, Clone)]
 pub struct Job {
     /// Row id.
     pub id: JobId,
-    /// The task name each occurrence runs; also the schedule's unique name.
-    pub name: TaskName,
+    /// The schedule's unique name.
+    pub name: ScheduleName,
+    /// The task each occurrence runs; many schedules may share one.
+    pub task_name: TaskName,
     /// When it fires.
     pub cron: CronExpression,
     /// Attempts each task it creates gets.
@@ -543,14 +530,17 @@ pub struct Job {
     pub next_run_at: DateTime<Utc>,
     /// When it was created.
     pub created_at: DateTime<Utc>,
-    /// When the row last changed.
+    /// When the row last changed (pausing and resuming do not change it).
     pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(feature = "cron")]
-impl TryFrom<SchedulerJob> for Job {
-    type Error = SchedulerError;
-    fn try_from(row: SchedulerJob) -> Result<Self, SchedulerError> {
+impl Job {
+    /// Project a row whose pause state the caller read alongside it.
+    pub(crate) fn from_row(
+        row: SchedulerJob,
+        lifecycle: JobLifecycle,
+    ) -> Result<Self, SchedulerError> {
         let job_id = row.id;
         let cron = CronExpression::parse_stored(job_id, &row.cron_expression)?;
         let max_attempts =
@@ -561,10 +551,11 @@ impl TryFrom<SchedulerJob> for Job {
         Ok(Job {
             id: job_id,
             name: row.name,
+            task_name: row.task_name,
             cron,
             max_attempts,
             queue: row.queue,
-            lifecycle: JobLifecycle::from_paused(row.is_paused),
+            lifecycle,
             next_run_at: row.next_run_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -579,13 +570,13 @@ impl TryFrom<SchedulerJob> for Job {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct SchedulerJob {
     pub id: JobId,
-    pub name: TaskName,
+    pub name: ScheduleName,
+    pub task_name: TaskName,
     pub cron_expression: String,
     pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
     pub max_attempts: i32,
     pub queue: QueueName,
-    pub is_paused: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -594,24 +585,11 @@ pub struct SchedulerJob {
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = scheduler_jobs)]
 pub struct NewJob {
-    pub name: TaskName,
+    pub name: ScheduleName,
+    pub task_name: TaskName,
     pub cron_expression: String,
     pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
     pub max_attempts: i32,
     pub queue: QueueName,
-    pub is_paused: bool,
-}
-
-#[cfg(all(test, feature = "cron"))]
-mod job_lifecycle_tests {
-    use super::JobLifecycle;
-
-    #[test]
-    fn from_paused_round_trips() {
-        assert_eq!(JobLifecycle::from_paused(true), JobLifecycle::Paused);
-        assert_eq!(JobLifecycle::from_paused(false), JobLifecycle::Active);
-        assert!(JobLifecycle::Paused.is_paused());
-        assert!(!JobLifecycle::Active.is_paused());
-    }
 }

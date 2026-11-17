@@ -59,6 +59,7 @@ async fn list_jobs_returns_view() {
         serde_json::json!([{
             "id": id.to_string(),
             "name": "j",
+            "task_name": "j",
             "cron_expression": "*/5 * * * *",
             "is_paused": false,
         }])
@@ -101,6 +102,7 @@ async fn resume_existing_204_missing_404() {
     let db = TestDb::new().await;
     let id = db
         .insert_job_full(
+            "j",
             "j",
             "*/5 * * * *",
             chrono::Utc::now() + chrono::Duration::hours(1),

@@ -61,6 +61,7 @@ async fn acquire<P: SchedulerPool>(pool: &P) -> Result<P::Conn, ApiError> {
 struct JobView {
     id: JobId,
     name: String,
+    task_name: String,
     cron_expression: String,
     is_paused: bool,
 }
@@ -71,6 +72,7 @@ impl From<pg_task_scheduler::Job> for JobView {
         JobView {
             id: j.id,
             name: j.name.as_str().to_owned(),
+            task_name: j.task_name.as_str().to_owned(),
             cron_expression: j.cron.as_str().to_owned(),
             is_paused: matches!(j.lifecycle, pg_task_scheduler::JobLifecycle::Paused),
         }

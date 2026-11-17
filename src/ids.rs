@@ -3,11 +3,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-/// Maximum length (in `char`s) of a [`TaskName`], [`TaskKey`], [`QueueName`] or [`WorkerId`].
+/// Maximum length (in `char`s) of an identifier (see [`validate_identifier`]).
 const MAX_IDENTIFIER_LEN: usize = 255;
 
-/// Why a string was rejected as a [`TaskName`], [`TaskKey`], [`QueueName`] or
-/// [`WorkerId`].
+/// Why a string was rejected as an identifier, such as a [`TaskName`], [`QueueName`] or
+/// [`CommandKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IdentifierError {
     /// The string is empty.
@@ -35,7 +35,8 @@ impl From<std::convert::Infallible> for IdentifierError {
     }
 }
 
-/// The crate-owned identifier policy for [`TaskName`], [`TaskKey`], [`QueueName`] and [`WorkerId`].
+/// The crate-owned identifier policy for [`TaskName`], [`TaskKey`], [`QueueName`], [`WorkerId`],
+/// [`EffectName`], [`Topic`] and (with `cron`) `ScheduleName`.
 ///
 /// Non-empty, no NUL, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
 /// The queue tables carry no SQL CHECKs for this, but database reads re-validate
@@ -154,6 +155,13 @@ validated_string!(
     /// Idempotency key of an outbox command: non-empty, no NUL, any length.
     CommandKey,
     validate_command_key
+);
+
+#[cfg(feature = "cron")]
+validated_string!(
+    /// Unique name of a recurring schedule (`scheduler_jobs.name`), distinct from the
+    /// task name its occurrences run.
+    ScheduleName
 );
 
 impl Default for QueueName {

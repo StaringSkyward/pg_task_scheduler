@@ -57,7 +57,7 @@ version:
 | File | Contents |
 | --- | --- |
 | `migrations/0001_create_queue_tables/up.sql` | `queue_tasks` (with the `cancelled` status and `admin_action_id`), `queue_task_attempts`, `queue_outbox` |
-| `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
+| `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` and `scheduler_job_pauses` (only with the `cron` feature) |
 | `migrations/0003_admin/up.sql` | `queue_admin_actions`; `queue_pauses`; `queue_workers`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
 
 Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
@@ -356,7 +356,8 @@ Advice for choosing queues, sizing workers and deploying. The API is in
   and splits capacity.
 - Set the queue on the task type (`Task::QUEUE`). Use `EnqueueOptions::queue`
   only to route a single call, such as a backfill of a task type that normally
-  runs live. Cron schedules set it with `CreateJob::queue`.
+  runs live. Cron schedules built with `CreateJob::for_task` take `Task::QUEUE`;
+  `CreateJob::queue` overrides it.
 - Queue names should be short, lowercase and stable, and describe the kind of
   work rather than the team that owns it.
 - To rename a queue without stranding tasks:
@@ -581,14 +582,30 @@ in [GitHub issues](https://github.com/StaringSkyward/pg_task_scheduler/issues).
 ## Recurring Schedules
 
 With the `cron` feature, `jobs::create`, `jobs::ensure_job`, pause/resume, and
-reschedule manage rows in `scheduler_jobs`. Each due occurrence becomes an
-ordinary queue task with `task_key = "schedule:{id}:{scheduled_for}"`, so a
-re-materialized occurrence never creates a second task. Every running scheduler
-materializes due schedules at most once per `max_poll_interval`, so an occurrence
-becomes a task within `max_poll_interval` of its time. Deleting or editing a
-schedule does not change tasks it already created. After downtime, one
-occurrence is created for the missed slot (`run_once`). `CreateJob::queue(..)`
-picks the queue for the tasks a schedule produces (default `default`).
+reschedule manage rows in `scheduler_jobs`. A schedule has its own unique name
+(`ScheduleName`) and names the task each occurrence runs (`TaskName`), so one
+handler can have several schedules, such as `digest-hourly` and `digest-daily`.
+Build the schedule with `CreateJob::for_task::<T>(name, cron, max_attempts,
+lifecycle, args)`: the task name, queue and argument type come from `T`.
+`CreateJob::new(name, task_name, ...)` is the untyped alternative, for a task
+whose type is not at hand; it takes any serializable `args` and the `default`
+queue. `CreateJob::queue(..)` overrides the queue for either.
+
+Each due occurrence becomes an ordinary queue task with
+`task_key = "schedule:{id}:{scheduled_for}"`, so a re-materialized occurrence
+never creates a second task. Every running scheduler materializes due schedules
+at most once per `max_poll_interval`, so an occurrence becomes a task within
+`max_poll_interval` of its time. Deleting or editing a schedule does not change
+tasks it already created. After downtime, one occurrence is created for the
+missed slot (`run_once`).
+
+A paused schedule has a row in `scheduler_job_pauses`; `jobs::pause` adds it and
+`jobs::resume` removes it. `ensure_job` reconciles a schedule's configuration but
+never its pause state or `next_run_at`, so a redeploy cannot resume a schedule an
+operator paused. Deleting a schedule deletes its pause, so a schedule recreated
+under the same name does not inherit it. A schedule whose stored row is invalid (only
+possible through direct SQL) is paused and logged rather than stopping other
+schedules.
 
 ## Feature Flags
 

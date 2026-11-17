@@ -247,8 +247,10 @@ GRANT SELECT ON queue_tasks, queue_task_attempts, queue_admin_actions,
 GRANT UPDATE ON queue_tasks TO pg_task_admin;
 GRANT INSERT, UPDATE ON queue_task_attempts, queue_admin_actions TO pg_task_admin;
 GRANT INSERT, DELETE ON queue_pauses TO pg_task_admin;
--- only with the `cron` feature (/api/jobs)
+-- only with the `cron` feature (/api/jobs): list and delete; pause and resume
+-- lock the job row (FOR KEY SHARE needs UPDATE) and add or remove its pause
 GRANT SELECT, UPDATE, DELETE ON scheduler_jobs TO pg_task_admin;
+GRANT SELECT, INSERT, DELETE ON scheduler_job_pauses TO pg_task_admin;
 ```
 
 These grants were checked by running every page query and action as such a role.
