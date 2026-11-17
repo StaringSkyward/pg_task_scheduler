@@ -22,6 +22,9 @@ pub enum IdentifierError {
     // interpolate a const into the `#[error(..)]` message).
     #[error("identifier must be at most 255 characters")]
     TooLong,
+    /// The string contains a NUL character, which PostgreSQL text cannot store.
+    #[error("identifier must not contain NUL")]
+    ContainsNul,
 }
 
 /// Absurd conversion so `TaskName` itself satisfies the `register` bound
@@ -34,19 +37,33 @@ impl From<std::convert::Infallible> for IdentifierError {
 
 /// The crate-owned identifier policy for [`TaskName`], [`TaskKey`], [`QueueName`] and [`WorkerId`].
 ///
-/// Non-empty, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
-/// The queue tables carry no SQL CHECKs for this: only validated identifiers are
-/// written by this crate, so a row edited directly in SQL can be loaded via
-/// `DieselNewType`'s `FromSql` without re-validation.
+/// Non-empty, no NUL, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
+/// The queue tables carry no SQL CHECKs for this, but database reads re-validate
+/// (`#[diesel_newtype(try_from)]`): a row edited in SQL that breaks the policy is
+/// a decode error rather than a silently loaded value.
 fn validate_identifier(s: &str) -> Result<(), IdentifierError> {
     if s.is_empty() {
         return Err(IdentifierError::Empty);
+    }
+    if s.contains('\0') {
+        return Err(IdentifierError::ContainsNul);
     }
     if s.trim() != s {
         return Err(IdentifierError::SurroundingWhitespace);
     }
     if s.chars().count() > MAX_IDENTIFIER_LEN {
         return Err(IdentifierError::TooLong);
+    }
+    Ok(())
+}
+
+/// Policy for [`CommandKey`]: non-empty and NUL-free, any length, whitespace allowed.
+fn validate_command_key(s: &str) -> Result<(), IdentifierError> {
+    if s.is_empty() {
+        return Err(IdentifierError::Empty);
+    }
+    if s.contains('\0') {
+        return Err(IdentifierError::ContainsNul);
     }
     Ok(())
 }
@@ -66,9 +83,13 @@ pub struct JobId(pub Uuid);
 
 macro_rules! validated_string {
     ($(#[$meta:meta])* $name:ident) => {
+        validated_string!($(#[$meta])* $name, validate_identifier);
+    };
+    ($(#[$meta:meta])* $name:ident, $validate:path) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
         #[serde(try_from = "String")]
+        #[diesel_newtype(try_from)]
         pub struct $name(String);
 
         impl $name {
@@ -81,7 +102,7 @@ macro_rules! validated_string {
         impl TryFrom<&str> for $name {
             type Error = IdentifierError;
             fn try_from(s: &str) -> Result<Self, IdentifierError> {
-                validate_identifier(s)?;
+                $validate(s)?;
                 Ok($name(s.to_owned()))
             }
         }
@@ -89,7 +110,7 @@ macro_rules! validated_string {
         impl TryFrom<String> for $name {
             type Error = IdentifierError;
             fn try_from(s: String) -> Result<Self, IdentifierError> {
-                validate_identifier(&s)?;
+                $validate(&s)?;
                 Ok($name(s))
             }
         }
@@ -121,6 +142,20 @@ validated_string!(
     QueueName
 );
 
+validated_string!(
+    /// Name of an outbox effect (identifier policy).
+    EffectName
+);
+validated_string!(
+    /// Topic of an outbox command (identifier policy).
+    Topic
+);
+validated_string!(
+    /// Idempotency key of an outbox command: non-empty, no NUL, any length.
+    CommandKey,
+    validate_command_key
+);
+
 impl Default for QueueName {
     fn default() -> Self {
         Self("default".to_owned())
@@ -138,10 +173,13 @@ impl WorkerId {
 mod identifier_tests {
     use std::str::FromStr;
 
+    use super::CommandKey;
+    use super::EffectName;
     use super::IdentifierError;
     use super::QueueName;
     use super::TaskKey;
     use super::TaskName;
+    use super::Topic;
     use super::WorkerId;
 
     #[test]
@@ -232,5 +270,32 @@ mod identifier_tests {
         assert!(serde_json::from_str::<TaskName>("\"ok\"").is_ok());
         assert!(serde_json::from_str::<TaskName>("\"\"").is_err());
         assert!(serde_json::from_str::<WorkerId>("\" x\"").is_err());
+    }
+
+    #[test]
+    fn nul_is_rejected() {
+        assert_eq!(TaskKey::try_from("a\0b"), Err(IdentifierError::ContainsNul));
+        assert_eq!(
+            CommandKey::try_from("a\0b"),
+            Err(IdentifierError::ContainsNul)
+        );
+    }
+
+    #[test]
+    fn command_key_allows_long_values_and_spaces() {
+        assert!(CommandKey::try_from(format!(" {} ", "x".repeat(1000))).is_ok());
+        assert_eq!(CommandKey::try_from(""), Err(IdentifierError::Empty));
+    }
+
+    #[test]
+    fn effect_name_and_topic_follow_the_identifier_policy() {
+        assert_eq!(
+            EffectName::try_from(" e"),
+            Err(IdentifierError::SurroundingWhitespace)
+        );
+        assert_eq!(
+            Topic::try_from("x".repeat(256)),
+            Err(IdentifierError::TooLong)
+        );
     }
 }

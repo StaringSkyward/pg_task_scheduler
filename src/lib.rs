@@ -29,6 +29,8 @@ pub use crate::error::DuplicateTaskName;
 pub use crate::error::RegisterError;
 pub use crate::error::SchedulerError;
 pub use crate::error::TaskError;
+pub use crate::ids::CommandKey;
+pub use crate::ids::EffectName;
 pub use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
 pub use crate::ids::JobId;
@@ -37,6 +39,7 @@ pub use crate::ids::QueueName;
 pub use crate::ids::TaskId;
 pub use crate::ids::TaskKey;
 pub use crate::ids::TaskName;
+pub use crate::ids::Topic;
 pub use crate::ids::WorkerId;
 #[cfg(feature = "cron")]
 pub use crate::jobs::Applied;

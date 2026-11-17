@@ -1,11 +1,14 @@
-#![cfg(feature = "cron")]
 mod common;
 
 use common::TestDb;
 use diesel::result::DatabaseErrorKind;
 use diesel::result::Error as DieselError;
 use diesel_async::RunQueryDsl;
+use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::TaskId;
+use pg_task_scheduler::store;
 
+#[cfg(feature = "cron")]
 /// Raw insert of a job with the given name, bypassing the Rust JobName
 /// constructor so the SQL CHECK is what is under test.
 async fn insert_job_with_name(db: &TestDb, name: &str) -> Result<usize, DieselError> {
@@ -19,6 +22,7 @@ async fn insert_job_with_name(db: &TestDb, name: &str) -> Result<usize, DieselEr
     .await
 }
 
+#[cfg(feature = "cron")]
 fn is_check_violation(err: &DieselError) -> bool {
     matches!(
         err,
@@ -26,6 +30,7 @@ fn is_check_violation(err: &DieselError) -> bool {
     )
 }
 
+#[cfg(feature = "cron")]
 #[tokio::test]
 async fn empty_job_name_is_rejected_by_check() {
     let db = TestDb::new().await;
@@ -36,6 +41,7 @@ async fn empty_job_name_is_rejected_by_check() {
     db.cleanup().await;
 }
 
+#[cfg(feature = "cron")]
 #[tokio::test]
 async fn leading_whitespace_job_name_is_rejected_by_check() {
     let db = TestDb::new().await;
@@ -46,6 +52,7 @@ async fn leading_whitespace_job_name_is_rejected_by_check() {
     db.cleanup().await;
 }
 
+#[cfg(feature = "cron")]
 #[tokio::test]
 async fn valid_job_name_is_accepted() {
     let db = TestDb::new().await;
@@ -53,5 +60,25 @@ async fn valid_job_name_is_accepted() {
         .await
         .expect("valid name should insert");
     assert_eq!(n, 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn decode_error_names_the_identifier_rule() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    // Raw SQL bypasses QueueName::try_from; queue_tasks has no CHECK on queue.
+    let id: i64 = db
+        .scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, queue) \
+             VALUES ('k', 'n', '') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await;
+    let err = store::task(&mut conn, TaskId(id)).await.unwrap_err();
+    assert!(matches!(err, SchedulerError::Database(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("identifier must not be empty"),
+        "{err}"
+    );
     db.cleanup().await;
 }
