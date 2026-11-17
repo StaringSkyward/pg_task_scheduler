@@ -329,3 +329,31 @@ async fn bulk<P: SchedulerPool>(
         Err(e) => db_fail(&state, e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The budget-spent branch needs 500+ rows and the fixed 10 s budget to reach end to end.
+    #[test]
+    fn budget_spent_result_offers_continue() {
+        let p = BulkParams {
+            action: "cancel".into(),
+            task_name: "a".into(),
+            ..Default::default()
+        };
+        let html = ResultPage {
+            base: "",
+            refresh: 0,
+            p: &p,
+            verb: "cancelled",
+            affected: 500,
+            budget_spent: true,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("Continue"), "{html}");
+        assert!(!html.contains("Run again"), "{html}");
+        assert!(html.contains("name=\"task_name\" value=\"a\""), "{html}");
+    }
+}

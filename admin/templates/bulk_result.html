@@ -5,7 +5,7 @@
 <h2>Bulk result</h2>
 <div class="body">
 <p id="bulk-result">{{ affected }} {{ verb }}</p>
-<p>{% if budget_spent %}More tasks may match.{% else %}Rows locked by other work were skipped; run again to catch them.{% endif %}</p>
+<p>{% if budget_spent %}More tasks may match.{% else %}Finished, or some rows were locked by other work and skipped; run again to catch them.{% endif %}</p>
 <form class="continue" method="post" action="{{ base }}/bulk">
   <input type="hidden" name="action" value="{{ p.action }}">
   <input type="hidden" name="task_name" value="{{ p.task_name }}">

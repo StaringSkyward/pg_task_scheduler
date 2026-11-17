@@ -106,3 +106,39 @@ async fn task_actions_include_linked_bulk_action() {
     assert_eq!(older[0].kind(), AdminActionKind::Cancel);
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn bulk_replay_with_error_filter_records_it() {
+    let db = TestDb::new().await;
+    insert_task(&db, "dead").await;
+    exec(&db, "UPDATE queue_tasks SET last_error = 'x'").await;
+    let mut conn = db.pool.get().await.unwrap();
+    let filter = store::BulkFilter {
+        task_name: pg_task_scheduler::TaskName::try_from("email").unwrap(),
+        queue: None,
+    };
+    let out = store::replay_matching(
+        &mut conn,
+        &filter,
+        Some("x"),
+        "ops",
+        "why",
+        store::BULK_BUDGET,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.affected, 1);
+    let a = store::admin_actions(&mut conn, None, 10).await.unwrap();
+    assert_eq!(a.len(), 1);
+    let AdminActionTarget::Bulk {
+        action: BulkAction::Replay { last_error },
+        task_name,
+        ..
+    } = &a[0].target
+    else {
+        panic!("not a bulk replay: {:?}", a[0].target)
+    };
+    assert_eq!(last_error.as_deref(), Some("x"));
+    assert_eq!(task_name.as_str(), "email");
+    db.cleanup().await;
+}
