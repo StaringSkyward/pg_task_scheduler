@@ -818,3 +818,41 @@ async fn db_contained_completion_before_handler_returns_counts_as_done() {
     run.stop().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn healthy_task_in_a_batch_with_a_bad_payload_runs() {
+    let db = TestDb::new().await;
+    let bad = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'job', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let good = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('good', 'job', '{}') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
+    // `store::task` cannot decode the bad payload, so check the row in SQL.
+    let dead = db
+        .scalar(&format!(
+            "SELECT count(*) AS n FROM queue_tasks WHERE id = {} AND status = 'dead'",
+            bad.0
+        ))
+        .await;
+    assert_eq!(dead, 1);
+
+    run.stop().await;
+    db.cleanup().await;
+}

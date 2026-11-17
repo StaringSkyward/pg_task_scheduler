@@ -448,3 +448,51 @@ async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest(
     );
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_rest() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    // PostgreSQL accepts this JSONB; serde_json rejects the out-of-range number.
+    let bad = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'email', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let good = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('good', 'email', '{}') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let claimed = store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &default_queue(),
+        &names(),
+        NonZeroUsize::new(2).unwrap(),
+        LEASE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].lease.task_id, good);
+    let t = store::task(&mut conn, good).await.unwrap().unwrap();
+    assert_eq!(t.state.status(), TaskStatus::Running);
+    // `store::task` cannot decode the bad payload, so check the row in SQL.
+    let dead = db
+        .scalar(&format!(
+            "SELECT count(*) AS n FROM queue_tasks WHERE id = {} AND status = 'dead' \
+             AND last_error LIKE '%payload%'",
+            bad.0
+        ))
+        .await;
+    assert_eq!(dead, 1);
+    let attempts = store::attempts(&mut conn, bad).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(common::outcome(&attempts[0]), Some(AttemptOutcome::Dead));
+    db.cleanup().await;
+}

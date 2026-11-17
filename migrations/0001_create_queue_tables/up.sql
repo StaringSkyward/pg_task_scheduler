@@ -21,7 +21,7 @@ CREATE TABLE queue_tasks (
     --   immediate task -> now()
     --   scheduled task -> future timestamp
     --   retry          -> retry timestamp
-    due_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    due_at TIMESTAMPTZ NOT NULL DEFAULT now() CHECK (isfinite(due_at)),
 
     -- Number of attempts that have been claimed/started.
     attempts INTEGER NOT NULL DEFAULT 0

@@ -32,8 +32,9 @@ struct ClaimedRow {
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Text)]
     queue: QueueName,
-    #[diesel(sql_type = sql_types::Jsonb)]
-    payload: serde_json::Value,
+    /// Raw text, parsed per row: see [`claim`].
+    #[diesel(sql_type = sql_types::Text)]
+    payload: String,
     #[diesel(sql_type = sql_types::Integer)]
     attempts: i32,
     #[diesel(sql_type = sql_types::Integer)]
@@ -64,7 +65,7 @@ const CLAIM: &str = r#"
             lock_token = q.lock_token + 1,
             locked_until = clock_timestamp() + $4::interval, updated_at = now()
         FROM candidate AS c WHERE q.id = c.id
-        RETURNING q.id, q.task_key, q.task_name, q.queue, q.payload, q.attempts, q.max_attempts,
+        RETURNING q.id, q.task_key, q.task_name, q.queue, q.payload::text AS payload, q.attempts, q.max_attempts,
                   q.lock_token, q.locked_until, q.due_at
     ), recorded AS (
         INSERT INTO queue_task_attempts (task_id, attempt_no, lock_token, worker_id)
@@ -103,19 +104,33 @@ pub async fn claim(
             lock_token: r.lock_token,
             attempt_no: r.attempts,
         };
-        // `queue_tasks` has no identifier CHECK, so a raw-SQL producer can store a key `TaskKey`
-        // rejects. The claim has already committed: failing the decode would strand the whole
-        // batch running until its leases expire. Dead-letter that one row and return the rest.
+        // The claim has already committed, so a row that fails conversion must not fail the call:
+        // that would strand the whole batch running until its leases expire. `queue_tasks` has no
+        // identifier CHECK and JSONB accepts numbers serde_json rejects, so a raw-SQL producer can
+        // store such rows. Dead-letter that one row and return the rest.
         let task_key = match TaskKey::try_from(r.task_key) {
             Ok(key) => key,
             Err(e) => {
-                let error = format!("invalid task_key: {e}");
-                tracing::error!(
-                    task_id = r.id.0,
-                    %error,
-                    "claimed task has an invalid key; marking it dead"
-                );
-                fail_permanently(conn, &lease, &error).await?;
+                dead_letter(conn, &lease, &format!("invalid task_key: {e}")).await;
+                continue;
+            }
+        };
+        let payload = match serde_json::from_str(&r.payload) {
+            Ok(payload) => payload,
+            Err(e) => {
+                dead_letter(conn, &lease, &format!("invalid payload: {e}")).await;
+                continue;
+            }
+        };
+        let max_attempts = match MaxAttempts::from_db_i32(r.max_attempts) {
+            Ok(max) => max,
+            Err(_) => {
+                dead_letter(
+                    conn,
+                    &lease,
+                    "invalid max_attempts: stored value is not positive",
+                )
+                .await;
                 continue;
             }
         };
@@ -124,15 +139,23 @@ pub async fn claim(
             task_key,
             task_name: r.task_name,
             queue: r.queue,
-            payload: r.payload,
-            max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
-                .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
+            payload,
+            max_attempts,
             due_at: r.due_at,
             claimed_at: r.claimed_at,
             locked_until: r.locked_until,
         });
     }
     Ok(claimed)
+}
+
+/// Dead-letter a claimed row that failed conversion. Logs and swallows its own error so the
+/// healthy rows of the batch are always returned.
+async fn dead_letter(conn: &mut AsyncPgConnection, lease: &TaskLease, reason: &str) {
+    tracing::error!(task_id = lease.task_id.0, %reason, "claimed task is unusable; marking it dead");
+    if let Err(e) = fail_permanently(conn, lease, reason).await {
+        tracing::error!(task_id = lease.task_id.0, error = %e, "could not dead-letter the task; skipping it");
+    }
 }
 
 #[derive(diesel::QueryableByName)]

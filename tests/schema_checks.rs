@@ -80,3 +80,16 @@ async fn admin_action_shape_is_checked() {
     }
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn infinite_due_at_is_rejected() {
+    let db = TestDb::new().await;
+    let e = exec(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, due_at) VALUES ('k', 'n', '-infinity')",
+    )
+    .await
+    .unwrap_err();
+    assert!(is_check_violation(&e), "{e:?}");
+    db.cleanup().await;
+}
