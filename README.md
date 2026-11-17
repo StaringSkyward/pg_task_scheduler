@@ -18,7 +18,7 @@ workers and the admin UI.
 ## Guarantees
 
 - **Idempotent enqueue:** each producer-supplied `task_key` maps to exactly one
-  logical task for the idempotency horizon. A retried enqueue returns the
+  logical task while its row is kept (30 days by default). A retried enqueue returns the
   existing task. The same key with different content is rejected as an
   idempotency conflict.
 - **Atomic enqueue with domain state:** enqueue on the caller's connection, and
@@ -101,10 +101,10 @@ returns the existing task. When the
 connection is inside a transaction, the task and its `queue_available`
 notification commit with the caller's data. Run producers at `READ COMMITTED`.
 
-**Idempotency horizon:** a `task_key` stays reserved while its row exists. Rows
-are kept for at least `Retention::idempotency_horizon` (default 7 days), and
-workers refuse a retention shorter than that. Producers must not reuse a key
-within the horizon for a different logical task.
+**Idempotency horizon:** a `task_key` stays reserved while its row exists, which
+is `Retention::done` after completion for done tasks and `Retention::dead` for
+dead and cancelled ones (30 days by default). Producers must not reuse a key
+within that time for a different logical task.
 
 ## Worker
 

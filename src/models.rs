@@ -253,13 +253,12 @@ const DEFAULT_CLEANUP_BATCH: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
 /// How long terminal rows are kept; `batch_size` bounds each delete statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
-    /// How long `done` tasks are kept after completion. Default 30 days.
+    /// How long `done` tasks are kept after completion; their `task_key` stays reserved for
+    /// this long. Default 30 days.
     pub done: Duration,
-    /// How long `dead` and `cancelled` tasks are kept after completion. Default 30 days.
+    /// How long `dead` and `cancelled` tasks are kept after completion; their `task_key`
+    /// stays reserved for this long. Default 30 days.
     pub dead: Duration,
-    /// How long a `task_key` stays reserved. `done` and `dead` must be at least this,
-    /// or [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) fails. Default 7 days.
-    pub idempotency_horizon: Duration,
     /// How long published outbox rows are kept after `published_at`. Default 7 days.
     pub outbox_published: Duration,
     /// Most rows one delete statement removes. Default 1000.
@@ -272,7 +271,6 @@ impl Default for Retention {
         Self {
             done: Duration::from_secs(30 * DAY),
             dead: Duration::from_secs(30 * DAY),
-            idempotency_horizon: Duration::from_secs(7 * DAY),
             outbox_published: Duration::from_secs(7 * DAY),
             batch_size: DEFAULT_CLEANUP_BATCH,
         }

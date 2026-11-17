@@ -156,8 +156,7 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
     /// [`SchedulerError::Config`] if no handler is registered, a duration is over 5 years,
     /// an interval is under 1 microsecond, a queue limit exceeds
     /// [`tokio::sync::Semaphore::MAX_PERMITS`], `heartbeat_interval` is over a third of `lease_duration`,
-    /// `base_retry_delay` exceeds `max_retry_delay`, or `done` or `dead` retention is
-    /// shorter than the idempotency horizon. Logs a warning for each registered
+    /// or `base_retry_delay` exceeds `max_retry_delay`. Logs a warning for each registered
     /// [`Task`] whose `QUEUE` this worker does not serve.
     pub fn build(mut self) -> Result<Scheduler<P>, SchedulerError> {
         if self.config.queues.is_empty() {
@@ -187,7 +186,6 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             c.registry_interval,
             r.done,
             r.dead,
-            r.idempotency_horizon,
             r.outbox_published,
         ];
         let invalid = if self.registry.is_empty() {
@@ -217,10 +215,6 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             Some("heartbeat_interval must be at most a third of lease_duration")
         } else if c.base_retry_delay > c.max_retry_delay {
             Some("base_retry_delay must not exceed max_retry_delay")
-        } else if c.retention.done < c.retention.idempotency_horizon
-            || c.retention.dead < c.retention.idempotency_horizon
-        {
-            Some("done and dead retention must be at least the idempotency horizon")
         } else {
             None
         };
@@ -415,24 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_retention_shorter_than_idempotency_horizon() {
-        let r = Retention::default();
-        let short = r.idempotency_horizon - secs(1);
-        assert!(rejected(
-            builder().retention(Retention { done: short, ..r })
-        ));
-        assert!(rejected(
-            builder().retention(Retention { dead: short, ..r })
-        ));
-        let at_horizon = Retention {
-            done: r.idempotency_horizon,
-            dead: r.idempotency_horizon,
-            ..r
-        };
-        assert!(builder().retention(at_horizon).build().is_ok());
-    }
-
-    #[test]
     fn build_rejects_base_retry_above_max() {
         assert!(rejected(
             builder()
@@ -445,13 +421,6 @@ mod tests {
     fn build_rejects_durations_over_5_years() {
         assert_eq!(MAX_DURATION, secs(157_680_000));
         let over = MAX_DURATION + secs(1);
-        let r = Retention::default();
-        let horizon = |d| Retention {
-            done: d,
-            dead: d,
-            idempotency_horizon: d,
-            ..r
-        };
         // Each setting, with any companion value its other rules need. heartbeat_interval is
         // absent: at most lease / 3, it can never reach the cap without the lease passing it.
         type Set = fn(SchedulerBuilder<FakePool>, Duration) -> SchedulerBuilder<FakePool>;
@@ -491,8 +460,6 @@ mod tests {
             );
             assert!(rejected(set(builder(), over)), "setting {i} over the cap");
         }
-        assert!(rejected(builder().retention(horizon(over))));
-        assert!(builder().retention(horizon(MAX_DURATION)).build().is_ok());
         assert!(rejected(builder().max_retry_delay(Duration::MAX)));
     }
 
