@@ -251,3 +251,20 @@ async fn materializer_transaction_ends_itself_when_left_idle() {
     assert_eq!(after, "0");
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn unsatisfiable_cron_pauses_its_job_and_later_jobs_still_materialize() {
+    let db = TestDb::new().await;
+    let past = Utc::now() - Duration::minutes(2);
+    // Parses, but 31 February never occurs; only direct SQL can store it.
+    let bad = db.insert_job("feb-31", "0 0 31 2 *", past).await;
+    let good = db
+        .insert_job("good", "*/1 * * * *", past + Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    assert!(db.is_paused(bad).await);
+    assert!(db.task_ids(bad).await.is_empty());
+    assert_eq!(db.task_ids(good).await.len(), 1);
+    db.cleanup().await;
+}

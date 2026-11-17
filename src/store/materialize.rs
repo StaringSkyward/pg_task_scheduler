@@ -65,7 +65,7 @@ pub(crate) fn schedule_task_key(
 
 /// Materialize all due jobs, one transaction per job. Returns the number of
 /// tasks inserted: an occurrence already present as a task, or a job paused for
-/// a corrupt cron, counts nothing.
+/// an unschedulable cron, counts nothing.
 ///
 /// Each job is handled in its own transaction so a single bad row cannot block
 /// the rest. For a due job, the occurrence for its *current* `next_run_at` (the
@@ -73,9 +73,9 @@ pub(crate) fn schedule_task_key(
 /// future occurrence — both in the same transaction, so pod death cannot turn
 /// into a missed run (`run_once` misfire).
 ///
-/// If the stored cron fails to re-parse (corruption — it was validated on
-/// create), the job is paused and the error logged; it is never silently
-/// advanced.
+/// A stored cron that fails to parse or has no next occurrence (corruption — it
+/// was validated on create) pauses its job and logs the error; it is never
+/// silently advanced, and only database errors end the pass.
 pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize, SchedulerError> {
     let mut inserted = 0;
     for _ in 0..100 {
@@ -100,10 +100,11 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, 
             return Ok(None);
         };
 
-        let inserted = match CronExpression::parse(&job.cron_expression) {
-            Ok(cron) => {
-                // Base the next run on the DB clock, never the Rust clock.
-                let next = cron.next_after(job.db_now)?;
+        // Base the next run on the DB clock, never the Rust clock.
+        let next = CronExpression::parse(&job.cron_expression)
+            .and_then(|cron| cron.next_after(job.db_now));
+        let inserted = match next {
+            Ok(next) => {
                 // run_once misfire: the occurrence is for the OLD next_run_at.
                 let key = schedule_task_key(JobId(job.id), job.next_run_at)?;
                 let inserted = diesel::sql_query(INSERT_TASK)
@@ -126,7 +127,7 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, 
                 inserted
             }
             Err(e) => {
-                tracing::error!(job_id = %job.id, error = %e, "corrupt cron; pausing job");
+                tracing::error!(job_id = %job.id, error = %e, "unschedulable cron; pausing job");
                 diesel::sql_query(PAUSE)
                     .bind::<sql_types::Uuid, _>(job.id)
                     .execute(c)
