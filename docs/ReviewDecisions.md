@@ -92,7 +92,7 @@ recreated.
   `diesel-derive-newtype` 2.1.3. That covers `TaskName`, `TaskKey`,
   `QueueName`, `WorkerId`, `ScheduleName`, `EffectName`, `Topic` and
   `CommandKey`. The materializer reads its columns as plain strings and parses
-  them itself (entry 1).
+  them itself (entry 1), and so does the claim for `task_key`.
 - **Why:** A value of a validated type must satisfy its rule wherever it came
   from.
 - **Expected behaviour:** Reading a row with an invalid identifier is
@@ -100,7 +100,15 @@ recreated.
   (`identifier_checks::decode_error_names_the_identifier_rule`). A read that
   includes such a row fails as a whole: an admin list containing it shows an
   error, and other lists keep working. `TaskId`, `LockToken` and `JobId` have
-  no rule and decode as before.
+  no rule and decode as before. The claim is the exception: it commits in one
+  statement before decoding, so it reads `task_key` as text and checks each
+  row itself. A claimed row whose key breaks the rule (`queue_tasks` has no
+  identifier CHECK, so a raw-SQL producer can write one) is logged at error
+  level and marked `dead` through `fail_permanently`, with its attempt closed
+  and `last_error` `invalid task_key: <rule>`. The rest of the batch is
+  returned (`claim::claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest`).
+  `task_name` and `queue` cannot be invalid there, because the claim matches
+  them against valid values.
 
 ### 5. The schema is in targeted sixth normal form
 

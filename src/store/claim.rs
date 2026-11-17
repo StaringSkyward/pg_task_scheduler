@@ -19,13 +19,15 @@ use crate::models::MaxAttempts;
 use crate::models::TaskLease;
 use crate::models::interval_to_duration;
 use crate::models::pg_interval;
+use crate::store::transitions::fail_permanently;
 
 #[derive(diesel::QueryableByName)]
 struct ClaimedRow {
     #[diesel(sql_type = sql_types::BigInt)]
     id: TaskId,
+    /// Raw: see [`claim`] for why a bad key must not fail the decode.
     #[diesel(sql_type = sql_types::Text)]
-    task_key: TaskKey,
+    task_key: String,
     #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Text)]
@@ -93,28 +95,44 @@ pub async fn claim(
         .bind::<sql_types::Text, _>(queue)
         .get_results::<ClaimedRow>(conn)
         .await?;
-    rows.into_iter()
-        .map(|r| {
-            Ok(ClaimedTask {
-                lease: TaskLease {
-                    task_id: r.id,
-                    worker_id: worker.clone(),
-                    lock_token: r.lock_token,
-                    attempt_no: r.attempts,
-                },
-                task_key: r.task_key,
-                task_name: r.task_name,
-                queue: r.queue,
-                payload: r.payload,
-                max_attempts: MaxAttempts::from_db_i32(r.max_attempts).map_err(|_| {
-                    SchedulerError::Invariant("stored max_attempts is not positive")
-                })?,
-                due_at: r.due_at,
-                claimed_at: r.claimed_at,
-                locked_until: r.locked_until,
-            })
-        })
-        .collect()
+    let mut claimed = Vec::with_capacity(rows.len());
+    for r in rows {
+        let lease = TaskLease {
+            task_id: r.id,
+            worker_id: worker.clone(),
+            lock_token: r.lock_token,
+            attempt_no: r.attempts,
+        };
+        // `queue_tasks` has no identifier CHECK, so a raw-SQL producer can store a key `TaskKey`
+        // rejects. The claim has already committed: failing the decode would strand the whole
+        // batch running until its leases expire. Dead-letter that one row and return the rest.
+        let task_key = match TaskKey::try_from(r.task_key) {
+            Ok(key) => key,
+            Err(e) => {
+                let error = format!("invalid task_key: {e}");
+                tracing::error!(
+                    task_id = r.id.0,
+                    %error,
+                    "claimed task has an invalid key; marking it dead"
+                );
+                fail_permanently(conn, &lease, &error).await?;
+                continue;
+            }
+        };
+        claimed.push(ClaimedTask {
+            lease,
+            task_key,
+            task_name: r.task_name,
+            queue: r.queue,
+            payload: r.payload,
+            max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
+                .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
+            due_at: r.due_at,
+            claimed_at: r.claimed_at,
+            locked_until: r.locked_until,
+        });
+    }
+    Ok(claimed)
 }
 
 #[derive(diesel::QueryableByName)]

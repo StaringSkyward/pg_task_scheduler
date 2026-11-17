@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
+use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::LockToken;
@@ -389,6 +390,61 @@ async fn next_due_in_covers_only_the_given_queues() {
     assert!(
         d > Duration::from_secs(9) && d <= Duration::from_secs(10),
         "{d:?}"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let good = enqueue::<Email>(
+        &mut conn,
+        key("good"),
+        json!({}),
+        EnqueueOptions::immediate(),
+    )
+    .await
+    .unwrap();
+    // A raw-SQL producer: queue_tasks has no identifier CHECK, so a 300-char key (TaskKey allows
+    // 255) can be stored.
+    let bad = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name) \
+             VALUES (repeat('x', 300), 'email') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let worker = WorkerId::generate();
+    let claimed = store::claim(
+        &mut conn,
+        &worker,
+        &default_queue(),
+        &names(),
+        NonZeroUsize::new(10).unwrap(),
+        LEASE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].lease.task_id, good.id);
+    let t = store::task(&mut conn, good.id).await.unwrap().unwrap();
+    assert_eq!(t.state.status(), TaskStatus::Running);
+
+    let dead = db
+        .scalar(&format!(
+            "SELECT count(*) AS n FROM queue_tasks WHERE id = {} AND status = 'dead' \
+             AND last_error = 'invalid task_key: identifier must be at most 255 characters'",
+            bad.0
+        ))
+        .await;
+    assert_eq!(dead, 1);
+    let attempts = store::attempts(&mut conn, bad).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(common::outcome(&attempts[0]), Some(AttemptOutcome::Dead));
+    assert_eq!(
+        attempts[0].error.as_deref(),
+        Some("invalid task_key: identifier must be at most 255 characters")
     );
     db.cleanup().await;
 }
