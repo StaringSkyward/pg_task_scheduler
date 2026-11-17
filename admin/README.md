@@ -342,7 +342,7 @@ strings, so any name works, `/`, `&` and `#` included.
 | `GET /tasks/:id` | A task, its payload, every attempt, and its admin actions. |
 | `POST /tasks/:id/cancel`, `/tasks/:id/replay` | Form posts with a `reason`; redirect back to the task. |
 | `POST /queues/pause`, `/queues/resume` | Form posts with `queue` and `reason`; redirect to the overview. |
-| `GET /bulk?action=cancel\|replay&task_name=…[&queue=…][&error=…]`, `POST /bulk` | Confirm page with the capped match count, then one budgeted run with a Continue button if more remain. |
+| `GET /bulk?action=cancel\|replay&task_name=…[&queue=…][&error=…]`, `POST /bulk` | Confirm page with the capped match count, then one budgeted run and a button to run it again: Continue when the budget ran out, Run again otherwise (rows locked by other work are skipped). |
 | `GET /api/tasks/:id` | The task as JSON. |
 | `POST /api/tasks/:id/replay` | JSON body `{"reason": "…"}`; 204, 400 if the reason is blank, or 409 if the task is not dead or cancelled. |
 | `GET /api/jobs`, `POST /api/jobs/:id/pause`, `POST /api/jobs/:id/resume`, `DELETE /api/jobs/:id` | Cron schedules (`cron` feature only). |

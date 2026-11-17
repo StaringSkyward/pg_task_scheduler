@@ -223,7 +223,9 @@ pub async fn enqueue<T: Task>(
     .into_enqueued(false)
 }
 
-// §18 replay; the audit row is linked from the task. No FK, so it outlives retention.
+// Administrative replay: dead or cancelled → queued with the same task_key, and lock_token + 1
+// fences a very late worker. The audit row is linked from the task. No FK, so it outlives
+// retention.
 #[doc(hidden)]
 pub const REPLAY: &str = r#"
     WITH target AS (

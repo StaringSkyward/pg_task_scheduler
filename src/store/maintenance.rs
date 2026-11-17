@@ -11,7 +11,8 @@ use crate::models::ReapSummary;
 use crate::models::Retention;
 use crate::models::pg_interval;
 
-// §12 reaper, plus closing each reaped task's open attempt. One statement, so both commit together.
+// Reaper: expired leases go back to queued after the crash-retry delay, or to dead when no attempts
+// remain, and each reaped task's open attempt closes. One statement, so both commit together.
 const REAP: &str = r#"
     WITH expired AS (
         SELECT id FROM queue_tasks
@@ -40,7 +41,7 @@ const REAP: &str = r#"
     SELECT status FROM reaped
 "#;
 
-// §20, one statement per terminal status: each is an ordered range scan of
+// Retention cleanup, one statement per terminal status: each is an ordered range scan of
 // queue_tasks_terminal_cleanup_idx with `completed_at < cutoff` as its index condition,
 // stopping at the LIMIT. One OR across both statuses cannot be one range: the planner
 // walks the whole index filtering every retained row, or bitmap-scans and sorts every

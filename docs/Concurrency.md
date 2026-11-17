@@ -176,8 +176,8 @@ was still open) can still be included. Each batch locks its rows
 `FOR UPDATE SKIP LOCKED`, so two bulk actions on the same name split the work,
 and a row locked by a handler or a claim is skipped. A batch can also come back
 short when a row it found changed before it locked it. A short batch ends the
-call with `more_remain = false`, so `more_remain = false` does not prove that no
-matching task is left: count again.
+call with `BulkStop::ShortBatch`, which therefore does not prove that no
+matching task is left: count again, or run the action again.
 
 ## Crash Recovery
 
@@ -226,9 +226,10 @@ per key, and a duplicate returns the existing task. Enqueue inside the producer'
 own transaction to make the domain change and the task atomic. Use
 `READ COMMITTED`: the duplicate path re-reads the committed winner.
 
-A key stays reserved while its row exists. Retention never deletes terminal rows
-younger than `Retention::idempotency_horizon`, and the builder rejects a
-retention configuration that would.
+A key stays reserved while its row exists, so retention is the idempotency
+horizon: `Retention::done` for `done` tasks, and `Retention::dead` for `dead` and
+`cancelled` ones (30 days each by default). A key can be reused once cleanup has
+deleted its row.
 
 With the `cron` feature, every scheduler also materializes due schedules, at
 most once per `max_poll_interval`. It locks one schedule row with `SKIP LOCKED`,
@@ -303,7 +304,7 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   so a cleanup backlog never delays lease recovery. Sustained input above
   capacity still grows `queued`. Watch `store::queue_stats`.
 
-## Failure Semantics (§22)
+## Failure Semantics
 
 | Failure | Result |
 | --- | --- |
@@ -318,8 +319,8 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 
 ## Validation Status
 
-The integration suite covers every §27 requirement. See the table in
-[Scheduler Design](SchedulerDesign.md#testing-contract-27). It also covers:
+The integration suite covers every requirement of the
+[testing contract](SchedulerDesign.md#testing-contract). It also covers:
 heartbeats while a handler holds the row lock, replay followed by a reclaim,
 notification and next-due wakeups, shutdown without detached work, and shutdown
 release: an interrupted handler, a handler still running at `shutdown_timeout`,

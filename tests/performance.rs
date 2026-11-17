@@ -601,7 +601,7 @@ struct IndexDef {
 
 /// Closing an attempt sets `finished_at`, `outcome` and `error`. An index whose key, INCLUDE
 /// list or predicate names one of them makes every close a non-HOT update that writes every
-/// attempts index, so completions would tax the hot path (spec §3).
+/// attempts index, so completions would tax the hot path (docs/AdminUI.md §3.12).
 #[tokio::test]
 async fn attempt_close_stays_hot_eligible() {
     let db = TestDb::new().await;

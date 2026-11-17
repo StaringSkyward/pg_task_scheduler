@@ -433,9 +433,9 @@ struct N {
 // form matches the partial indexes on queued and running rows (a BitmapOr over
 // queue_tasks_due_idx and queue_tasks_expired_lease_idx). `IN` plans as a seq scan over every
 // retained row (performance::bulk_cancel_batch_reads_only_live_rows).
-// ponytail: no index finds live rows by task_name, because §3 forbids an index enqueue must
-// maintain; this reads every queued and running row and filters by name. Add one only if
-// enqueue can afford it.
+// ponytail: no index finds live rows by task_name, because enqueue must not maintain a new index
+// (docs/AdminUI.md §3.10); this reads every queued and running row and filters by name. Add one
+// only if enqueue can afford it.
 #[doc(hidden)]
 pub const CANCEL_BATCH: &str = r#"
     WITH target AS (

@@ -217,7 +217,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`. That bounds shutdown, not the
         // server: a periodic upsert cut off by `cancel`, or a `stopping` write that timed out,
         // may still execute after the delete below and re-create the row, which then reads
-        // live until its `lost_after` (AdminUI §6.11).
+        // live until its `lost_after` (docs/AdminUI.md §6.11).
         if let Err(error) = registration.await {
             tracing::error!(%error, "registry task panicked");
         }
@@ -759,7 +759,7 @@ async fn maintenance_pass<P: SchedulerPool>(
     }
 }
 
-/// Keep this worker's display-only registry row (§5.2): upsert at once and every
+/// Keep this worker's display-only registry row (docs/AdminUI.md §6.7): upsert at once and every
 /// `registry_interval`. When `cancel` fires, write `stopping` once, within
 /// `REGISTRY_SHUTDOWN_TIMEOUT`, and return. Every other await races `cancel`, so a stalled
 /// pool never holds shutdown.

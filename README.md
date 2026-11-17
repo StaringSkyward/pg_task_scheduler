@@ -246,11 +246,13 @@ progress keyed by `task_key`.
 
 Each worker keeps a row in `queue_workers`, for display only: claims, ownership
 and health never read it. The row holds its label, status (`starting`,
-`healthy`, `degraded` or `stopping`), last error, task names, and per queue the
-limit, handlers in use, whether the queue is paused, and when one of its
-dispatches there last ended. The worker writes it at start and every
-`registry_interval`, marks it `stopping` when shutdown begins, and deletes it
-once the drain ends. Each shutdown write is bounded by 0.5 s, so a stalled
+`healthy`, `degraded` or `stopping`) and last error; its task names and, per
+queue, the limit, handlers in use, and when one of its dispatches there last
+ended are rows of `queue_worker_task_names` and `queue_worker_queues`. Whether
+each queue is paused is read from `queue_pauses` when the workers are listed.
+The worker writes these rows at start and every `registry_interval`, in one
+transaction, marks its row `stopping` when shutdown begins, and deletes it once
+the drain ends. Each shutdown write is bounded by 0.5 s, so a stalled
 database adds at most 1 s to shutdown. `store::workers` lists the rows, live
 workers first. A row not written for 3 × `registry_interval` reads as `lost`
 (for example, the process was killed), and every worker's maintenance deletes
@@ -262,7 +264,7 @@ health.
   `HOSTNAME` environment variable when that is set and non-empty, and otherwise
   the worker id is shown.
 - `.registry_interval(d)` sets how often the row is written (default 15 s;
-  `build()` rejects zero and anything over 5 years).
+  `build()` rejects anything under 1 µs or over 5 years).
 
 Since the row is a periodic snapshot, it lags: a new worker reads `starting`
 until its second write, a draining worker's row is not refreshed after its
@@ -598,7 +600,9 @@ never creates a second task. Every running scheduler materializes due schedules
 at most once per `max_poll_interval`, so an occurrence becomes a task within
 `max_poll_interval` of its time. Deleting or editing a schedule does not change
 tasks it already created. After downtime, one occurrence is created for the
-missed slot (`run_once`).
+missed slot (`run_once`). Task keys starting with `schedule:` are reserved for
+schedule occurrences; a producer that uses one can collide with an occurrence,
+which is then silently skipped.
 
 A paused schedule has a row in `scheduler_job_pauses`; `jobs::pause` adds it and
 `jobs::resume` removes it. `ensure_job` reconciles a schedule's configuration but
