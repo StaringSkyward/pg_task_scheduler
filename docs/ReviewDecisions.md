@@ -145,7 +145,15 @@ recreated.
   - **Locking:** `jobs::pause` and `jobs::resume` lock the job row
     `FOR KEY SHARE`, so it cannot be deleted before the pause row references
     it. They wait for an in-flight materialization of that job, and the
-    materializer skips a job while one of them holds the lock.
+    materializer (`FOR UPDATE SKIP LOCKED`) skips a job while one of them
+    holds the lock. That lock alone does not close the race: `SELECT_DUE`'s
+    pause anti-join reads the statement's snapshot, and a pause does not
+    change the job row, so a pause that commits after that snapshot but
+    before the materializer locks the row would not be re-checked, and one
+    more occurrence would be inserted. So once it holds the row lock, the
+    materializer re-reads `scheduler_job_pauses` in a new statement and
+    skips the job if a pause is there. A pause that comes later blocks on
+    that lock until the materializer commits.
   - **Admin role:** PostgreSQL requires UPDATE privilege for `FOR KEY SHARE`,
     so the admin role keeps `UPDATE` on `scheduler_jobs` and needs `SELECT`,
     `INSERT` and `DELETE` on `scheduler_job_pauses` (`admin/README.md`).

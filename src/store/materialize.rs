@@ -35,6 +35,12 @@ struct DueJob {
     queue: String,
 }
 
+#[derive(diesel::QueryableByName)]
+struct PausedRow {
+    #[diesel(sql_type = sql_types::Bool)]
+    paused: bool,
+}
+
 /// The task columns stay raw so [`parse_due`] can pause a job with a bad value
 /// instead of a decode error ending the pass.
 const SELECT_DUE: &str = "\
@@ -44,6 +50,13 @@ const SELECT_DUE: &str = "\
     WHERE j.next_run_at <= now() \
       AND NOT EXISTS (SELECT 1 FROM scheduler_job_pauses p WHERE p.job_id = j.id) \
     ORDER BY j.next_run_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT 1";
+/// Re-checks the pause after `SELECT_DUE` has locked the job. `SELECT_DUE`'s anti-join reads its
+/// statement snapshot, and a pause commits without touching the job row (`jobs::pause` takes only
+/// `FOR KEY SHARE` on it), so no EvalPlanQual recheck fires: a pause committed between that
+/// snapshot and the lock would still get one more occurrence. Under READ COMMITTED this new
+/// statement sees it; a later pause blocks on our `FOR UPDATE` until we commit.
+const STILL_PAUSED: &str =
+    "SELECT EXISTS (SELECT 1 FROM scheduler_job_pauses WHERE job_id = $1) AS paused";
 const INSERT_TASK: &str = "\
     INSERT INTO queue_tasks (task_key, task_name, payload, due_at, max_attempts, queue) \
     VALUES ($1, $2, $3, $4, $5, $6) \
@@ -70,8 +83,8 @@ pub(crate) fn schedule_task_key(
 }
 
 /// Materialize all due jobs, one transaction per job. Returns the number of
-/// tasks inserted: an occurrence already present as a task, or a job paused for
-/// an unschedulable cron, counts nothing.
+/// tasks inserted: an occurrence already present as a task, or a job paused (by an
+/// operator, or below for a job-local defect), counts nothing.
 ///
 /// Each job is handled in its own transaction so a single bad row cannot block
 /// the rest. For a due job, the occurrence for its *current* `next_run_at` (the
@@ -129,6 +142,14 @@ async fn materialize_one(conn: &mut AsyncPgConnection) -> Result<Option<usize>, 
         else {
             return Ok(None);
         };
+        if diesel::sql_query(STILL_PAUSED)
+            .bind::<sql_types::Uuid, _>(job.id)
+            .get_result::<PausedRow>(c)
+            .await?
+            .paused
+        {
+            return Ok(Some(0));
+        }
 
         let occurrence = match parse_due(&job) {
             Ok(occurrence) => occurrence,
