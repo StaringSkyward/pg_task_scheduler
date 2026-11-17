@@ -26,7 +26,12 @@ AND locked_until > clock_timestamp()  -- hard lease, database time
 ```
 
 Heartbeat, completion, completion with outbox, retry, permanent failure, release,
-and the DB-contained `lock_owned` all use this predicate. A guarded statement that
+and the DB-contained `lock_owned` all use this predicate. Each first locks the row
+with `SELECT 1 FROM queue_tasks WHERE id = $1 FOR UPDATE` in its own statement, in
+the same transaction, and only then runs the guarded statement. The order matters:
+after a lock wait PostgreSQL re-evaluates a statement's `WHERE` only if the blocker
+updated the row, so a blocker that merely locked the row would leave the
+`clock_timestamp()` check stale. The separate statement evaluates expiry after the wait. A guarded statement that
 matches zero rows means ownership is lost (`SchedulerError::LostOwnership`). It
 never means success.
 
@@ -65,7 +70,7 @@ Worker groups with different registrations can share one queue.
 | --- | --- |
 | Two workers claim one task | One locks and claims it; the other skips it. |
 | Two producers enqueue one `task_key` | `ON CONFLICT DO NOTHING` waits for the first insert to commit; the second returns the existing task. |
-| Worker ACKs after its hard lease expired | The predicate fails on `locked_until`; zero rows; the worker cannot complete. |
+| Worker ACKs after its hard lease expired | The row is locked first (waiting out any other holder), then the predicate fails on `locked_until`; zero rows; the worker cannot complete. |
 | Old generation ACKs after a reclaim | `lock_token` no longer matches; zero rows. |
 | Heartbeat races the reaper | Either the heartbeat extends a still-valid lease, or the reaper requeues the expired row and the heartbeat matches zero rows. |
 | Completion races the reaper | Completion needs an unexpired lease; once expired, only the reaper can move the row. |

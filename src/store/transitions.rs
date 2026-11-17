@@ -18,12 +18,19 @@ use crate::models::TaskStatus;
 use crate::models::pg_interval;
 
 // Ownership guard shared by every worker-owned mutation. Binds: $1 task id, $2 worker, $3 token.
+//
+// Every transition first locks the row in its own statement (`lock_task_row`), then runs the
+// guarded statement. PostgreSQL re-evaluates a statement's WHERE after a lock wait only when the
+// blocker updated the row; a blocker that merely locked it and rolled back leaves the scan's
+// earlier `clock_timestamp()` check stale. A new statement evaluates the expiry after the wait.
 macro_rules! owned {
     () => {
         "WHERE id = $1 AND status = 'running' AND locked_by = $2 AND lock_token = $3 \
          AND locked_until > clock_timestamp()"
     };
 }
+
+const LOCK_ROW: &str = "SELECT 1 AS one FROM queue_tasks WHERE id = $1 FOR UPDATE";
 
 const HEARTBEAT: &str = concat!(
     "UPDATE queue_tasks SET locked_until = clock_timestamp() + $4::interval, updated_at = now() ",
@@ -152,6 +159,29 @@ macro_rules! owned_query {
     };
 }
 
+#[derive(diesel::QueryableByName)]
+struct OneRow {
+    #[diesel(sql_type = sql_types::Integer)]
+    #[allow(dead_code)]
+    one: i32,
+}
+
+/// Lock the task row (waiting out any other transaction holding it). A missing row is lost.
+async fn lock_task_row(
+    conn: &mut AsyncPgConnection,
+    lease: &TaskLease,
+) -> Result<(), SchedulerError> {
+    diesel::sql_query(LOCK_ROW)
+        .bind::<sql_types::BigInt, _>(&lease.task_id)
+        .get_result::<OneRow>(conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            diesel::result::Error::NotFound => lost(lease),
+            e => e.into(),
+        })
+}
+
 fn lost(lease: &TaskLease) -> SchedulerError {
     SchedulerError::LostOwnership(lease.task_id)
 }
@@ -185,15 +215,19 @@ pub async fn heartbeat(
     lease: &TaskLease,
     duration: Duration,
 ) -> Result<DateTime<Utc>, SchedulerError> {
-    owned_query!(HEARTBEAT, lease)
-        .bind::<sql_types::Interval, _>(pg_interval(duration))
-        .get_result::<HeartbeatRow>(conn)
-        .await
-        .map(|r| r.locked_until)
-        .map_err(|e| match e {
-            diesel::result::Error::NotFound => lost(lease),
-            e => e.into(),
-        })
+    conn.transaction::<_, SchedulerError, _>(async |c| {
+        lock_task_row(c, lease).await?;
+        owned_query!(HEARTBEAT, lease)
+            .bind::<sql_types::Interval, _>(pg_interval(duration))
+            .get_result::<HeartbeatRow>(c)
+            .await
+            .map(|r| r.locked_until)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => lost(lease),
+                e => e.into(),
+            })
+    })
+    .await
 }
 
 /// `SELECT ... FOR UPDATE` on the owned row, for DB-contained handlers. Call inside the
@@ -202,6 +236,7 @@ pub async fn lock_owned(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
 ) -> Result<(), SchedulerError> {
+    lock_task_row(conn, lease).await?;
     let rows = owned_query!(LOCK_OWNED, lease)
         .get_results::<IdRow>(conn)
         .await?;
@@ -217,6 +252,7 @@ pub async fn complete(
     lease: &TaskLease,
 ) -> Result<(), SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
+        lock_task_row(c, lease).await?;
         let rows = owned_query!(COMPLETE, lease)
             .get_results::<IdRow>(c)
             .await?;
@@ -235,6 +271,7 @@ pub async fn release(
     lease: &TaskLease,
 ) -> Result<(), SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
+        lock_task_row(c, lease).await?;
         let rows = owned_query!(RELEASE, lease).get_results::<IdRow>(c).await?;
         if rows.is_empty() {
             return Err(lost(lease));
@@ -256,6 +293,7 @@ pub async fn complete_with_outbox(
     command: &OutboxCommand,
 ) -> Result<OutboxWrite, SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
+        lock_task_row(c, lease).await?;
         let rows = owned_query!(COMPLETE_WITH_OUTBOX, lease)
             .bind::<sql_types::Text, _>(&command.effect_name)
             .bind::<sql_types::Text, _>(&command.command_key)
@@ -290,6 +328,7 @@ pub async fn retry(
     delay: Duration,
 ) -> Result<RetryOutcome, SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
+        lock_task_row(c, lease).await?;
         let rows = owned_query!(RETRY, lease)
             .bind::<sql_types::Interval, _>(pg_interval(delay))
             .bind::<sql_types::Text, _>(error)
@@ -316,6 +355,7 @@ pub async fn fail_permanently(
     error: &str,
 ) -> Result<(), SchedulerError> {
     conn.transaction::<_, SchedulerError, _>(async |c| {
+        lock_task_row(c, lease).await?;
         let rows = owned_query!(FAIL, lease)
             .bind::<sql_types::Text, _>(error)
             .get_results::<IdRow>(c)

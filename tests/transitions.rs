@@ -7,6 +7,8 @@ use common::TestDb;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
+use diesel_async::pooled_connection::deadpool::Object;
 use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::ClaimedTask;
 use pg_task_scheduler::EnqueueOptions;
@@ -38,13 +40,20 @@ fn names() -> Vec<String> {
 }
 
 async fn claim_one(conn: &mut AsyncPgConnection) -> Option<ClaimedTask> {
+    claim_one_with_lease(conn, Duration::from_secs(60)).await
+}
+
+async fn claim_one_with_lease(
+    conn: &mut AsyncPgConnection,
+    lease: Duration,
+) -> Option<ClaimedTask> {
     store::claim(
         conn,
         &WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
         &names(),
         NonZeroUsize::new(1).unwrap(),
-        Duration::from_secs(60),
+        lease,
     )
     .await
     .unwrap()
@@ -66,6 +75,55 @@ async fn claimed(db: &TestDb) -> ClaimedTask {
     let mut conn = db.pool.get().await.unwrap();
     enqueue_key(&mut conn, "k").await;
     claim_one(&mut conn).await.unwrap()
+}
+
+async fn claimed_with_lease(db: &TestDb, lease: Duration) -> ClaimedTask {
+    let mut conn = db.pool.get().await.unwrap();
+    enqueue_key(&mut conn, "k").await;
+    claim_one_with_lease(&mut conn, lease).await.unwrap()
+}
+
+/// Holds the task row with a lock-only transaction until the lease has expired, then releases it
+/// without updating the row; the waiting transition must re-check expiry after the wait.
+async fn lost_after_lock_wait<F, Fut, T>(op: F)
+where
+    F: FnOnce(Object<AsyncPgConnection>, TaskLease) -> Fut,
+    Fut: std::future::Future<Output = Result<T, SchedulerError>> + Send + 'static,
+    T: std::fmt::Debug + Send + 'static,
+{
+    let db = TestDb::new().await;
+    let c = claimed_with_lease(&db, Duration::from_secs(1)).await;
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM queue_tasks WHERE id = {} FOR UPDATE",
+            c.lease.task_id.0
+        ))
+        .await
+        .unwrap();
+    let mut conn = db.pool.get().await.unwrap();
+    let pid = common::backend_pid(&mut conn).await;
+    let lease = c.lease.clone();
+    let waiting = tokio::spawn(op(conn, lease.clone()));
+    db.wait_until_lock_blocked(pid).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    lost(waiting.await.unwrap(), &lease);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn complete_waiting_on_a_lock_past_expiry_loses_ownership() {
+    lost_after_lock_wait(|mut conn, lease| async move { store::complete(&mut conn, &lease).await })
+        .await;
+}
+
+#[tokio::test]
+async fn heartbeat_waiting_on_a_lock_past_expiry_loses_ownership() {
+    lost_after_lock_wait(|mut conn, lease| async move {
+        store::heartbeat(&mut conn, &lease, Duration::from_secs(60)).await
+    })
+    .await;
 }
 
 fn cmd(effect: &str, key: &str) -> OutboxCommand {

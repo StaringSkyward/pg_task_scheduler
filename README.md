@@ -26,7 +26,8 @@ workers and the admin UI.
 - **One valid owner per attempt:** ownership is the task id, `locked_by`, a
   monotonically increasing `lock_token`, and an unexpired `locked_until`. Every
   worker transition checks all four.
-- **Hard leases:** once `locked_until` passes, the old worker can no longer
+- **Hard leases:** a transition checks the lease when it runs, after it has
+  locked the row. Once `locked_until` has passed, the old worker can no longer
   heartbeat, complete, retry, or fail the task, even if the reaper has not run.
 - **Exactly-once PostgreSQL-contained effects:** business writes and the `done`
   transition can share one transaction.
@@ -303,8 +304,10 @@ async fn ship_order(
 }
 ```
 
-The lease must outlast the transaction. A transaction that finishes after
-`locked_until` cannot complete the task, and it rolls back.
+The lease must outlast the work before `complete` runs: the lease is checked
+when `complete` runs. Its row lock then keeps the reaper and every other worker
+away until the caller's transaction ends, so a commit after `locked_until` still
+holds exclusive ownership; it does not roll back.
 
 ### Transactional outbox
 
