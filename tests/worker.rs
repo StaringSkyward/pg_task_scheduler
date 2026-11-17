@@ -324,6 +324,22 @@ async fn db_contained_handler_survives_heartbeat_while_holding_row_lock() {
     wait_for(&db, id, TaskStatus::Done, Duration::from_secs(3)).await;
     assert_eq!(db.scalar("SELECT count(*) AS n FROM effects").await, 1);
     assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
+    // A cancelled heartbeat must not leave a transaction open on the row.
+    let mut idle = -1;
+    for _ in 0..50 {
+        idle = db
+            .scalar(
+                "SELECT count(*) AS n FROM pg_stat_activity \
+                 WHERE datname = current_database() AND state = 'idle in transaction' \
+                 AND pid <> pg_backend_pid()",
+            )
+            .await;
+        if idle == 0 {
+            break;
+        }
+        tokio::time::sleep(ms(100)).await;
+    }
+    assert_eq!(idle, 0, "idle-in-transaction backend left behind");
 
     run.stop().await;
     db.cleanup().await;

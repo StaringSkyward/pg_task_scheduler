@@ -23,6 +23,9 @@ use crate::models::pg_interval;
 // guarded statement. PostgreSQL re-evaluates a statement's WHERE after a lock wait only when the
 // blocker updated the row; a blocker that merely locked it and rolled back leaves the scan's
 // earlier `clock_timestamp()` check stale. A new statement evaluates the expiry after the wait.
+// The lock statement matches on ownership identity (id, worker, token) so a stale or fenced
+// worker gets zero rows at once rather than waiting on, or deadlocking with, the current
+// owner; expiry stays in the second statement because it must be read after the wait.
 macro_rules! owned {
     () => {
         "WHERE id = $1 AND status = 'running' AND locked_by = $2 AND lock_token = $3 \
@@ -30,7 +33,8 @@ macro_rules! owned {
     };
 }
 
-const LOCK_ROW: &str = "SELECT 1 AS one FROM queue_tasks WHERE id = $1 FOR UPDATE";
+const LOCK_ROW: &str = "SELECT id FROM queue_tasks \
+    WHERE id = $1 AND locked_by = $2 AND lock_token = $3 FOR UPDATE";
 
 const HEARTBEAT: &str = concat!(
     "UPDATE queue_tasks SET locked_until = clock_timestamp() + $4::interval, updated_at = now() ",
@@ -159,21 +163,15 @@ macro_rules! owned_query {
     };
 }
 
-#[derive(diesel::QueryableByName)]
-struct OneRow {
-    #[diesel(sql_type = sql_types::Integer)]
-    #[allow(dead_code)]
-    one: i32,
-}
-
-/// Lock the task row (waiting out any other transaction holding it). A missing row is lost.
+/// Lock the row by ownership identity (id, worker, token), waiting out any other holder. A stale
+/// or fenced worker matches no row and is lost at once instead of queueing behind the current
+/// owner; expiry is deliberately not part of the lock, it is checked by the guarded statement.
 async fn lock_task_row(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
 ) -> Result<(), SchedulerError> {
-    diesel::sql_query(LOCK_ROW)
-        .bind::<sql_types::BigInt, _>(&lease.task_id)
-        .get_result::<OneRow>(conn)
+    owned_query!(LOCK_ROW, lease)
+        .get_result::<IdRow>(conn)
         .await
         .map(|_| ())
         .map_err(|e| match e {

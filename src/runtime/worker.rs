@@ -556,13 +556,22 @@ async fn keep_lease<P: SchedulerPool>(
     loop {
         tokio::time::sleep_until((Instant::now() + config.heartbeat_interval).min(deadline)).await;
         let sent = Instant::now();
-        let beat = tokio::time::timeout_at(deadline, async {
-            let mut conn = acquire(pool).await?;
+        // Spawned so a dropped keep_lease (handler finished, deadline) cannot abandon the
+        // heartbeat's transaction mid-flight holding the row lock: dropping a JoinHandle
+        // does not cancel the task, so it always commits or rolls back.
+        let (pool, lease_c, lease_duration) = (pool.clone(), lease.clone(), config.lease_duration);
+        let handle = tokio::spawn(async move {
+            let mut conn = acquire(&pool).await?;
             timed(
                 "heartbeat",
-                store::heartbeat(&mut conn, lease, config.lease_duration),
+                store::heartbeat(&mut conn, &lease_c, lease_duration),
             )
             .await
+        });
+        let beat = tokio::time::timeout_at(deadline, async {
+            handle
+                .await
+                .map_err(|_| SchedulerError::Invariant("heartbeat task panicked"))?
         })
         .await;
         match beat {

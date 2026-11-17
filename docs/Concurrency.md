@@ -73,8 +73,8 @@ Worker groups with different registrations can share one queue.
 | Worker ACKs after its hard lease expired | The row is locked first (waiting out any other holder), then the predicate fails on `locked_until`; zero rows; the worker cannot complete. |
 | Old generation ACKs after a reclaim | `lock_token` no longer matches; zero rows. |
 | Heartbeat races the reaper | Either the heartbeat extends a still-valid lease, or the reaper requeues the expired row and the heartbeat matches zero rows. |
-| Completion races the reaper | Completion needs an unexpired lease; once expired, only the reaper can move the row. |
-| Release races lease expiry | Release needs an unexpired lease; after expiry only the reaper moves the row, and the attempt counts. |
+| Completion races the reaper | A transition starting after expiry matches zero rows; a transition that already holds the row lock keeps the row away from the reaper. |
+| Release races lease expiry | A release starting after expiry matches zero rows; the reaper requeues the row and the attempt counts. |
 | Reaper races a DB-contained transaction | The handler holds the task row via `lock_owned`; the reaper's `SKIP LOCKED` passes over it. |
 | Two reapers select one expired task | One locks it; the other skips it. |
 | Stale worker emits an outbox command | The outbox insert depends on the guarded completion CTE; no completed row means no outbox row. |
@@ -123,9 +123,10 @@ requests already in flight cannot be recalled.
 
 A DB-contained handler holds its row lock while a heartbeat may be waiting on it.
 Because the lease keeper is a separate future, the handler keeps being polled and
-commits, and the heartbeat then sees a `done` row. The lease must still outlast
-the database transaction. An expired lease makes the final guarded update match
-zero rows, and the transaction rolls back.
+commits, and the heartbeat then sees a `done` row. The lease is checked when the
+transition runs, after it has locked the row. A caller that commits after
+`locked_until` still holds exclusive ownership, because its row lock kept the
+reaper and every other worker away; it does not roll back.
 
 ## Admin Actions
 
