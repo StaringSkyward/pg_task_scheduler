@@ -154,7 +154,8 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
 
     /// Checks the configuration and makes the scheduler. Fails with
     /// [`SchedulerError::Config`] if no handler is registered, a duration is over 5 years,
-    /// an interval is zero, `heartbeat_interval` is over a third of `lease_duration`,
+    /// an interval is under 1 microsecond, a queue limit exceeds
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`], `heartbeat_interval` is over a third of `lease_duration`,
     /// `base_retry_delay` exceeds `max_retry_delay`, or `done` or `dead` retention is
     /// shorter than the idempotency horizon. Logs a warning for each registered
     /// [`Task`] whose `QUEUE` this worker does not serve.
@@ -200,9 +201,18 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             c.reaper_interval,
             c.registry_interval,
         ]
-        .contains(&Duration::ZERO)
+        .iter()
+        .any(|d| d.as_micros() == 0)
         {
-            Some("lease, heartbeat, poll, reaper and registry intervals must be greater than zero")
+            Some(
+                "lease, heartbeat, poll, reaper and registry intervals must be at least 1 microsecond",
+            )
+        } else if c
+            .queues
+            .iter()
+            .any(|(_, limit)| limit.get() > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            Some("a queue limit must be at most tokio::sync::Semaphore::MAX_PERMITS")
         } else if c.heartbeat_interval.saturating_mul(3) > c.lease_duration {
             Some("heartbeat_interval must be at most a third of lease_duration")
         } else if c.base_retry_delay > c.max_retry_delay {
@@ -497,5 +507,28 @@ mod tests {
     #[test]
     fn build_rejects_zero_registry_interval() {
         assert!(rejected(builder().registry_interval(Duration::ZERO)));
+    }
+
+    #[test]
+    fn build_rejects_intervals_below_one_microsecond() {
+        let ns = Duration::from_nanos;
+        assert!(rejected(
+            builder().lease_duration(ns(3)).heartbeat_interval(ns(1))
+        ));
+        assert!(rejected(builder().max_poll_interval(ns(999))));
+        assert!(
+            builder()
+                .max_poll_interval(Duration::from_micros(1))
+                .build()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn build_rejects_queue_limit_above_semaphore_max() {
+        let over = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).unwrap();
+        let max = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).unwrap();
+        assert!(rejected(builder().queue("default", over).unwrap()));
+        assert!(builder().queue("default", max).unwrap().build().is_ok());
     }
 }

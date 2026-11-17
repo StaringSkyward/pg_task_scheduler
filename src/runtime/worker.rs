@@ -835,8 +835,8 @@ fn registry_failed(error: &dyn std::fmt::Display) {
     tracing::warn!(%error, "worker registry write failed");
 }
 
-/// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)` (§11.2). Saturates
-/// rather than overflowing for any `attempt_no`.
+/// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)`, computed exactly for
+/// any `attempt_no`.
 pub(crate) fn retry_delay(
     attempt_no: i32,
     base: Duration,
@@ -844,13 +844,15 @@ pub(crate) fn retry_delay(
     jitter: Duration,
     random: u64,
 ) -> Duration {
-    let doublings = attempt_no.saturating_sub(1).clamp(0, 31).unsigned_abs();
+    // 2^127 ns exceeds the 5-year duration cap, so clamping the count never changes the
+    // capped result; saturation is likewise absorbed by the `max` cap.
+    let doublings = attempt_no.saturating_sub(1).clamp(0, 127).unsigned_abs();
+    let nanos = base.as_nanos().saturating_mul(1u128 << doublings);
+    let nanos = nanos.min(max.as_nanos());
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
-    base.saturating_mul(1 << doublings)
-        .min(max)
-        .saturating_add(Duration::from_nanos(
-            random % jitter_nanos.saturating_add(1),
-        ))
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).saturating_add(
+        Duration::from_nanos(random % jitter_nanos.saturating_add(1)),
+    )
 }
 
 #[cfg(test)]
@@ -872,6 +874,17 @@ mod tests {
     fn retry_delay_saturates_at_max() {
         assert_eq!(retry_delay(i32::MAX, BASE, MAX, Duration::ZERO, 0), MAX);
         assert_eq!(retry_delay(0, BASE, MAX, Duration::ZERO, 0), BASE);
+    }
+
+    #[test]
+    fn retry_delay_keeps_doubling_past_attempt_32() {
+        let ns = Duration::from_nanos(1);
+        assert_eq!(
+            retry_delay(34, ns, MAX, Duration::ZERO, 0),
+            Duration::from_nanos(1 << 33)
+        );
+        assert_eq!(retry_delay(40, ns, MAX, Duration::ZERO, 0), MAX);
+        assert_eq!(retry_delay(i32::MAX, ns, MAX, Duration::ZERO, 0), MAX);
     }
 
     #[test]
