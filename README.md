@@ -604,8 +604,10 @@ at most once per `max_poll_interval`, so an occurrence becomes a task within
 `max_poll_interval` of its time. Deleting or editing a schedule does not change
 tasks it already created. After downtime, one occurrence is created for the
 missed slot (`run_once`). Task keys starting with `schedule:` are reserved for
-schedule occurrences; a producer that uses one can collide with an occurrence,
-which is then silently skipped.
+schedule occurrences; `enqueue` rejects such keys with `ReservedTaskKey`. The
+first materialization of an occurrence defines its content, for as long as its
+task row is retained: re-pointing a schedule at a slot it already ran creates
+nothing new.
 
 A paused schedule has a row in `scheduler_job_pauses`; `jobs::pause` adds it and
 `jobs::resume` removes it. `ensure_job` reconciles a schedule's configuration but

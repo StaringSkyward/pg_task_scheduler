@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::SchedulerError;
 use crate::ids::QueueName;
+use crate::ids::SCHEDULE_KEY_PREFIX;
 use crate::ids::TaskId;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
@@ -177,6 +178,9 @@ pub async fn enqueue<T: Task>(
     args: T::Args,
     options: EnqueueOptions,
 ) -> Result<Enqueued, SchedulerError> {
+    if key.as_str().starts_with(SCHEDULE_KEY_PREFIX) {
+        return Err(SchedulerError::ReservedTaskKey(key));
+    }
     let name = TaskName::try_from(T::NAME)?;
     let queue = match options.queue {
         Some(q) => q,

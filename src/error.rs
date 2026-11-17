@@ -48,6 +48,9 @@ pub enum SchedulerError {
     /// The same `task_key` was enqueued with a different task name or payload.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),
+    /// The task key starts with the prefix reserved for schedule occurrences.
+    #[error("task key {} starts with the reserved prefix \"schedule:\"", .0.as_str())]
+    ReservedTaskKey(TaskKey),
     /// The task already recorded this effect with a different command key, topic or payload.
     #[error("outbox conflict: effect {} of task key {} already exists with different content", .effect_name.as_str(), .task_key.as_str())]
     OutboxConflict {

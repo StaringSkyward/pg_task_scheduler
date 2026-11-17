@@ -13,6 +13,7 @@ use crate::error::SchedulerError;
 use crate::ids::IdentifierError;
 use crate::ids::JobId;
 use crate::ids::QueueName;
+use crate::ids::SCHEDULE_KEY_PREFIX;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::models::MaxAttempts;
@@ -86,7 +87,8 @@ pub(crate) fn schedule_task_key(
     scheduled_for: DateTime<Utc>,
 ) -> Result<TaskKey, IdentifierError> {
     TaskKey::try_from(format!(
-        "schedule:{}:{}",
+        "{}{}:{}",
+        SCHEDULE_KEY_PREFIX,
         id.0,
         scheduled_for.to_rfc3339_opts(SecondsFormat::Micros, true)
     ))

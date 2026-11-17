@@ -3,6 +3,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
+/// Task-key prefix reserved for schedule occurrences (see `schedule_task_key`).
+pub(crate) const SCHEDULE_KEY_PREFIX: &str = "schedule:";
+
 /// Maximum length (in `char`s) of an identifier (see [`validate_identifier`]).
 const MAX_IDENTIFIER_LEN: usize = 255;
 

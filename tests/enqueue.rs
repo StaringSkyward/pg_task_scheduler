@@ -307,3 +307,22 @@ async fn invalid_task_queue_is_rejected() {
     assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn enqueue_rejects_the_schedule_prefix() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let r = enqueue::<Email>(
+        &mut conn,
+        key("schedule:imported-1"),
+        json!({}),
+        EnqueueOptions::immediate(),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(SchedulerError::ReservedTaskKey(_))),
+        "{r:?}"
+    );
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
+    db.cleanup().await;
+}
