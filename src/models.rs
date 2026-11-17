@@ -12,9 +12,9 @@ use diesel::prelude::*;
 use crate::cron::CronExpression;
 #[cfg(feature = "cron")]
 use crate::error::SchedulerError;
-#[cfg(feature = "cron")]
 use crate::ids::CommandKey;
 use crate::ids::EffectName;
+#[cfg(feature = "cron")]
 use crate::ids::JobId;
 use crate::ids::LockToken;
 use crate::ids::QueueName;

@@ -1,8 +1,11 @@
 mod common;
 
 use common::TestDb;
+#[cfg(feature = "cron")]
 use diesel::result::DatabaseErrorKind;
+#[cfg(feature = "cron")]
 use diesel::result::Error as DieselError;
+#[cfg(feature = "cron")]
 use diesel_async::RunQueryDsl;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::TaskId;

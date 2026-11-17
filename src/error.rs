@@ -1,8 +1,8 @@
 //! Crate error types.
 
-#[cfg(feature = "cron")]
 use crate::ids::EffectName;
 use crate::ids::IdentifierError;
+#[cfg(feature = "cron")]
 use crate::ids::JobId;
 use crate::ids::TaskId;
 use crate::ids::TaskKey;
