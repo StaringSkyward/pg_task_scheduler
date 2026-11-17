@@ -7,9 +7,11 @@ use chrono::DateTime;
 use chrono::Utc;
 use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
+use diesel_async::AnsiTransactionManager;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::TransactionManager;
 
 use crate::error::SchedulerError;
 use crate::ids::QueueName;
@@ -256,9 +258,9 @@ struct TaskNameRow {
     task_name: TaskName,
 }
 
-/// Every registered worker: live ones first, then by label (or id when unlabelled). Each
-/// worker's queues are ordered by queue name; `paused` is read live.
-pub async fn workers(conn: &mut AsyncPgConnection) -> Result<Vec<WorkerView>, SchedulerError> {
+type RegistryRows = (Vec<WorkerRow>, Vec<QueueRow>, Vec<TaskNameRow>);
+
+async fn registry_rows(conn: &mut AsyncPgConnection) -> Result<RegistryRows, SchedulerError> {
     let rows = diesel::sql_query(
         "SELECT worker_id, label, started_at, last_seen_at, status, last_error, \
                 lost_after < now() AS lost \
@@ -278,6 +280,28 @@ pub async fn workers(conn: &mut AsyncPgConnection) -> Result<Vec<WorkerView>, Sc
     )
     .get_results::<TaskNameRow>(conn)
     .await?;
+    Ok((rows, queue_rows, name_rows))
+}
+
+/// Every registered worker: live ones first, then by label (or id when unlabelled). Each
+/// worker's queues are ordered by queue name; `paused` is read live.
+///
+/// Its three reads run in one `REPEATABLE READ READ ONLY` transaction, so they share a snapshot.
+/// When `conn` is already in a transaction they run in that one, and its isolation decides.
+pub async fn workers(conn: &mut AsyncPgConnection) -> Result<Vec<WorkerView>, SchedulerError> {
+    // diesel-async cannot begin a REPEATABLE READ transaction inside another one.
+    let nested = AnsiTransactionManager::transaction_manager_status_mut(conn)
+        .transaction_depth()?
+        .is_some();
+    let (rows, queue_rows, name_rows) = if nested {
+        registry_rows(conn).await?
+    } else {
+        conn.build_transaction()
+            .repeatable_read()
+            .read_only()
+            .run(async |c| registry_rows(c).await)
+            .await?
+    };
     let mut queues: HashMap<WorkerId, Vec<WorkerQueueView>> = HashMap::new();
     for r in queue_rows {
         queues

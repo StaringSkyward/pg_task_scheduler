@@ -131,8 +131,10 @@ it was a judgement call made during the work, open to change.
   dependencies need at most 1.86 (Diesel). The workspace was checked with 1.88,
   and failed to build with 1.87.
 - **Expected behaviour:** Cargo reports a clear error on an older toolchain.
-  CI builds only on nightly, so a newer language feature could raise the real
-  minimum without anyone noticing.
+  CI's cargo builds, clippy runs and tests use the toolchain pinned in
+  `rust-toolchain.toml` (1.100.0); only the format check uses nightly. No CI
+  job runs on 1.88, so a newer language feature could raise the real minimum
+  without anyone noticing.
 
 ### 11. First release is plain `0.1.0`
 

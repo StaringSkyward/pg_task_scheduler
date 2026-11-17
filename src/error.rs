@@ -26,8 +26,9 @@ pub enum SchedulerError {
     /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting.
     #[error("configuration error: {0}")]
     Config(String),
-    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName)
-    /// or [`WorkerId`](crate::WorkerId).
+    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName),
+    /// [`WorkerId`](crate::WorkerId), [`EffectName`], [`Topic`](crate::Topic),
+    /// [`CommandKey`](crate::CommandKey) or (with `cron`) `ScheduleName`.
     #[error("invalid identifier: {0}")]
     Identifier(#[from] IdentifierError),
     /// A handler registration was rejected.

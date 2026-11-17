@@ -401,8 +401,10 @@ recreated.
   [Publishing](Publishing.md)). A CI job on the minimum Rust version stays
   optional.
 - **Expected behaviour:** Both crates declare `license = "MIT"`, a description,
-  the repository and `rust-version = "1.88"`. CI has no job on Rust 1.88, so a
-  newer language feature could raise the real minimum unnoticed
+  the repository and `rust-version = "1.88"`. CI builds and tests on the
+  toolchain pinned in `rust-toolchain.toml` (1.100.0), and uses nightly only
+  for the format check. It has no job on Rust 1.88, so a newer language
+  feature could raise the real minimum unnoticed
   ([Publishing, entry 10](Publishing.md#10-minimum-rust-version-is-188)).
 
 ### 15. Example app integration tests are deferred

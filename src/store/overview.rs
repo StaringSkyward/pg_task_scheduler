@@ -48,18 +48,20 @@ impl OverviewParams {
     }
 }
 
-const fn nz(n: u32) -> NonZeroU32 {
-    NonZeroU32::new(n).unwrap()
-}
+// `const` items, so a zero fails the build rather than panicking in `default()`.
+const DEFAULT_COUNT_CAP: NonZeroU32 = NonZeroU32::new(10_000).unwrap();
+const DEFAULT_NO_HANDLER_PROBE: NonZeroU32 = NonZeroU32::new(100).unwrap();
+const DEFAULT_FAILURE_GROUPS: NonZeroU32 = NonZeroU32::new(20).unwrap();
+const DEFAULT_RECENT_ACTIONS: NonZeroU32 = NonZeroU32::new(10).unwrap();
 
 impl Default for OverviewParams {
     fn default() -> Self {
         Self {
             window: Duration::from_secs(3600),
-            count_cap: nz(10_000),
-            no_handler_probe: nz(100),
-            failure_groups: nz(20),
-            recent_actions: nz(10),
+            count_cap: DEFAULT_COUNT_CAP,
+            no_handler_probe: DEFAULT_NO_HANDLER_PROBE,
+            failure_groups: DEFAULT_FAILURE_GROUPS,
+            recent_actions: DEFAULT_RECENT_ACTIONS,
         }
     }
 }

@@ -454,6 +454,13 @@ recovers it after the lease expires.
   running row through their partial indexes (its status test is written as
   `OR`, which matches them; `IN` would scan every retained row) and filters by
   name, because an index on `task_name` there would tax every enqueue.
+- With `cron`, `scheduler_jobs_due_idx` is no longer partial: the pause moved
+  to `scheduler_job_pauses`, so a paused schedule that is due stays at the
+  front of the index. Each materializer statement that finds the next due
+  schedule walks past every such schedule and probes the pause table for each.
+  That is O(paused-and-due) per statement, which is cheap at realistic counts.
+  A schedule the materializer locks gets one more pause probe, which closes the
+  race with a concurrent pause.
 - The claim index is a starting point, not an optimum. Benchmark it against
   realistic scheduled-task and priority distributions before tuning: very many
   future tasks or unusual priority mixes may justify bounded priority classes
