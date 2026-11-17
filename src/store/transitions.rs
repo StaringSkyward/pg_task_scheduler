@@ -10,6 +10,7 @@ use diesel_async::RunQueryDsl;
 
 use crate::error::SchedulerError;
 use crate::ids::TaskKey;
+use crate::models::LeaseDuration;
 use crate::models::OutboxCommand;
 use crate::models::OutboxWrite;
 use crate::models::RetryOutcome;
@@ -211,12 +212,13 @@ async fn close_attempt(
 pub async fn heartbeat(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
-    duration: Duration,
+    duration: LeaseDuration,
 ) -> Result<DateTime<Utc>, SchedulerError> {
+    let duration = pg_interval(duration.get())?;
     conn.transaction::<_, SchedulerError, _>(async |c| {
         lock_task_row(c, lease).await?;
         owned_query!(HEARTBEAT, lease)
-            .bind::<sql_types::Interval, _>(pg_interval(duration))
+            .bind::<sql_types::Interval, _>(duration)
             .get_result::<HeartbeatRow>(c)
             .await
             .map(|r| r.locked_until)
@@ -325,10 +327,11 @@ pub async fn retry(
     error: &str,
     delay: Duration,
 ) -> Result<RetryOutcome, SchedulerError> {
+    let delay = pg_interval(delay)?;
     conn.transaction::<_, SchedulerError, _>(async |c| {
         lock_task_row(c, lease).await?;
         let rows = owned_query!(RETRY, lease)
-            .bind::<sql_types::Interval, _>(pg_interval(delay))
+            .bind::<sql_types::Interval, _>(delay)
             .bind::<sql_types::Text, _>(error)
             .get_results::<RetryRow>(c)
             .await?;

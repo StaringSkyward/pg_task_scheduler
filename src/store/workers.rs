@@ -99,8 +99,8 @@ const DROP_TASK_NAMES: &str =
 const INSERT_TASK_NAMES: &str = "INSERT INTO queue_worker_task_names (worker_id, task_name) \
      SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING";
 
-fn big(n: usize) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
+fn big(n: usize) -> Result<i64, SchedulerError> {
+    i64::try_from(n).map_err(|_| SchedulerError::Invariant("queue slot count exceeds i64::MAX"))
 }
 
 /// Insert or refresh this worker's row, its queue rows and its task-name rows, in one
@@ -112,11 +112,24 @@ pub async fn upsert_worker(
     let q = &reg.queues;
     let queue_names: Vec<&str> = q.iter().map(|s| s.name.as_str()).collect();
     let task_names: Vec<&str> = reg.task_names.iter().map(TaskName::as_str).collect();
+    let lost_after = pg_interval(reg.lost_after)?;
+    let limits = q
+        .iter()
+        .map(|s| big(s.limit))
+        .collect::<Result<Vec<_>, _>>()?;
+    let in_use = q
+        .iter()
+        .map(|s| big(s.in_use))
+        .collect::<Result<Vec<_>, _>>()?;
+    let finished_ago = q
+        .iter()
+        .map(|s| s.finished_ago.map(pg_interval).transpose())
+        .collect::<Result<Vec<Option<PgInterval>>, _>>()?;
     conn.transaction::<(), SchedulerError, _>(async |conn| {
         diesel::sql_query(UPSERT_WORKER)
             .bind::<sql_types::Text, _>(&reg.worker_id)
             .bind::<sql_types::Nullable<sql_types::Text>, _>(&reg.label)
-            .bind::<sql_types::Interval, _>(pg_interval(reg.lost_after))
+            .bind::<sql_types::Interval, _>(lost_after)
             .bind::<sql_types::Text, _>(reg.status.as_str())
             .bind::<sql_types::Nullable<sql_types::Text>, _>(&reg.last_error)
             .execute(conn)
@@ -129,17 +142,9 @@ pub async fn upsert_worker(
         diesel::sql_query(UPSERT_QUEUES)
             .bind::<sql_types::Text, _>(&reg.worker_id)
             .bind::<sql_types::Array<sql_types::Text>, _>(&queue_names)
-            .bind::<sql_types::Array<sql_types::BigInt>, _>(
-                q.iter().map(|s| big(s.limit)).collect::<Vec<_>>(),
-            )
-            .bind::<sql_types::Array<sql_types::BigInt>, _>(
-                q.iter().map(|s| big(s.in_use)).collect::<Vec<_>>(),
-            )
-            .bind::<sql_types::Array<sql_types::Nullable<sql_types::Interval>>, _>(
-                q.iter()
-                    .map(|s| s.finished_ago.map(pg_interval))
-                    .collect::<Vec<Option<PgInterval>>>(),
-            )
+            .bind::<sql_types::Array<sql_types::BigInt>, _>(&limits)
+            .bind::<sql_types::Array<sql_types::BigInt>, _>(&in_use)
+            .bind::<sql_types::Array<sql_types::Nullable<sql_types::Interval>>, _>(&finished_ago)
             .execute(conn)
             .await?;
         diesel::sql_query(DROP_TASK_NAMES)

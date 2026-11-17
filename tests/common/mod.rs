@@ -27,6 +27,11 @@ use uuid::Uuid;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A checked lease for store calls; panics on an out-of-range test value.
+pub fn lease(d: std::time::Duration) -> pg_task_scheduler::LeaseDuration {
+    pg_task_scheduler::LeaseDuration::try_from(d).unwrap()
+}
+
 pub fn database_url() -> String {
     // Load `.env` exactly once. `std::sync::Once` gives a happens-before edge so
     // concurrent tests don't race on env mutation (relevant under edition 2024),

@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         } = self;
         let health = StoppedOnDrop(health_tx);
         let config = Arc::new(config);
-        let names = registry.names();
+        let names = registry.task_names();
         let queues: Vec<_> = config
             .queues
             .iter()
@@ -111,7 +111,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         let registration = tokio::spawn(keep_registered(
             pool.clone(),
             config.clone(),
-            registry.task_names(),
+            names.clone(),
             queues.clone(),
             health.0.subscribe(),
             background,
@@ -245,6 +245,8 @@ async fn timed<T>(operation: &'static str, query: impl Future<Output = T>) -> T 
     out
 }
 
+/// A row count as `u64`, for metrics and for comparing with a `u32` batch size; no supported
+/// `usize` exceeds `u64`, so the saturation never applies.
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -334,7 +336,7 @@ async fn notified<C: DerefMut<Target = AsyncPgConnection>>(listener: &mut Option
 async fn claim_cycle<P: SchedulerPool>(
     pool: &P,
     registry: &Registry,
-    names: &[String],
+    names: &[TaskName],
     config: &Arc<Config>,
     queues: &[WorkerQueue],
     in_flight: &mut JoinSet<()>,
@@ -347,7 +349,10 @@ async fn claim_cycle<P: SchedulerPool>(
             return Ok(Some(config.max_poll_interval));
         }
         let free = queue.permits.available_permits();
-        let Some(want) = NonZeroUsize::new(free.min(config.claim_batch_size.get())) else {
+        // Exact: the `min` with the `u32` batch size bounds the result, so a `free` beyond
+        // `u32` only means the batch size wins.
+        let want = u32::try_from(free).unwrap_or(u32::MAX);
+        let Some(want) = NonZeroU32::new(want.min(config.claim_batch_size.get())) else {
             continue;
         };
         let sent = Instant::now();
@@ -363,7 +368,7 @@ async fn claim_cycle<P: SchedulerPool>(
             ),
         )
         .await?;
-        let full_batch = claimed.len() == want.get();
+        let full_batch = count(claimed.len()) == u64::from(want.get());
         claimed_any |= !claimed.is_empty();
         for task in claimed {
             let name = task.task_name.as_str().to_owned();
@@ -380,7 +385,7 @@ async fn claim_cycle<P: SchedulerPool>(
             let handler = registry
                 .get(&task.task_name)
                 .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
-            let deadline = sent + config.lease_duration;
+            let deadline = sent + config.lease_duration.get();
             let run = dispatch(
                 pool.clone(),
                 config.clone(),
@@ -575,7 +580,7 @@ async fn keep_lease<P: SchedulerPool>(
         })
         .await;
         match beat {
-            Ok(Ok(_)) => deadline = sent + config.lease_duration,
+            Ok(Ok(_)) => deadline = sent + config.lease_duration.get(),
             Ok(Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
             Ok(Err(error)) => {
                 metrics::counter!("pg_task_scheduler_heartbeat_failures_total", "task_name" => name.to_owned())
@@ -740,7 +745,7 @@ async fn maintenance_pass<P: SchedulerPool>(
     if let Err(error) = store::prune_workers(&mut conn).await {
         registry_failed(&error);
     }
-    let batch = config.retention.batch_size.get();
+    let batch = u64::from(config.retention.batch_size.get());
     let mut cleaning = true;
     loop {
         let reaped = timed(
@@ -760,9 +765,9 @@ async fn maintenance_pass<P: SchedulerPool>(
                 .increment(count(deleted.tasks));
             metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "outbox")
                 .increment(count(deleted.outbox));
-            cleaning = deleted.tasks >= batch || deleted.outbox >= batch;
+            cleaning = count(deleted.tasks) >= batch || count(deleted.outbox) >= batch;
         }
-        if n < config.reaper_batch_size.get() && !cleaning {
+        if count(n) < u64::from(config.reaper_batch_size.get()) && !cleaning {
             return Ok(());
         }
     }

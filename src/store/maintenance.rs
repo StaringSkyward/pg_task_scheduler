@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use diesel::sql_types;
@@ -97,20 +97,22 @@ struct StatusRow {
     status: String,
 }
 
-fn limit(n: NonZeroUsize) -> i64 {
-    i64::try_from(n.get()).unwrap_or(i64::MAX)
+/// What is left of `batch` once `used` rows are deleted; `None` when it is spent. A `used`
+/// beyond `u32` has spent any `u32` batch, so the conversion failing is exact.
+fn left(batch: NonZeroU32, used: usize) -> Option<NonZeroU32> {
+    NonZeroU32::new(batch.get().saturating_sub(u32::try_from(used).ok()?))
 }
 
 /// Recover up to `batch` tasks whose lease expired: requeue after `crash_retry_delay`, or mark
 /// dead when attempts are exhausted. Safe to run from several processes (SKIP LOCKED).
 pub async fn reap_expired(
     conn: &mut AsyncPgConnection,
-    batch: NonZeroUsize,
+    batch: NonZeroU32,
     crash_retry_delay: Duration,
 ) -> Result<ReapSummary, SchedulerError> {
     let rows = diesel::sql_query(REAP)
-        .bind::<sql_types::BigInt, _>(limit(batch))
-        .bind::<sql_types::Interval, _>(pg_interval(crash_retry_delay))
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
+        .bind::<sql_types::Interval, _>(pg_interval(crash_retry_delay)?)
         .get_results::<StatusRow>(conn)
         .await?;
     let dead = rows.iter().filter(|r| r.status == "dead").count();
@@ -129,34 +131,34 @@ pub async fn cleanup(
 ) -> Result<CleanupSummary, SchedulerError> {
     let batch = retention.batch_size;
     let done = diesel::sql_query(CLEANUP_DONE)
-        .bind::<sql_types::Interval, _>(pg_interval(retention.done))
-        .bind::<sql_types::BigInt, _>(limit(batch))
+        .bind::<sql_types::Interval, _>(pg_interval(retention.done)?)
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
         .execute(conn)
         .await?;
     // Both statuses share one budget: a call deletes at most `batch_size` task rows.
-    let dead = match NonZeroUsize::new(batch.get().saturating_sub(done)) {
+    let dead = match left(batch, done) {
         Some(left) => {
             diesel::sql_query(CLEANUP_DEAD)
-                .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
-                .bind::<sql_types::BigInt, _>(limit(left))
+                .bind::<sql_types::Interval, _>(pg_interval(retention.dead)?)
+                .bind::<sql_types::BigInt, _>(i64::from(left.get()))
                 .execute(conn)
                 .await?
         }
         None => 0,
     };
-    let cancelled = match NonZeroUsize::new(batch.get().saturating_sub(done + dead)) {
+    let cancelled = match left(batch, done + dead) {
         Some(left) => {
             diesel::sql_query(CLEANUP_CANCELLED)
-                .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
-                .bind::<sql_types::BigInt, _>(limit(left))
+                .bind::<sql_types::Interval, _>(pg_interval(retention.dead)?)
+                .bind::<sql_types::BigInt, _>(i64::from(left.get()))
                 .execute(conn)
                 .await?
         }
         None => 0,
     };
     let outbox = diesel::sql_query(CLEANUP_OUTBOX)
-        .bind::<sql_types::Interval, _>(pg_interval(retention.outbox_published))
-        .bind::<sql_types::BigInt, _>(limit(batch))
+        .bind::<sql_types::Interval, _>(pg_interval(retention.outbox_published)?)
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
         .execute(conn)
         .await?;
     Ok(CleanupSummary {

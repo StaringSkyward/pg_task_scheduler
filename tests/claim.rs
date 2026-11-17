@@ -1,6 +1,6 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -14,6 +14,7 @@ use pg_task_scheduler::QueueName;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskName;
 use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::WorkerId;
@@ -33,14 +34,16 @@ impl Task for Other {
     type Args = serde_json::Value;
 }
 
-const LEASE: Duration = Duration::from_secs(30);
+fn lease() -> pg_task_scheduler::LeaseDuration {
+    common::lease(Duration::from_secs(30))
+}
 
 fn key(s: &str) -> TaskKey {
     TaskKey::try_from(s).unwrap()
 }
 
-fn names() -> Vec<String> {
-    vec!["email".to_owned()]
+fn names() -> Vec<TaskName> {
+    vec![TaskName::try_from("email").unwrap()]
 }
 
 fn default_queue() -> QueueName {
@@ -51,8 +54,8 @@ fn bulk() -> QueueName {
     QueueName::try_from("bulk").unwrap()
 }
 
-fn one() -> NonZeroUsize {
-    NonZeroUsize::new(1).unwrap()
+fn one() -> NonZeroU32 {
+    NonZeroU32::new(1).unwrap()
 }
 
 #[tokio::test]
@@ -63,9 +66,16 @@ async fn claim_marks_running_and_records_attempt() {
         .await
         .unwrap();
     let worker = WorkerId::generate();
-    let claimed = store::claim(&mut conn, &worker, &default_queue(), &names(), one(), LEASE)
-        .await
-        .unwrap();
+    let claimed = store::claim(
+        &mut conn,
+        &worker,
+        &default_queue(),
+        &names(),
+        one(),
+        lease(),
+    )
+    .await
+    .unwrap();
     assert_eq!(claimed.len(), 1);
     let c = &claimed[0];
     assert_eq!(c.lease.task_id, e.id);
@@ -114,7 +124,7 @@ async fn concurrent_claims_produce_one_owner() {
                 &default_queue(),
                 &names(),
                 one(),
-                LEASE,
+                lease(),
             )
             .await
             .unwrap()
@@ -144,14 +154,14 @@ async fn future_task_is_not_claimed_until_due() {
     .unwrap();
     let w = WorkerId::generate();
     assert!(
-        store::claim(&mut conn, &w, &default_queue(), &names(), one(), LEASE)
+        store::claim(&mut conn, &w, &default_queue(), &names(), one(), lease())
             .await
             .unwrap()
             .is_empty()
     );
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(
-        store::claim(&mut conn, &w, &default_queue(), &names(), one(), LEASE)
+        store::claim(&mut conn, &w, &default_queue(), &names(), one(), lease())
             .await
             .unwrap()
             .len(),
@@ -195,7 +205,7 @@ async fn higher_priority_due_task_is_claimed_first() {
         &default_queue(),
         &names(),
         one(),
-        LEASE,
+        lease(),
     )
     .await
     .unwrap();
@@ -220,7 +230,7 @@ async fn unregistered_task_name_is_never_claimed() {
         &default_queue(),
         &names(),
         one(),
-        LEASE,
+        lease(),
     )
     .await
     .unwrap();
@@ -250,8 +260,8 @@ async fn batch_claim_respects_limit() {
         &WorkerId::generate(),
         &default_queue(),
         &names(),
-        NonZeroUsize::new(3).unwrap(),
-        LEASE,
+        NonZeroU32::new(3).unwrap(),
+        lease(),
     )
     .await
     .unwrap();
@@ -340,15 +350,15 @@ async fn claim_takes_only_the_requested_queue() {
     )
     .await
     .unwrap();
-    let two = NonZeroUsize::new(2).unwrap();
+    let two = NonZeroU32::new(2).unwrap();
     let w = WorkerId::generate();
-    let got = store::claim(&mut conn, &w, &bulk(), &names(), two, LEASE)
+    let got = store::claim(&mut conn, &w, &bulk(), &names(), two, lease())
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].task_key, key("b"));
     assert_eq!(got[0].queue, bulk());
-    let got = store::claim(&mut conn, &w, &default_queue(), &names(), two, LEASE)
+    let got = store::claim(&mut conn, &w, &default_queue(), &names(), two, lease())
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
@@ -421,8 +431,8 @@ async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest(
         &worker,
         &default_queue(),
         &names(),
-        NonZeroUsize::new(10).unwrap(),
-        LEASE,
+        NonZeroU32::new(10).unwrap(),
+        lease(),
     )
     .await
     .unwrap();
@@ -473,8 +483,8 @@ async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_r
         &WorkerId::generate(),
         &default_queue(),
         &names(),
-        NonZeroUsize::new(2).unwrap(),
-        LEASE,
+        NonZeroU32::new(2).unwrap(),
+        lease(),
     )
     .await
     .unwrap();

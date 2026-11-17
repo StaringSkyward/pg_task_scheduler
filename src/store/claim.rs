@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -15,6 +15,7 @@ use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::ClaimedTask;
+use crate::models::LeaseDuration;
 use crate::models::MaxAttempts;
 use crate::models::TaskLease;
 use crate::models::interval_to_duration;
@@ -83,16 +84,15 @@ pub async fn claim(
     conn: &mut AsyncPgConnection,
     worker: &WorkerId,
     queue: &QueueName,
-    task_names: &[String],
-    limit: NonZeroUsize,
-    lease: Duration,
+    task_names: &[TaskName],
+    limit: NonZeroU32,
+    lease: LeaseDuration,
 ) -> Result<Vec<ClaimedTask>, SchedulerError> {
-    let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
     let rows = diesel::sql_query(CLAIM)
         .bind::<sql_types::Array<sql_types::Text>, _>(task_names)
-        .bind::<sql_types::BigInt, _>(limit)
+        .bind::<sql_types::BigInt, _>(i64::from(limit.get()))
         .bind::<sql_types::Text, _>(worker)
-        .bind::<sql_types::Interval, _>(pg_interval(lease))
+        .bind::<sql_types::Interval, _>(pg_interval(lease.get())?)
         .bind::<sql_types::Text, _>(queue)
         .get_results::<ClaimedRow>(conn)
         .await?;
@@ -172,7 +172,7 @@ struct WaitRow {
 pub async fn next_due_in(
     conn: &mut AsyncPgConnection,
     queues: &[QueueName],
-    task_names: &[String],
+    task_names: &[TaskName],
 ) -> Result<Option<Duration>, SchedulerError> {
     let row = diesel::sql_query(
         "SELECT min(next.due_at) - now() AS wait \

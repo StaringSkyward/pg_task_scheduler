@@ -1,5 +1,5 @@
 use std::num::NonZeroI32;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -367,7 +367,7 @@ pub struct CleanupSummary {
     pub outbox: usize,
 }
 
-const DEFAULT_CLEANUP_BATCH: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+const DEFAULT_CLEANUP_BATCH: NonZeroU32 = NonZeroU32::new(1000).unwrap();
 
 /// How long terminal rows are kept; `batch_size` bounds each delete statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,7 +381,7 @@ pub struct Retention {
     /// How long published outbox rows are kept after `published_at`. Default 7 days.
     pub outbox_published: Duration,
     /// Most rows one delete statement removes. Default 1000.
-    pub batch_size: NonZeroUsize,
+    pub batch_size: NonZeroU32,
 }
 
 impl Default for Retention {
@@ -436,9 +436,12 @@ pub struct QueueStats {
     pub oldest_unpublished_age: Option<Duration>,
 }
 
-/// `Duration` to a pure-microsecond PG interval, saturating at `i64::MAX`.
-pub(crate) fn pg_interval(d: Duration) -> PgInterval {
-    PgInterval::from_microseconds(i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+/// `Duration` to a pure-microsecond PG interval (sub-microsecond parts truncate). Fails on
+/// more than `i64::MAX` microseconds, which no interval holds.
+pub(crate) fn pg_interval(d: Duration) -> Result<PgInterval, SchedulerError> {
+    i64::try_from(d.as_micros())
+        .map(PgInterval::from_microseconds)
+        .map_err(|_| SchedulerError::Config("duration too large for a PostgreSQL interval".into()))
 }
 
 /// PG interval to `Duration` (days count as 86 400 s); negative becomes zero.
@@ -451,6 +454,51 @@ pub(crate) fn interval_to_duration(iv: PgInterval) -> Duration {
 // ---------------------------------------------------------------------------
 // Validated config types (input boundary)
 // ---------------------------------------------------------------------------
+
+/// Longest duration the scheduler accepts for any setting: 5 years (5 × 365 days). Every
+/// duration becomes a PostgreSQL interval added to or subtracted from `now()`, and a far
+/// larger one (such as `Duration::MAX`) fails each such statement with
+/// "timestamp out of range".
+pub(crate) const MAX_DURATION: Duration = Duration::from_secs(5 * 365 * 86_400);
+
+/// How long a claim or heartbeat leases a task, in PostgreSQL time: from 1 microsecond to
+/// 5 years. Build one with `LeaseDuration::try_from(Duration::from_secs(60))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseDuration(Duration);
+
+/// Why a `Duration` was rejected as a [`LeaseDuration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LeaseDurationError {
+    /// Under 1 microsecond, which a PostgreSQL interval truncates to zero.
+    #[error("lease_duration must be at least 1 microsecond")]
+    BelowOneMicrosecond,
+    /// Over 5 years.
+    #[error("lease_duration must be at most 5 years")]
+    AboveFiveYears,
+}
+
+impl TryFrom<Duration> for LeaseDuration {
+    type Error = LeaseDurationError;
+    fn try_from(d: Duration) -> Result<Self, LeaseDurationError> {
+        if d.as_micros() == 0 {
+            Err(LeaseDurationError::BelowOneMicrosecond)
+        } else if d > MAX_DURATION {
+            Err(LeaseDurationError::AboveFiveYears)
+        } else {
+            Ok(Self(d))
+        }
+    }
+}
+
+impl LeaseDuration {
+    /// 60 seconds, the builder's default.
+    pub(crate) const DEFAULT: Self = Self(Duration::from_secs(60));
+
+    /// The lease length.
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
 
 /// How many attempts a task gets before it is marked `dead`; at least 1. Build one
 /// with `MaxAttempts::try_from(5u32)`. The default is 3.
@@ -544,16 +592,39 @@ mod task_enum_tests {
     #[test]
     fn interval_conversions() {
         assert_eq!(
-            interval_to_duration(pg_interval(Duration::from_millis(1500))),
+            interval_to_duration(pg_interval(Duration::from_millis(1500)).unwrap()),
             Duration::from_millis(1500)
         );
-        assert_eq!(pg_interval(Duration::MAX).microseconds, i64::MAX);
         assert_eq!(
             interval_to_duration(PgInterval::from_microseconds(-5)),
             Duration::ZERO
         );
         let day = PgInterval::new(0, 1, 0);
         assert_eq!(interval_to_duration(day), Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn lease_duration_bounds() {
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_nanos(999)),
+            Err(LeaseDurationError::BelowOneMicrosecond)
+        );
+        assert!(LeaseDuration::try_from(Duration::from_micros(1)).is_ok());
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_secs(157_680_001)),
+            Err(LeaseDurationError::AboveFiveYears)
+        );
+    }
+
+    #[test]
+    fn pg_interval_rejects_what_it_cannot_represent() {
+        assert!(pg_interval(Duration::MAX).is_err());
+        assert_eq!(
+            pg_interval(Duration::from_millis(1500))
+                .unwrap()
+                .microseconds,
+            1_500_000
+        );
     }
 }
 

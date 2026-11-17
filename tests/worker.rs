@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -539,9 +540,9 @@ async fn claim_elsewhere(db: &TestDb, name: &str) -> TaskId {
         &mut conn,
         &WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
-        &[name.to_owned()],
-        NonZeroUsize::MIN,
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from(name).unwrap()],
+        NonZeroU32::MIN,
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
@@ -683,7 +684,7 @@ async fn cleanup_backlog_does_not_starve_reaper() {
         .reaper_interval(Duration::from_secs(60)) // one pass, starting now
         .crash_retry_delay(Duration::from_secs(3600)) // keep the reaped task queued
         .retention(Retention {
-            batch_size: NonZeroUsize::MIN, // one row per cleanup batch: a long drain
+            batch_size: NonZeroU32::MIN, // one row per cleanup batch: a long drain
             ..Retention::default()
         })
         .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })

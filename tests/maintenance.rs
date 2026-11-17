@@ -1,6 +1,6 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::TestDb;
@@ -30,8 +30,8 @@ impl Task for Email {
     type Args = serde_json::Value;
 }
 
-fn nz(n: usize) -> NonZeroUsize {
-    NonZeroUsize::new(n).unwrap()
+fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).unwrap()
 }
 
 async fn exec(conn: &mut AsyncPgConnection, sql: &str) {
@@ -54,9 +54,9 @@ async fn claim_lease(conn: &mut AsyncPgConnection, lease: Duration) -> Option<Cl
         conn,
         &WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
-        &["email".to_owned()],
+        &[pg_task_scheduler::TaskName::try_from("email").unwrap()],
         nz(1),
-        lease,
+        common::lease(lease),
     )
     .await
     .unwrap()

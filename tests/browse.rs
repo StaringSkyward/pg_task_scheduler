@@ -1,7 +1,6 @@
 mod common;
 
 use std::num::NonZeroU32;
-use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use common::TestDb;
@@ -225,9 +224,9 @@ async fn task_detail_has_attempts_and_actions() {
         &mut conn,
         &WorkerId::generate(),
         &QueueName::default(),
-        &["job".to_owned()],
-        NonZeroUsize::new(1).unwrap(),
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from("job").unwrap()],
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()

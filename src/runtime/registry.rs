@@ -37,15 +37,7 @@ impl Registry {
         self.handlers.is_empty()
     }
 
-    /// Returns the inner task-name strings, for use in the `ANY($1)` claim filter.
-    pub fn names(&self) -> Vec<String> {
-        self.handlers
-            .keys()
-            .map(|n| n.as_str().to_owned())
-            .collect()
-    }
-
-    /// The registered task names, as typed values for the worker registry.
+    /// The registered task names: the claim filter and the worker registry's list.
     pub fn task_names(&self) -> Vec<TaskName> {
         self.handlers.keys().cloned().collect()
     }

@@ -1,6 +1,6 @@
 #![cfg(feature = "cron")]
 mod common;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -142,7 +142,7 @@ async fn materialize_failure_degrades_health_without_slowing_claims() {
     let started = Arc::new(AtomicU32::new(0));
     let counter = started.clone();
     let scheduler = Scheduler::builder(db.pool.clone())
-        .claim_batch_size(NonZeroUsize::MIN) // every claim of one task is a full batch
+        .claim_batch_size(NonZeroU32::MIN) // every claim of one task is a full batch
         .max_poll_interval(Duration::from_secs(10))
         .shutdown_timeout(Duration::from_millis(100))
         .register_task::<Hold, _, _>(move |_ctx, _args| {

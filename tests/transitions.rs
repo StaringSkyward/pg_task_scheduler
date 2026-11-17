@@ -1,6 +1,6 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::TestDb;
@@ -35,8 +35,8 @@ impl Task for Email {
     type Args = serde_json::Value;
 }
 
-fn names() -> Vec<String> {
-    vec!["email".to_owned()]
+fn names() -> Vec<pg_task_scheduler::TaskName> {
+    vec![pg_task_scheduler::TaskName::try_from("email").unwrap()]
 }
 
 async fn claim_one(conn: &mut AsyncPgConnection) -> Option<ClaimedTask> {
@@ -52,8 +52,8 @@ async fn claim_one_with_lease(
         &WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
         &names(),
-        NonZeroUsize::new(1).unwrap(),
-        lease,
+        NonZeroU32::new(1).unwrap(),
+        common::lease(lease),
     )
     .await
     .unwrap()
@@ -121,7 +121,7 @@ async fn complete_waiting_on_a_lock_past_expiry_loses_ownership() {
 #[tokio::test]
 async fn heartbeat_waiting_on_a_lock_past_expiry_loses_ownership() {
     lost_after_lock_wait(|mut conn, lease| async move {
-        store::heartbeat(&mut conn, &lease, Duration::from_secs(60)).await
+        store::heartbeat(&mut conn, &lease, common::lease(Duration::from_secs(60))).await
     })
     .await;
 }
@@ -170,7 +170,7 @@ async fn heartbeat_extends_lease() {
     let db = TestDb::new().await;
     let c = claimed(&db).await;
     let mut conn = db.pool.get().await.unwrap();
-    let until = store::heartbeat(&mut conn, &c.lease, Duration::from_secs(120))
+    let until = store::heartbeat(&mut conn, &c.lease, common::lease(Duration::from_secs(120)))
         .await
         .unwrap();
     assert!(until > c.locked_until);
@@ -245,7 +245,7 @@ async fn every_transition_fails_after_hard_lease_expiry() {
     let mut conn = db.pool.get().await.unwrap();
     let l = &c.lease;
     lost(
-        store::heartbeat(&mut conn, l, Duration::from_secs(60)).await,
+        store::heartbeat(&mut conn, l, common::lease(Duration::from_secs(60))).await,
         l,
     );
     lost(store::complete(&mut conn, l).await, l);
@@ -279,8 +279,8 @@ async fn stale_token_cannot_complete_after_reclaim() {
         &old.lease.worker_id,
         &pg_task_scheduler::QueueName::default(),
         &names(),
-        NonZeroUsize::new(1).unwrap(),
-        Duration::from_secs(60),
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()

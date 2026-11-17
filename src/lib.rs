@@ -59,6 +59,8 @@ pub use crate::models::CleanupSummary;
 pub use crate::models::Job;
 #[cfg(feature = "cron")]
 pub use crate::models::JobLifecycle;
+pub use crate::models::LeaseDuration;
+pub use crate::models::LeaseDurationError;
 pub use crate::models::MaxAttempts;
 pub use crate::models::MaxAttemptsError;
 pub use crate::models::OutboxCommand;

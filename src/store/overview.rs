@@ -334,7 +334,7 @@ async fn window_counts(
     now: DateTime<Utc>,
 ) -> Result<Window, SchedulerError> {
     let rows = diesel::sql_query(sql)
-        .bind::<sql_types::Interval, _>(pg_interval(p.window))
+        .bind::<sql_types::Interval, _>(pg_interval(p.window)?)
         .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<WindowRow>(conn)
         .await?;
@@ -355,13 +355,13 @@ async fn failure_groups(
     now: DateTime<Utc>,
 ) -> Result<(Vec<FailureGroup>, Duration), SchedulerError> {
     let dead = diesel::sql_query(DEAD_GROUPS)
-        .bind::<sql_types::Interval, _>(pg_interval(p.window))
+        .bind::<sql_types::Interval, _>(pg_interval(p.window)?)
         .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<GroupRow>(conn)
         .await?;
     let dead_capped = dead.iter().map(|r| r.n).sum::<i64>() >= p.cap();
     let attempts = diesel::sql_query(OVERVIEW_FAILED_ATTEMPTS)
-        .bind::<sql_types::Interval, _>(pg_interval(p.window))
+        .bind::<sql_types::Interval, _>(pg_interval(p.window)?)
         .bind::<sql_types::BigInt, _>(p.cap())
         .get_results::<AttemptGroupRow>(conn)
         .await?;

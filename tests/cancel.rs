@@ -3,7 +3,6 @@ mod common;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -57,9 +56,9 @@ async fn claim_one(conn: &mut AsyncPgConnection) -> ClaimedTask {
         conn,
         &WorkerId::generate(),
         &QueueName::default(),
-        &["job".to_owned()],
-        NonZeroUsize::new(1).unwrap(),
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from("job").unwrap()],
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
@@ -148,7 +147,12 @@ async fn cancel_running_task_closes_attempt_and_fences_worker() {
     );
     assert_eq!(attempts[0].error.as_deref(), Some("cancelled by operator"));
 
-    let beat = store::heartbeat(&mut conn, &claimed.lease, Duration::from_secs(60)).await;
+    let beat = store::heartbeat(
+        &mut conn,
+        &claimed.lease,
+        common::lease(Duration::from_secs(60)),
+    )
+    .await;
     assert!(
         matches!(beat, Err(SchedulerError::LostOwnership(t)) if t == id),
         "{beat:?}"

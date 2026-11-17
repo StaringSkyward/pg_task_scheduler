@@ -1,7 +1,6 @@
 mod common;
 
 use std::num::NonZeroU32;
-use std::num::NonZeroUsize;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -44,9 +43,9 @@ async fn claim(db: &TestDb, queue: &str) -> Vec<pg_task_scheduler::ClaimedTask> 
         &mut conn,
         &WorkerId::generate(),
         &q(queue),
-        &["job".to_owned()],
-        NonZeroUsize::new(5).unwrap(),
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from("job").unwrap()],
+        NonZeroU32::new(5).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
@@ -112,7 +111,7 @@ async fn next_due_in_ignores_paused_queues() {
     let db = TestDb::new().await;
     add(&db, "a", "bulk").await;
     let mut conn = db.pool.get().await.unwrap();
-    let names = ["job".to_owned()];
+    let names = [pg_task_scheduler::TaskName::try_from("job").unwrap()];
     assert!(
         store::next_due_in(&mut conn, &[q("bulk")], &names)
             .await
