@@ -13,10 +13,12 @@ pub struct CronExpression {
 }
 
 impl CronExpression {
+    /// Parses a five-field cron expression, evaluated in UTC.
     pub fn parse(source: impl Into<String>) -> Result<Self, SchedulerError> {
         Self::parse_inner(source.into()).map_err(SchedulerError::Cron)
     }
 
+    /// The expression as given.
     pub fn as_str(&self) -> &str {
         &self.source
     }

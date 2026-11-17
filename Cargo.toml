@@ -2,10 +2,27 @@
 members = [".", "admin"]
 exclude = ["example-app"]
 
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/StaringSkyward/pg_task_scheduler"
+
 [package]
 name = "pg_task_scheduler"
 version = "0.1.0"
-edition = "2024"
+description = "Embeddable PostgreSQL task queue for Diesel, diesel-async and Tokio"
+keywords = ["queue", "postgres", "jobs", "diesel", "scheduler"]
+categories = ["asynchronous", "database"]
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["src", "migrations", "README.md", "LICENSE"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

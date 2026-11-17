@@ -186,7 +186,7 @@ pub async fn heartbeat(
         })
 }
 
-/// `SELECT ... FOR UPDATE` on the owned row, for DB-contained handlers (§10.2). Call inside the
+/// `SELECT ... FOR UPDATE` on the owned row, for DB-contained handlers. Call inside the
 /// caller's transaction; the reaper skips the row until it ends.
 pub async fn lock_owned(
     conn: &mut AsyncPgConnection,

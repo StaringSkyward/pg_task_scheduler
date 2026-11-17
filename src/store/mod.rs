@@ -1,4 +1,7 @@
-//! Store operations on the queue tables (added task by task).
+//! Statements on the queue tables: worker transitions (claim, heartbeat, complete,
+//! retry, fail), maintenance, inspection, and the admin operations (cancel, replay,
+//! pause, bulk actions). [`Scheduler`](crate::Scheduler) calls most of these for you;
+//! call them directly for transactional completion, operations tooling or tests.
 
 mod admin;
 mod browse;

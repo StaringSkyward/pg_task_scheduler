@@ -1,4 +1,8 @@
-//! Programmatic job CRUD. The cron is already validated (`CreateJob` holds a
+//! Recurring schedules (the `cron` feature): create, list, pause, resume, reschedule and
+//! delete rows in `scheduler_jobs`. Running schedulers turn each due occurrence into an
+//! ordinary queue task.
+//!
+//! The cron is already validated (`CreateJob` holds a
 //! `CronExpression`). Every cursor (`next_run_at`) is computed from the database
 //! clock — `now()` inside the operation's transaction — never the host clock, so
 //! all scheduling derives from the single PostgreSQL clock authority.
@@ -27,6 +31,7 @@ use crate::models::NewJob;
 use crate::models::SchedulerJob;
 use crate::schema::scheduler_jobs::dsl as j;
 
+/// A schedule to insert with [`create`] or [`ensure_job`].
 #[derive(Debug, Clone)]
 pub struct CreateJob {
     name: TaskName,
@@ -38,6 +43,9 @@ pub struct CreateJob {
 }
 
 impl CreateJob {
+    /// A schedule that runs task `name` with `args` at each `cron` occurrence, in the
+    /// `default` queue. Fails only if `args` does not serialize.
+    ///
     /// The four leading parameters are distinct, non-`Serialize` types, so their
     /// positional order is type-checked. `args` accepts any `Serialize` and is
     /// intentionally last (the one slot a transposition could reach). It is
@@ -214,6 +222,7 @@ pub async fn reschedule(
     row.map(Job::try_from).transpose()
 }
 
+/// The schedule with this id, if any.
 pub async fn get(conn: &mut AsyncPgConnection, id: JobId) -> Result<Option<Job>, SchedulerError> {
     let row: Option<SchedulerJob> = j::scheduler_jobs
         .find(id)
@@ -224,6 +233,7 @@ pub async fn get(conn: &mut AsyncPgConnection, id: JobId) -> Result<Option<Job>,
     row.map(Job::try_from).transpose()
 }
 
+/// Every schedule, ordered by name.
 pub async fn list(conn: &mut AsyncPgConnection) -> Result<Vec<Job>, SchedulerError> {
     let rows: Vec<SchedulerJob> = j::scheduler_jobs
         .order(j::name.asc())
@@ -243,10 +253,12 @@ fn applied_from_affected(affected: usize) -> Applied {
     }
 }
 
+/// Stops a schedule creating tasks. Tasks it already created are unaffected.
 pub async fn pause(conn: &mut AsyncPgConnection, id: JobId) -> Result<Applied, SchedulerError> {
     set_paused(conn, id, true).await
 }
 
+/// Lets a paused schedule create tasks again.
 pub async fn resume(conn: &mut AsyncPgConnection, id: JobId) -> Result<Applied, SchedulerError> {
     set_paused(conn, id, false).await
 }
@@ -263,6 +275,7 @@ async fn set_paused(
     Ok(applied_from_affected(affected))
 }
 
+/// Deletes a schedule. Tasks it already created are unaffected.
 pub async fn delete(conn: &mut AsyncPgConnection, id: JobId) -> Result<Applied, SchedulerError> {
     let affected = diesel::delete(j::scheduler_jobs.find(id))
         .execute(conn)

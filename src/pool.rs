@@ -15,6 +15,7 @@ pub trait SchedulerPool: Clone + Send + Sync + 'static {
     /// `AsyncPgConnection` so callers can pass `&mut *conn` to store fns.
     type Conn: DerefMut<Target = AsyncPgConnection> + Send;
 
+    /// Takes a connection from the pool, waiting if none is free.
     fn acquire(&self) -> impl std::future::Future<Output = Result<Self::Conn, PoolError>> + Send;
 }
 

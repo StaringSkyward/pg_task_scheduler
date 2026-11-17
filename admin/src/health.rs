@@ -1,4 +1,5 @@
-//! The queue status rules (spec §7.2). Pure: everything it needs is passed in.
+//! The rules that give each queue on the overview a status. Pure: everything it needs is
+//! passed in.
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -8,15 +9,22 @@ use pg_task_scheduler::store::WorkerView;
 
 use crate::QueueThresholds;
 
+/// A queue's status on the overview, checked in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueStatus {
+    /// An operator paused it.
     Paused,
+    /// It has due tasks, but no live worker serves it, or none has finished one of its
+    /// tasks (or started) within `stall_after`.
     Stalled,
+    /// Its oldest due task has waited longer than `backlog_after`.
     Backlog,
+    /// None of the above.
     Healthy,
 }
 
 impl QueueStatus {
+    /// Lowercase name, as shown on the page.
     pub fn label(self) -> &'static str {
         match self {
             Self::Paused => "paused",
@@ -27,9 +35,12 @@ impl QueueStatus {
     }
 }
 
+/// A queue's status and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
+    /// The status.
     pub status: QueueStatus,
+    /// A short explanation, such as `"no live worker"`; empty when healthy.
     pub reason: String,
 }
 
@@ -52,7 +63,8 @@ fn verdict_of(status: QueueStatus, reason: impl Into<String>) -> Verdict {
     }
 }
 
-/// `serving` holds the live workers whose queues include `q.queue`.
+/// The status of queue `q`. `serving` holds the live workers whose queues include
+/// `q.queue`; `unhandled_names` counts its due task names that no serving worker handles.
 pub fn verdict(
     q: &QueueOverview,
     serving: &[&WorkerView],

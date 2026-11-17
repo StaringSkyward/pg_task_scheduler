@@ -9,21 +9,30 @@ use crate::ids::TaskName;
 #[cfg(feature = "cron")]
 use crate::models::MaxAttemptsError;
 
+/// The error type of every fallible scheduler, store and enqueue operation.
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
+    /// A query failed.
     #[error("database error: {0}")]
     Database(#[from] diesel::result::Error),
+    /// The connection pool could not hand out a connection.
     #[error("connection pool error: {0}")]
     Pool(String),
+    /// A cron expression did not parse.
     #[cfg(feature = "cron")]
     #[error("cron parse error: {0}")]
     Cron(String),
+    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting.
     #[error("configuration error: {0}")]
     Config(String),
+    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName)
+    /// or [`WorkerId`](crate::WorkerId).
     #[error("invalid identifier: {0}")]
     Identifier(#[from] IdentifierError),
+    /// A handler registration was rejected.
     #[error(transparent)]
     Register(#[from] RegisterError),
+    /// Task arguments or an outbox payload failed to serialize or deserialize.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
@@ -41,7 +50,9 @@ pub enum SchedulerError {
     #[cfg(feature = "cron")]
     #[error("corrupt job row {job_id:?}: {source}")]
     CorruptJob {
+        /// The schedule whose row is corrupt.
         job_id: JobId,
+        /// Which stored value is invalid.
         #[source]
         source: CorruptJobRow,
     },
@@ -49,13 +60,14 @@ pub enum SchedulerError {
 
 /// Why a stored `scheduler_jobs` row failed to project into a domain `Job`. Each
 /// arm is a value the scheduler guarantees on write, so reaching one means the row
-/// was corrupted. The cron arm is a `String` because cron errors are stringly
-/// crate-wide (`src/cron.rs`); tightening that is a separate finding.
+/// was corrupted.
 #[cfg(feature = "cron")]
 #[derive(Debug, thiserror::Error)]
 pub enum CorruptJobRow {
+    /// The stored cron expression does not parse; holds the parser's message.
     #[error("unparseable cron: {0}")]
     Cron(String),
+    /// The stored `max_attempts` is not positive.
     #[error(transparent)]
     MaxAttempts(#[from] MaxAttemptsError),
 }
@@ -68,12 +80,19 @@ pub struct DuplicateTaskName(pub TaskName);
 /// Why `SchedulerBuilder::register` rejected a registration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RegisterError {
+    /// The task name is not a valid identifier.
     #[error(transparent)]
     Name(#[from] IdentifierError),
+    /// A handler is already registered for the name.
     #[error(transparent)]
     Duplicate(#[from] DuplicateTaskName),
 }
 
+/// The error a task handler returns. It says what happens to the task next:
+/// [`retry`](Self::retry), [`permanent`](Self::permanent) or
+/// [`interrupted`](Self::interrupted). Any `std::error::Error` converts into a
+/// permanent failure, so `?` marks the task `dead`.
+///
 /// Opaque handler error. Deliberately does NOT implement `std::error::Error`
 /// (same trick as `anyhow::Error`) so the blanket `From<E: Error>` below is
 /// coherent — if `TaskError` were itself an `Error`, that blanket would collide
@@ -92,6 +111,8 @@ enum Kind {
 }
 
 impl TaskError {
+    /// Marks the task `dead` now, whatever attempts remain. `message` is stored in
+    /// `last_error`.
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
             source: message.into().into(),
@@ -99,6 +120,8 @@ impl TaskError {
         }
     }
 
+    /// Requeues the task with exponential backoff and jitter, or marks it `dead` once
+    /// `max_attempts` is used up. `message` is stored in `last_error`.
     pub fn retry(message: impl Into<String>) -> Self {
         Self {
             source: message.into().into(),
@@ -115,10 +138,13 @@ impl TaskError {
         }
     }
 
+    /// Whether the task will be tried again: true for [`retry`](Self::retry) and
+    /// [`interrupted`](Self::interrupted).
     pub fn is_retryable(&self) -> bool {
         matches!(self.kind, Kind::Retry | Kind::Interrupted)
     }
 
+    /// Whether this was made by [`interrupted`](Self::interrupted).
     pub fn is_interrupted(&self) -> bool {
         self.kind == Kind::Interrupted
     }

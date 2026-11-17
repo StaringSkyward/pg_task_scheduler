@@ -30,7 +30,9 @@ use crate::Operator;
 /// [`hash_password`].
 #[derive(Clone)]
 pub struct BasicUser {
+    /// The login name; it becomes the [`Operator`].
     pub name: String,
+    /// An argon2id PHC string.
     pub password_hash: String,
 }
 
@@ -43,10 +45,15 @@ impl std::fmt::Debug for BasicUser {
     }
 }
 
+/// Why [`with_basic_auth`] rejected its users.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthConfigError {
+    /// A user's `password_hash` is not an argon2id PHC string.
     #[error("user {user:?}: password_hash is not an argon2id PHC string")]
-    InvalidHash { user: String },
+    InvalidHash {
+        /// The user's name.
+        user: String,
+    },
 }
 
 /// An argon2id PHC string for `password`, with a random salt and default parameters.

@@ -26,21 +26,32 @@ use crate::schema::scheduler_jobs;
 /// Lifecycle state of a `queue_tasks` row (stored as TEXT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
+    /// Waiting for its `due_at` and a worker that serves its queue and name.
     Queued,
+    /// Claimed; a worker holds its lease.
     Running,
+    /// The handler succeeded. Terminal.
     Done,
+    /// Failed permanently or used up its attempts. Terminal; replayable.
     Dead,
+    /// Cancelled by an operator. Terminal; replayable.
     Cancelled,
 }
 
 /// Outcome recorded on a closed `queue_task_attempts` row (stored as TEXT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
+    /// The handler succeeded.
     Done,
+    /// The handler failed and the task was requeued.
     Retry,
+    /// The handler failed and the task was marked `dead`.
     Dead,
+    /// The lease expired before the worker finished; the reaper closed the attempt.
     LeaseExpired,
+    /// Released at shutdown. The attempt is not counted.
     Released,
+    /// An operator cancelled the task while it ran.
     Cancelled,
 }
 
@@ -55,6 +66,7 @@ pub struct ParseEnumError {
 macro_rules! text_enum {
     ($ty:ident, $kind:literal, { $($variant:ident => $s:literal),+ $(,)? }) => {
         impl $ty {
+            /// The value stored in the database.
             pub fn as_str(self) -> &'static str {
                 match self { $(Self::$variant => $s),+ }
             }
@@ -85,14 +97,23 @@ text_enum!(AttemptOutcome, "attempt outcome", {
 /// A task handed to a worker by `store::claim`.
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
+    /// Ownership of this attempt; every later transition checks it.
     pub lease: TaskLease,
+    /// The queue it was claimed from.
     pub queue: QueueName,
+    /// The producer's idempotency key.
     pub task_key: TaskKey,
+    /// Selects the handler.
     pub task_name: TaskName,
+    /// The task's arguments as JSON.
     pub payload: serde_json::Value,
+    /// Attempts allowed in total.
     pub max_attempts: i32,
+    /// When the task became due.
     pub due_at: DateTime<Utc>,
+    /// Database time of the claim.
     pub claimed_at: DateTime<Utc>,
+    /// Lease expiry as of the claim.
     pub locked_until: DateTime<Utc>,
 }
 
@@ -100,7 +121,10 @@ pub struct ClaimedTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryOutcome {
     /// Requeued; due again at `due_at` (PostgreSQL time).
-    Queued { due_at: DateTime<Utc> },
+    Queued {
+        /// When the task is due again.
+        due_at: DateTime<Utc>,
+    },
     /// Attempts exhausted; the task is now dead.
     Dead,
 }
@@ -108,31 +132,54 @@ pub enum RetryOutcome {
 /// A command written to `queue_outbox` atomically with task completion.
 #[derive(Debug, Clone)]
 pub struct OutboxCommand {
+    /// Names the effect, for example `"order-shipped"`. A task records each effect at
+    /// most once: the row is unique on `(task_key, effect_name)`.
     pub effect_name: String,
+    /// Unique across the outbox. Receivers deduplicate by it, so derive it from the
+    /// `task_key` and `effect_name`.
     pub command_key: String,
+    /// Where the application's relay publishes the command.
     pub topic: String,
+    /// The command body.
     pub payload: serde_json::Value,
 }
 
 /// Every `queue_tasks` column as a domain type.
 #[derive(Debug, Clone)]
 pub struct TaskView {
+    /// Row id.
     pub id: TaskId,
+    /// The producer's idempotency key.
     pub task_key: TaskKey,
+    /// Selects the handler.
     pub task_name: TaskName,
+    /// The queue it runs in.
     pub queue: QueueName,
+    /// The task's arguments as JSON.
     pub payload: serde_json::Value,
+    /// Lifecycle state.
     pub status: TaskStatus,
+    /// Higher is claimed first, within its queue.
     pub priority: i32,
+    /// Earliest time a worker may claim it.
     pub due_at: DateTime<Utc>,
+    /// Attempts counted so far.
     pub attempts: i32,
+    /// Attempts allowed in total.
     pub max_attempts: i32,
+    /// The worker holding the lease, while `running`.
     pub locked_by: Option<WorkerId>,
+    /// Fencing token of the latest claim.
     pub lock_token: LockToken,
+    /// Lease expiry, while `running`.
     pub locked_until: Option<DateTime<Utc>>,
+    /// Message of the latest failure.
     pub last_error: Option<String>,
+    /// When it was enqueued.
     pub created_at: DateTime<Utc>,
+    /// When the row last changed.
     pub updated_at: DateTime<Utc>,
+    /// When it became `done`, `dead` or `cancelled`. Retention counts from here.
     pub completed_at: Option<DateTime<Utc>>,
     /// The admin action that last cancelled or replayed this task.
     pub admin_action_id: Option<i64>,
@@ -141,12 +188,19 @@ pub struct TaskView {
 /// One `queue_task_attempts` row.
 #[derive(Debug, Clone)]
 pub struct Attempt {
+    /// 1 for the first attempt.
     pub attempt_no: i32,
+    /// Fencing token of the claim that started it.
     pub lock_token: LockToken,
+    /// The worker that ran it.
     pub worker_id: WorkerId,
+    /// When it was claimed.
     pub started_at: DateTime<Utc>,
+    /// When it closed; `None` while it runs.
     pub finished_at: Option<DateTime<Utc>>,
+    /// How it closed; `None` while it runs.
     pub outcome: Option<AttemptOutcome>,
+    /// The failure message, if it failed.
     pub error: Option<String>,
 }
 
@@ -154,23 +208,31 @@ pub struct Attempt {
 /// guarded by it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskLease {
+    /// The claimed task.
     pub task_id: TaskId,
+    /// The worker that claimed it.
     pub worker_id: WorkerId,
+    /// The claim's fencing token.
     pub lock_token: LockToken,
+    /// Which attempt this is, from 1.
     pub attempt_no: i32,
 }
 
 /// What one `store::reap_expired` pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReapSummary {
+    /// Expired tasks put back to `queued`.
     pub requeued: usize,
+    /// Expired tasks with no attempts left, marked `dead`.
     pub dead: usize,
 }
 
 /// Rows deleted by one `store::cleanup` pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupSummary {
+    /// `done`, `dead` and `cancelled` task rows deleted, with their attempts.
     pub tasks: usize,
+    /// Published outbox rows deleted.
     pub outbox: usize,
 }
 
@@ -179,10 +241,16 @@ const DEFAULT_CLEANUP_BATCH: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
 /// How long terminal rows are kept; `batch_size` bounds each delete statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
+    /// How long `done` tasks are kept after completion. Default 30 days.
     pub done: Duration,
+    /// How long `dead` and `cancelled` tasks are kept after completion. Default 30 days.
     pub dead: Duration,
+    /// How long a `task_key` stays reserved. `done` and `dead` must be at least this,
+    /// or [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) fails. Default 7 days.
     pub idempotency_horizon: Duration,
+    /// How long published outbox rows are kept after `published_at`. Default 7 days.
     pub outbox_published: Duration,
+    /// Most rows one delete statement removes. Default 1000.
     pub batch_size: NonZeroUsize,
 }
 
@@ -202,9 +270,13 @@ impl Default for Retention {
 /// Queued tasks of one queue, name and priority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueDepth {
+    /// The queue.
     pub queue: QueueName,
+    /// The task name.
     pub task_name: TaskName,
+    /// The priority.
     pub priority: i32,
+    /// Queued tasks in this group, due or not.
     pub queued: i64,
     /// Of `queued`, those whose `due_at` has passed.
     pub due: i64,
@@ -215,15 +287,23 @@ pub struct QueueDepth {
 /// Point-in-time queue health from `store::queue_stats`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueStats {
+    /// Tasks in `queued`, across all queues.
     pub queued: i64,
+    /// Tasks in `running`.
     pub running: i64,
+    /// Retained `done` tasks.
     pub done: i64,
+    /// Retained `dead` tasks.
     pub dead: i64,
     /// Queued tasks whose `due_at` has passed.
     pub due: i64,
+    /// Age of the oldest due task; `None` if none is due.
     pub oldest_due_age: Option<Duration>,
+    /// Queued tasks broken down by queue, name and priority.
     pub depth: Vec<QueueDepth>,
+    /// Outbox rows not yet published.
     pub outbox_unpublished: i64,
+    /// Age of the oldest unpublished outbox row; `None` if there is none.
     pub oldest_unpublished_age: Option<Duration>,
 }
 
@@ -243,16 +323,21 @@ pub(crate) fn interval_to_duration(iv: PgInterval) -> Duration {
 // Validated config types (input boundary)
 // ---------------------------------------------------------------------------
 
-/// Max claim attempts. Private `NonZeroI32` with the invariant `>= 1`, enforced by
-/// every constructor — so the stored-`i32` conversion is total.
+/// How many attempts a task gets before it is marked `dead`; at least 1. Build one
+/// with `MaxAttempts::try_from(5u32)`. The default is 3.
+//
+// Private `NonZeroI32` with the invariant `>= 1`, enforced by every constructor — so the
+// stored-`i32` conversion is total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxAttempts(NonZeroI32);
 
 /// Why a value was rejected as a [`MaxAttempts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MaxAttemptsError {
+    /// Zero, or a stored value that is not positive.
     #[error("max_attempts must be greater than zero")]
     NonPositive,
+    /// Above `i32::MAX`, the largest value the database column holds.
     #[error("max_attempts exceeds i32::MAX")]
     TooLarge,
 }
@@ -284,8 +369,10 @@ impl MaxAttempts {
         self.0.get()
     }
 
-    /// The configured attempt count. Total: the inner is a validated `1..=i32::MAX`,
-    /// so `i32::unsigned_abs` is an exact i32->u32 — no `as` cast, no `unwrap`.
+    /// The attempt count.
+    //
+    // Total: the inner is a validated `1..=i32::MAX`, so `i32::unsigned_abs` is an exact
+    // i32->u32 — no `as` cast, no `unwrap`.
     pub fn get(self) -> u32 {
         self.0.get().unsigned_abs()
     }
@@ -400,7 +487,9 @@ mod max_attempts_tests {
 /// stored `is_paused` boolean never escapes the row mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobLifecycle {
+    /// Creates a task for each occurrence.
     Active,
+    /// Creates no tasks until resumed.
     Paused,
 }
 
@@ -428,14 +517,23 @@ impl JobLifecycle {
 /// it must not become an accidental wire contract.
 #[derive(Debug, Clone)]
 pub struct Job {
+    /// Row id.
     pub id: JobId,
+    /// The task name each occurrence runs; also the schedule's unique name.
     pub name: TaskName,
+    /// When it fires.
     pub cron: CronExpression,
+    /// Attempts each task it creates gets.
     pub max_attempts: MaxAttempts,
+    /// The queue its tasks go to.
     pub queue: QueueName,
+    /// Active or paused.
     pub lifecycle: JobLifecycle,
+    /// The next occurrence to turn into a task.
     pub next_run_at: DateTime<Utc>,
+    /// When it was created.
     pub created_at: DateTime<Utc>,
+    /// When the row last changed.
     pub updated_at: DateTime<Utc>,
 }
 

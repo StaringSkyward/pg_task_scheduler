@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "cron")]
 mod cron;
@@ -9,10 +11,15 @@ pub mod jobs;
 mod models;
 mod pool;
 pub mod queue;
+/// The worker: [`Scheduler`], its builder, and what handlers receive.
 pub mod runtime;
 #[cfg(feature = "cron")]
 mod schema;
 pub mod store;
+
+/// Re-exported from `tokio-util`: [`Scheduler::run_until_shutdown`] takes one, and
+/// [`TaskContext::cancellation`] is one.
+pub use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "cron")]
 pub use crate::cron::CronExpression;

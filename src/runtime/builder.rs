@@ -45,6 +45,8 @@ pub(crate) struct Config {
     pub label: Option<String>,
 }
 
+/// Configures a [`Scheduler`]. Made by [`Scheduler::builder`]; every setting has a
+/// default, and [`build`](Self::build) checks them together.
 pub struct SchedulerBuilder<P: SchedulerPool> {
     pool: P,
     registry: Registry,
@@ -150,6 +152,12 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         Ok(self)
     }
 
+    /// Checks the configuration and makes the scheduler. Fails with
+    /// [`SchedulerError::Config`] if no handler is registered, a duration is over 5 years,
+    /// an interval is zero, `heartbeat_interval` is over a third of `lease_duration`,
+    /// `base_retry_delay` exceeds `max_retry_delay`, or `done` or `dead` retention is
+    /// shorter than the idempotency horizon. Logs a warning for each registered
+    /// [`Task`] whose `QUEUE` this worker does not serve.
     pub fn build(mut self) -> Result<Scheduler<P>, SchedulerError> {
         if self.config.queues.is_empty() {
             self.config.queues.push((QueueName::default(), SIXTEEN));
@@ -219,6 +227,9 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
     }
 }
 
+/// A worker: it claims due tasks for its registered names from the queues it serves,
+/// runs their handlers, and does maintenance. Start it with
+/// [`run_until_shutdown`](Self::run_until_shutdown).
 pub struct Scheduler<P: SchedulerPool> {
     pub(crate) pool: P,
     pub(crate) registry: Registry,
@@ -227,7 +238,7 @@ pub struct Scheduler<P: SchedulerPool> {
 }
 
 impl<P: SchedulerPool> Scheduler<P> {
-    /// A builder with the documented defaults and a fresh UUID worker id (§7.1).
+    /// A builder with the documented defaults and a fresh UUID worker id.
     pub fn builder(pool: P) -> SchedulerBuilder<P> {
         SchedulerBuilder {
             pool,
@@ -254,10 +265,12 @@ impl<P: SchedulerPool> Scheduler<P> {
         }
     }
 
+    /// This worker's id, as stored in `locked_by` and the worker registry.
     pub fn worker_id(&self) -> &WorkerId {
         &self.config.worker_id
     }
 
+    /// A receiver of this worker's health, updated after each claim cycle.
     pub fn health(&self) -> tokio::sync::watch::Receiver<WorkerHealth> {
         self.health_tx.subscribe()
     }
