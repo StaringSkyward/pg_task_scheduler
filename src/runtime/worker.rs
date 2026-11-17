@@ -24,6 +24,7 @@ use crate::error::SchedulerError;
 use crate::error::TaskError;
 use crate::ids::QueueName;
 use crate::ids::TaskName;
+use crate::models::AttemptNo;
 use crate::models::ClaimedTask;
 use crate::models::RetryOutcome;
 use crate::models::TaskLease;
@@ -479,7 +480,7 @@ fn dispatch<P: SchedulerPool>(
         task_key = task.task_key.as_str(),
         task_name = task.task_name.as_str(),
         queue = task.queue.as_str(),
-        attempt_no = task.lease.attempt_no,
+        attempt_no = task.lease.attempt_no.get(),
         worker_id = config.worker_id.as_str(),
         lock_token = task.lease.lock_token.0,
     );
@@ -853,7 +854,7 @@ fn registry_failed(error: &dyn std::fmt::Display) {
 /// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)`, computed exactly for
 /// any `attempt_no`.
 pub(crate) fn retry_delay(
-    attempt_no: i32,
+    attempt_no: AttemptNo,
     base: Duration,
     max: Duration,
     jitter: Duration,
@@ -861,7 +862,7 @@ pub(crate) fn retry_delay(
 ) -> Duration {
     // 2^127 ns exceeds the 5-year duration cap, so clamping the count never changes the
     // capped result; saturation is likewise absorbed by the `max` cap.
-    let doublings = attempt_no.saturating_sub(1).clamp(0, 127).unsigned_abs();
+    let doublings = (attempt_no.get() - 1).min(127);
     let nanos = base.as_nanos().saturating_mul(1u128 << doublings);
     let nanos = nanos.min(max.as_nanos());
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
@@ -875,38 +876,56 @@ mod tests {
     use std::time::Duration;
 
     use super::retry_delay;
+    use crate::AttemptNo;
+
+    fn n(v: u32) -> AttemptNo {
+        AttemptNo::try_from(v).unwrap()
+    }
 
     const BASE: Duration = Duration::from_secs(1);
     const MAX: Duration = Duration::from_secs(300);
 
     #[test]
     fn retry_delay_doubles_from_base() {
-        assert_eq!(retry_delay(1, BASE, MAX, Duration::ZERO, 0), BASE);
-        assert_eq!(retry_delay(3, BASE, MAX, Duration::ZERO, 0), 4 * BASE);
+        assert_eq!(retry_delay(n(1), BASE, MAX, Duration::ZERO, 0), BASE);
+        assert_eq!(retry_delay(n(3), BASE, MAX, Duration::ZERO, 0), 4 * BASE);
+    }
+
+    #[test]
+    fn retry_delay_first_attempt_is_base() {
+        assert_eq!(
+            retry_delay(AttemptNo::FIRST, BASE, MAX, Duration::ZERO, 0),
+            BASE
+        );
     }
 
     #[test]
     fn retry_delay_saturates_at_max() {
-        assert_eq!(retry_delay(i32::MAX, BASE, MAX, Duration::ZERO, 0), MAX);
-        assert_eq!(retry_delay(0, BASE, MAX, Duration::ZERO, 0), BASE);
+        assert_eq!(
+            retry_delay(n(i32::MAX.unsigned_abs()), BASE, MAX, Duration::ZERO, 0),
+            MAX
+        );
     }
 
     #[test]
     fn retry_delay_keeps_doubling_past_attempt_32() {
         let ns = Duration::from_nanos(1);
         assert_eq!(
-            retry_delay(34, ns, MAX, Duration::ZERO, 0),
+            retry_delay(n(34), ns, MAX, Duration::ZERO, 0),
             Duration::from_nanos(1 << 33)
         );
-        assert_eq!(retry_delay(40, ns, MAX, Duration::ZERO, 0), MAX);
-        assert_eq!(retry_delay(i32::MAX, ns, MAX, Duration::ZERO, 0), MAX);
+        assert_eq!(retry_delay(n(40), ns, MAX, Duration::ZERO, 0), MAX);
+        assert_eq!(
+            retry_delay(n(i32::MAX.unsigned_abs()), ns, MAX, Duration::ZERO, 0),
+            MAX
+        );
     }
 
     #[test]
     fn retry_delay_jitter_is_bounded() {
         let jitter = Duration::from_millis(500);
-        let d = retry_delay(1, BASE, MAX, jitter, u64::MAX);
+        let d = retry_delay(n(1), BASE, MAX, jitter, u64::MAX);
         assert!((BASE..=BASE + jitter).contains(&d), "{d:?}");
-        assert_eq!(retry_delay(1, BASE, MAX, jitter, 0), BASE);
+        assert_eq!(retry_delay(n(1), BASE, MAX, jitter, 0), BASE);
     }
 }

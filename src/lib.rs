@@ -50,6 +50,8 @@ pub use crate::jobs::CreateJob;
 #[cfg(feature = "cron")]
 pub use crate::jobs::ScheduleUpdate;
 pub use crate::models::Attempt;
+pub use crate::models::AttemptNo;
+pub use crate::models::AttemptNoError;
 pub use crate::models::AttemptOutcome;
 pub use crate::models::AttemptRun;
 pub use crate::models::AttemptState;

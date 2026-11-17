@@ -530,7 +530,7 @@ fn finished_page(
 // ---- task detail ----
 
 struct AttemptRow {
-    no: i32,
+    no: u32,
     worker: String,
     started: String,
     finished: String,
@@ -623,7 +623,7 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
                     ),
                 };
                 AttemptRow {
-                    no: a.attempt_no,
+                    no: a.attempt_no.get(),
                     worker: a.worker_id.as_str().to_owned(),
                     started: ts(a.started_at),
                     finished,

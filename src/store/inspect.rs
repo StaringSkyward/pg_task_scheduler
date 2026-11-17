@@ -13,6 +13,7 @@ use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::Attempt;
+use crate::models::AttemptNo;
 use crate::models::AttemptState;
 use crate::models::MaxAttempts;
 use crate::models::QueueDepth;
@@ -103,7 +104,8 @@ pub async fn task(
             state: TaskState::from_columns(&r.status, r.locked_by, r.locked_until, r.completed_at)?,
             priority: r.priority,
             due_at: r.due_at,
-            attempts: r.attempts,
+            attempts: u32::try_from(r.attempts)
+                .map_err(|_| SchedulerError::Invariant("stored attempts is negative"))?,
             max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
                 .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
             lock_token: r.lock_token,
@@ -131,7 +133,8 @@ pub async fn attempts(
     .into_iter()
     .map(|r| {
         Ok(Attempt {
-            attempt_no: r.attempt_no,
+            attempt_no: AttemptNo::from_db_i32(r.attempt_no)
+                .map_err(|_| SchedulerError::Invariant("stored attempt_no is not positive"))?,
             lock_token: r.lock_token,
             worker_id: r.worker_id,
             started_at: r.started_at,

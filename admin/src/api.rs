@@ -134,7 +134,7 @@ struct TaskJson {
     task_name: String,
     queue: String,
     status: &'static str,
-    attempts: i32,
+    attempts: u32,
     max_attempts: u32,
     due_at: chrono::DateTime<chrono::Utc>,
     locked_by: Option<String>,

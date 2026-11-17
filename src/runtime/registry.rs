@@ -97,7 +97,7 @@ mod tests {
                 task_id: TaskId(1),
                 worker_id: WorkerId::generate(),
                 lock_token: LockToken(1),
-                attempt_no: 1,
+                attempt_no: crate::AttemptNo::FIRST,
             },
             task_key: TaskKey::try_from("k").unwrap(),
             task_name: TaskName::try_from("t").unwrap(),

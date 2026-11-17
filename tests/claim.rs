@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use common::TestDb;
+use pg_task_scheduler::AttemptNo;
 use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::EnqueueOptions;
@@ -79,7 +80,7 @@ async fn claim_marks_running_and_records_attempt() {
     assert_eq!(claimed.len(), 1);
     let c = &claimed[0];
     assert_eq!(c.lease.task_id, e.id);
-    assert_eq!(c.lease.attempt_no, 1);
+    assert_eq!(c.lease.attempt_no, AttemptNo::FIRST);
     assert_eq!(c.lease.lock_token, LockToken(1));
 
     let t = store::task(&mut conn, e.id).await.unwrap().unwrap();
@@ -97,7 +98,7 @@ async fn claim_marks_running_and_records_attempt() {
 
     let attempts = store::attempts(&mut conn, e.id).await.unwrap();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].attempt_no, 1);
+    assert_eq!(attempts[0].attempt_no, AttemptNo::FIRST);
     assert_eq!(attempts[0].lock_token, LockToken(1));
     assert_eq!(attempts[0].worker_id, worker);
     assert_eq!(attempts[0].state, AttemptState::Open);

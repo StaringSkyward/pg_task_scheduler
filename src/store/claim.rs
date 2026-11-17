@@ -14,6 +14,7 @@ use crate::ids::TaskId;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
+use crate::models::AttemptNo;
 use crate::models::ClaimedTask;
 use crate::models::LeaseDuration;
 use crate::models::MaxAttempts;
@@ -98,16 +99,30 @@ pub async fn claim(
         .await?;
     let mut claimed = Vec::with_capacity(rows.len());
     for r in rows {
-        let lease = TaskLease {
+        let mut lease = TaskLease {
             task_id: r.id,
             worker_id: worker.clone(),
             lock_token: r.lock_token,
-            attempt_no: r.attempts,
+            // Placeholder until parsed below: the dead-letter queries key on (task_id,
+            // lock_token) and never read it.
+            attempt_no: AttemptNo::FIRST,
         };
         // The claim has already committed, so a row that fails conversion must not fail the call:
         // that would strand the whole batch running until its leases expire. `queue_tasks` has no
         // identifier CHECK and JSONB accepts numbers serde_json rejects, so a raw-SQL producer can
         // store such rows. Dead-letter that one row and return the rest.
+        match AttemptNo::from_db_i32(r.attempts) {
+            Ok(n) => lease.attempt_no = n,
+            Err(_) => {
+                dead_letter(
+                    conn,
+                    &lease,
+                    "invalid attempt_no: stored value is not positive",
+                )
+                .await;
+                continue;
+            }
+        }
         let task_key = match TaskKey::try_from(r.task_key) {
             Ok(key) => key,
             Err(e) => {

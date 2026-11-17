@@ -45,7 +45,7 @@ pub struct TaskRow {
     /// Earliest time a worker may claim it.
     pub due_at: DateTime<Utc>,
     /// Attempts counted so far.
-    pub attempts: i32,
+    pub attempts: u32,
     /// Attempts allowed in total.
     pub max_attempts: MaxAttempts,
     /// Message of the latest failure.
@@ -145,7 +145,8 @@ impl TryFrom<Row> for TaskRow {
             state: TaskState::from_columns(&r.status, r.locked_by, r.locked_until, r.completed_at)?,
             priority: r.priority,
             due_at: r.due_at,
-            attempts: r.attempts,
+            attempts: u32::try_from(r.attempts)
+                .map_err(|_| SchedulerError::Invariant("stored attempts is negative"))?,
             max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
                 .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
             last_error: r.last_error,

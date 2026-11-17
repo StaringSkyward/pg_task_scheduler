@@ -303,7 +303,7 @@ pub struct TaskView {
     /// Earliest time a worker may claim it.
     pub due_at: DateTime<Utc>,
     /// Attempts counted so far.
-    pub attempts: i32,
+    pub attempts: u32,
     /// Attempts allowed in total.
     pub max_attempts: MaxAttempts,
     /// Fencing token of the latest claim.
@@ -322,7 +322,7 @@ pub struct TaskView {
 #[derive(Debug, Clone)]
 pub struct Attempt {
     /// 1 for the first attempt.
-    pub attempt_no: i32,
+    pub attempt_no: AttemptNo,
     /// Fencing token of the claim that started it.
     pub lock_token: LockToken,
     /// The worker that ran it.
@@ -346,7 +346,7 @@ pub struct TaskLease {
     /// The claim's fencing token.
     pub lock_token: LockToken,
     /// Which attempt this is, from 1.
-    pub attempt_no: i32,
+    pub attempt_no: AttemptNo,
 }
 
 /// What one `store::reap_expired` pass did.
@@ -525,6 +525,63 @@ impl TryFrom<u32> for MaxAttempts {
         let i = i32::try_from(v).map_err(|_| MaxAttemptsError::TooLarge)?; // v > i32::MAX
         let nz = NonZeroI32::new(i).ok_or(MaxAttemptsError::NonPositive)?; // v == 0
         Ok(MaxAttempts(nz)) // i > 0: v is unsigned and non-zero
+    }
+}
+
+/// Which attempt of a task this is, counted from 1.
+//
+// Private `NonZeroI32` with the invariant `>= 1`, like [`MaxAttempts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptNo(NonZeroI32);
+
+/// Why a value was rejected as an [`AttemptNo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AttemptNoError {
+    /// Zero, or a stored value that is not positive.
+    #[error("attempt_no must be greater than zero")]
+    NonPositive,
+    /// Above `i32::MAX`, the largest value the database column holds.
+    #[error("attempt_no exceeds i32::MAX")]
+    TooLarge,
+}
+
+impl TryFrom<u32> for AttemptNo {
+    type Error = AttemptNoError;
+    fn try_from(v: u32) -> Result<Self, AttemptNoError> {
+        let i = i32::try_from(v).map_err(|_| AttemptNoError::TooLarge)?;
+        NonZeroI32::new(i)
+            .map(AttemptNo)
+            .ok_or(AttemptNoError::NonPositive)
+    }
+}
+
+impl AttemptNo {
+    /// The first attempt.
+    pub const FIRST: AttemptNo = AttemptNo(NonZeroI32::new(1).unwrap());
+
+    /// Read boundary: parse the stored signed number. Rejects `<= 0`.
+    pub(crate) fn from_db_i32(i: i32) -> Result<Self, AttemptNoError> {
+        NonZeroI32::new(i)
+            .filter(|n| n.get() > 0)
+            .map(AttemptNo)
+            .ok_or(AttemptNoError::NonPositive)
+    }
+
+    /// Total: the invariant guarantees `1..=i32::MAX`.
+    #[cfg(test)]
+    pub(crate) fn to_i32(self) -> i32 {
+        self.0.get()
+    }
+
+    /// The attempt number, from 1.
+    pub fn get(self) -> u32 {
+        self.0.get().unsigned_abs()
+    }
+}
+
+impl std::fmt::Display for AttemptNo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
     }
 }
 
@@ -729,6 +786,19 @@ mod max_attempts_tests {
     #[test]
     fn get_returns_u32() {
         assert_eq!(MaxAttempts::try_from(3u32).unwrap().get(), 3);
+    }
+
+    #[test]
+    fn attempt_no_rejects_zero_and_above_i32_max() {
+        use super::AttemptNo;
+        use super::AttemptNoError;
+        assert_eq!(AttemptNo::try_from(0u32), Err(AttemptNoError::NonPositive));
+        assert_eq!(AttemptNo::try_from(u32::MAX), Err(AttemptNoError::TooLarge));
+        assert_eq!(AttemptNo::from_db_i32(0), Err(AttemptNoError::NonPositive));
+        assert_eq!(AttemptNo::from_db_i32(-1), Err(AttemptNoError::NonPositive));
+        assert_eq!(AttemptNo::from_db_i32(2).unwrap().get(), 2);
+        assert_eq!(AttemptNo::FIRST.get(), 1);
+        assert_eq!(AttemptNo::try_from(7u32).unwrap().to_i32(), 7);
     }
 }
 

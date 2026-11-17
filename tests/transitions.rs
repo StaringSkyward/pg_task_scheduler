@@ -9,6 +9,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::deadpool::Object;
+use pg_task_scheduler::AttemptNo;
 use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::ClaimedTask;
 use pg_task_scheduler::EnqueueOptions;
@@ -203,7 +204,7 @@ async fn retry_requeues_with_db_time_delay_then_dies() {
         .await
         .unwrap();
     let c2 = claim_one(&mut conn).await.unwrap();
-    assert_eq!(c2.lease.attempt_no, 2);
+    assert_eq!(c2.lease.attempt_no, AttemptNo::try_from(2u32).unwrap());
     let out = store::retry(&mut conn, &c2.lease, "boom2", Duration::from_secs(2))
         .await
         .unwrap();
@@ -517,7 +518,7 @@ async fn release_requeues_and_refunds_the_attempt() {
     let again = claim_one(&mut conn).await.unwrap();
     assert_eq!(
         (again.lease.attempt_no, again.lease.lock_token),
-        (1, LockToken(2))
+        (AttemptNo::FIRST, LockToken(2))
     );
     db.cleanup().await;
 }

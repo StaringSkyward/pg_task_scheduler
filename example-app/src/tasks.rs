@@ -8,6 +8,7 @@ use diesel::sql_types::Integer;
 use diesel::sql_types::Text;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
+use pg_task_scheduler::AttemptNo;
 use pg_task_scheduler::CommandKey;
 use pg_task_scheduler::EffectName;
 use pg_task_scheduler::OutboxCommand;
@@ -197,7 +198,7 @@ async fn place_order(pool: Pool, ctx: TaskContext, args: OrderArgs) -> Result<()
         .bind::<Integer, _>(args.amount_cents)
         .get_result::<NewOrder>(c)
         .await?;
-        if ctx.lease.attempt_no == 1 {
+        if ctx.lease.attempt_no == AttemptNo::FIRST {
             return Err(PlaceOrderError::Crash);
         }
         let command = OutboxCommand {

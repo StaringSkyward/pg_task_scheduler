@@ -7,6 +7,7 @@ use common::TestDb;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use pg_task_scheduler::AttemptNo;
 use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::ClaimedTask;
 use pg_task_scheduler::EnqueueOptions;
@@ -371,11 +372,11 @@ async fn replayed_task_is_claimable_and_records_new_attempt() {
         .unwrap();
     assert!(replay(&mut conn, c.lease.task_id, "op", "r").await.unwrap());
     let again = claim_one(&mut conn).await.unwrap();
-    assert_eq!(again.lease.attempt_no, 1);
+    assert_eq!(again.lease.attempt_no, AttemptNo::FIRST);
     assert_eq!(again.lease.lock_token, LockToken(3));
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
     assert_eq!(a.len(), 2);
-    assert!(a.iter().all(|x| x.attempt_no == 1));
+    assert!(a.iter().all(|x| x.attempt_no == AttemptNo::FIRST));
     db.cleanup().await;
 }
 
