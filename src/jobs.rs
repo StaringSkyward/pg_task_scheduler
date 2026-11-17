@@ -222,26 +222,26 @@ pub async fn ensure_job(
     conn.transaction::<Job, SchedulerError, _>(async |c| {
         let db_now = fetch_db_now(c).await?;
         let row = new_job(&spec, db_now)?;
-        // A concurrent insert of the same name waits for the other transaction, then
-        // does nothing; the UPDATE below then sees the committed row.
-        let inserted: Option<JobId> = diesel::insert_into(j::scheduler_jobs)
-            .values(&row)
-            .on_conflict(j::name)
-            .do_nothing()
-            .returning(j::id)
-            .get_result(c)
-            .await
-            .optional()?;
-        let id = match inserted {
-            Some(id) => {
-                if spec.lifecycle == JobLifecycle::Paused {
-                    insert_pause(c, id).await?;
+        for _ in 0..3 {
+            // A concurrent insert of the same name waits for the other transaction, then
+            // does nothing; the UPDATE below then sees the committed row.
+            let inserted: Option<JobId> = diesel::insert_into(j::scheduler_jobs)
+                .values(&row)
+                .on_conflict(j::name)
+                .do_nothing()
+                .returning(j::id)
+                .get_result(c)
+                .await
+                .optional()?;
+            let id = match inserted {
+                Some(id) => {
+                    if spec.lifecycle == JobLifecycle::Paused {
+                        insert_pause(c, id).await?;
+                    }
+                    Some(id)
                 }
-                id
-            }
-            // next_run_at and the pause state are deliberately absent from the SET.
-            None => {
-                diesel::update(j::scheduler_jobs.filter(j::name.eq(&row.name)))
+                // next_run_at and the pause state are deliberately absent from the SET.
+                None => diesel::update(j::scheduler_jobs.filter(j::name.eq(&row.name)))
                     .set((
                         j::task_name.eq(&row.task_name),
                         j::cron_expression.eq(&row.cron_expression),
@@ -252,10 +252,16 @@ pub async fn ensure_job(
                     ))
                     .returning(j::id)
                     .get_result(c)
-                    .await?
+                    .await
+                    .optional()?,
+            };
+            // None: a concurrent delete removed the row while the UPDATE waited on its
+            // lock; the next pass re-inserts it.
+            if let Some(id) = id {
+                return reload(c, id).await;
             }
-        };
-        reload(c, id).await
+        }
+        Err(SchedulerError::Database(diesel::result::Error::NotFound))
     })
     .await
 }

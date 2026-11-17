@@ -387,6 +387,34 @@ async fn concurrent_ensure_job_creates_one_job() {
 }
 
 #[tokio::test]
+async fn ensure_job_survives_a_concurrent_delete() {
+    use diesel_async::SimpleAsyncConnection;
+    let db = TestDb::new().await;
+    let mut setup = db.pool.get().await.unwrap();
+    let _ = jobs::create(&mut setup, spec("race", "race", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute("BEGIN; SELECT 1 FROM scheduler_jobs WHERE name = 'race' FOR UPDATE")
+        .await
+        .unwrap();
+    let mut racer = db.pool.get().await.unwrap();
+    let pid = common::backend_pid(&mut racer).await;
+    let handle = tokio::spawn(async move {
+        jobs::ensure_job(&mut racer, spec("race", "race", "*/5 * * * *")).await
+    });
+    db.wait_until_lock_blocked(pid).await;
+    holder
+        .batch_execute("DELETE FROM scheduler_jobs WHERE name = 'race'; COMMIT")
+        .await
+        .unwrap();
+    let job = handle.await.unwrap().unwrap();
+    assert!(jobs::get(&mut setup, job.id).await.unwrap().is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn recreated_schedule_is_not_paused() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
