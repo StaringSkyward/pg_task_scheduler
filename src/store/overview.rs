@@ -433,7 +433,7 @@ async fn no_handler(
         let handled: BTreeSet<&str> = workers
             .iter()
             .filter(|w| !w.lost && w.queues.iter().any(|wq| wq.name.as_str() == queue))
-            .flat_map(|w| w.task_names.iter().map(String::as_str))
+            .flat_map(|w| w.task_names.iter().map(TaskName::as_str))
             .collect();
         let mut task_names: Vec<TaskName> = rows
             .iter()

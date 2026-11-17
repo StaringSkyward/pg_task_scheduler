@@ -233,7 +233,7 @@ over plain HTTP sends the password in the clear on every request.
 ## Database role
 
 Give the UI its own role, so its grants and connection count are visible and
-bounded. The pages read five tables; the actions update tasks, close attempts,
+bounded. The pages read seven tables; the actions update tasks, close attempts,
 write audit rows, and add or remove pauses:
 
 ```sql
@@ -241,7 +241,8 @@ CREATE ROLE pg_task_admin LOGIN PASSWORD '...';
 GRANT USAGE ON SCHEMA public TO pg_task_admin;   -- the schema holding the queue tables
 -- pages
 GRANT SELECT ON queue_tasks, queue_task_attempts, queue_admin_actions,
-                queue_workers, queue_pauses TO pg_task_admin;
+                queue_workers, queue_worker_queues, queue_worker_task_names,
+                queue_pauses TO pg_task_admin;
 -- actions: cancel and replay; cancel closes the attempt; audit rows (bulk updates
 -- their count); pause and resume
 GRANT UPDATE ON queue_tasks TO pg_task_admin;

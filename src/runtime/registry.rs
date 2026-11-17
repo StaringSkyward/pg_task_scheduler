@@ -45,6 +45,11 @@ impl Registry {
             .collect()
     }
 
+    /// The registered task names, as typed values for the worker registry.
+    pub fn task_names(&self) -> Vec<TaskName> {
+        self.handlers.keys().cloned().collect()
+    }
+
     pub fn get(&self, name: &TaskName) -> Option<Handler> {
         self.handlers.get(name).cloned()
     }

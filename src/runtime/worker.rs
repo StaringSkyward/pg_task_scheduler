@@ -23,6 +23,7 @@ use tracing::Instrument;
 use crate::error::SchedulerError;
 use crate::error::TaskError;
 use crate::ids::QueueName;
+use crate::ids::TaskName;
 use crate::models::ClaimedTask;
 use crate::models::RetryOutcome;
 use crate::models::TaskLease;
@@ -110,7 +111,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         let registration = tokio::spawn(keep_registered(
             pool.clone(),
             config.clone(),
-            names.clone(),
+            registry.task_names(),
             queues.clone(),
             health.0.subscribe(),
             background,
@@ -765,7 +766,7 @@ async fn maintenance_pass<P: SchedulerPool>(
 async fn keep_registered<P: SchedulerPool>(
     pool: P,
     config: Arc<Config>,
-    task_names: Vec<String>,
+    task_names: Vec<TaskName>,
     queues: Vec<WorkerQueue>,
     health: watch::Receiver<WorkerHealth>,
     cancel: CancellationToken,

@@ -122,7 +122,12 @@ async fn workers<P: SchedulerPool>(State(state): State<AppState<P>>) -> Response
                     )
                 })
                 .collect(),
-            task_names: w.task_names.join(", "),
+            task_names: w
+                .task_names
+                .iter()
+                .map(TaskName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
         })
         .collect();
     render(

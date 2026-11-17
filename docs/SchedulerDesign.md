@@ -101,7 +101,10 @@ The display-only worker registry: one row per running scheduler, written by the
 worker itself (see [Worker Runtime](#worker-runtime-24)). Nothing in claiming,
 ownership or health reads it.
 `lost_after` is `now() + 3 × registry_interval` at each write, so a reader can
-tell a lost worker without knowing the worker's configuration.
+tell a lost worker without knowing the worker's configuration. The queues a worker
+serves and its task names live in `queue_worker_queues` and
+`queue_worker_task_names`, rewritten at each write; `paused` is read from
+`queue_pauses` when listed.
 
 ### `scheduler_jobs` (`cron` feature)
 

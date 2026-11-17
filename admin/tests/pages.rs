@@ -45,10 +45,11 @@ const DUE_EMAIL: &str = "INSERT INTO queue_tasks (task_key, task_name, queue, du
 /// A worker row serving `queue` (limit 4), seen now and finished a task 5s ago.
 fn worker_sql(queue: &str, lost_after: &str) -> String {
     format!(
-        "INSERT INTO queue_workers (worker_id, label, lost_after, status, queues, task_names) \
-         VALUES ('w1', 'box', {lost_after}, 'healthy', \
-           jsonb_build_array(jsonb_build_object('name', '{queue}', 'limit', 4, 'in_use', 0, \
-             'paused', false, 'last_finished_at', now() - interval '5 seconds')), '{{send}}')"
+        "INSERT INTO queue_workers (worker_id, label, lost_after, status) \
+         VALUES ('w1', 'box', {lost_after}, 'healthy'); \
+         INSERT INTO queue_worker_queues (worker_id, queue, slot_limit, in_use, last_finished_at) \
+         VALUES ('w1', '{queue}', 4, 0, now() - interval '5 seconds'); \
+         INSERT INTO queue_worker_task_names (worker_id, task_name) VALUES ('w1', 'send')"
     )
 }
 
@@ -384,8 +385,8 @@ async fn task_data_is_escaped() {
     .await;
     sql(
         &db,
-        "INSERT INTO queue_workers (worker_id, label, lost_after, status, queues, task_names) \
-         VALUES ('w1', '<u>w</u>', now() + interval '1 minute', 'healthy', '[]', '{}')",
+        "INSERT INTO queue_workers (worker_id, label, lost_after, status) \
+         VALUES ('w1', '<u>w</u>', now() + interval '1 minute', 'healthy')",
     )
     .await;
     for (path, want, raw) in [

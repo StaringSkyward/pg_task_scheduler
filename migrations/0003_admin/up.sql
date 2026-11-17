@@ -52,9 +52,24 @@ CREATE TABLE queue_workers (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     lost_after   TIMESTAMPTZ NOT NULL,
     status       TEXT NOT NULL CHECK (status IN ('starting', 'healthy', 'degraded', 'stopping')),
-    last_error   TEXT,
-    queues       JSONB NOT NULL,
-    task_names   TEXT[] NOT NULL
+    last_error   TEXT
+);
+
+-- One row per queue a worker serves; rewritten at each registry write.
+CREATE TABLE queue_worker_queues (
+    worker_id        TEXT NOT NULL REFERENCES queue_workers (worker_id) ON DELETE CASCADE,
+    queue            TEXT NOT NULL,
+    slot_limit       BIGINT NOT NULL CHECK (slot_limit >= 1),
+    in_use           BIGINT NOT NULL CHECK (in_use >= 0 AND in_use <= slot_limit),
+    last_finished_at TIMESTAMPTZ,
+    PRIMARY KEY (worker_id, queue)
+);
+
+-- One row per task name a worker has a handler for.
+CREATE TABLE queue_worker_task_names (
+    worker_id TEXT NOT NULL REFERENCES queue_workers (worker_id) ON DELETE CASCADE,
+    task_name TEXT NOT NULL,
+    PRIMARY KEY (worker_id, task_name)
 );
 
 -- 5. the failed/cancelled browser lists newest first without a task_name filter. Partial like

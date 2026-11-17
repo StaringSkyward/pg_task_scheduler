@@ -182,7 +182,10 @@ fn registration(queue: &str, names: &[&str]) -> WorkerRegistration {
             in_use: 0,
             finished_ago: None,
         }],
-        task_names: names.iter().map(|s| (*s).to_owned()).collect(),
+        task_names: names
+            .iter()
+            .map(|s| pg_task_scheduler::TaskName::try_from(*s).unwrap())
+            .collect(),
         lost_after: Duration::from_secs(60),
     }
 }
