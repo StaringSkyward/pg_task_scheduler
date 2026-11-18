@@ -160,9 +160,10 @@ const INSERT: &str = r#"
     RETURNING id, status, due_at
 "#;
 
-// `payload = $3` is JSONB equality: key order and whitespace do not matter.
+// Canonical JSONB text: key order and whitespace do not matter, but numeric scale does, so
+// `1` and `1.0` differ (JSONB `=` would equate them, and the handler decodes them apart).
 const EXISTING: &str = r#"
-    SELECT id, status, due_at, (task_name = $2 AND payload = $3) AS same
+    SELECT id, status, due_at, (task_name = $2 AND payload::text = $3::jsonb::text) AS same
     FROM queue_tasks
     WHERE task_key = $1
 "#;
@@ -328,6 +329,8 @@ pub(crate) async fn check_stored<A: serde::Serialize + DeserializeOwned>(
     // Identical JSON decodes identically, so re-serialize only when JSONB changed a number's
     // form, since a `HashSet` re-serializes in another order. `Value` equality tells a `u64`
     // from an `f64`.
+    // `Value` equality treats `-0.0` and `0.0` as equal and JSONB stores `0.0`, so a negative
+    // zero is accepted and the worker decodes `+0.0`.
     // ponytail: args with both, such as a `HashSet` beside an `f64` of 1e18, are still
     // rejected; comparing decoded values would need `PartialEq` on `Task::Args`.
     if stored != *payload && serde_json::to_value(&decoded)? != *payload {

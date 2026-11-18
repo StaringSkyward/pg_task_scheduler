@@ -635,6 +635,23 @@ async fn outbox_payload_key_order_is_not_a_conflict() {
     db.cleanup().await;
 }
 
+/// A receiver decodes `1.0` and `1` differently, so a scale difference is a different command.
+#[tokio::test]
+async fn outbox_payload_scale_difference_is_a_conflict() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    preinsert(&mut conn, "ck", r#"{"n":1}"#).await;
+    let mut command = cmd("e", "ck");
+    command.payload = serde_json::json!({"n": 1.0});
+    let r = store::complete_with_outbox(&mut conn, &c.lease, &command).await;
+    assert!(
+        matches!(r, Err(SchedulerError::OutboxConflict { .. })),
+        "{r:?}"
+    );
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn command_key_collision_across_tasks_fails() {
     let db = TestDb::new().await;

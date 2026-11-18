@@ -405,6 +405,54 @@ async fn enqueue_rejects_args_whose_meaning_changes_in_jsonb() {
     db.cleanup().await;
 }
 
+/// JSONB equality says `1 = 1.0`, but the handler decodes `Count(1)` and `Ratio(1.0)` apart.
+#[tokio::test]
+async fn idempotency_distinguishes_payloads_that_decode_differently() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let k = || key("same");
+    enqueue::<Measure>(&mut conn, k(), Amount::Count(1), EnqueueOptions::default())
+        .await
+        .unwrap();
+    let r = enqueue::<Measure>(
+        &mut conn,
+        k(),
+        Amount::Ratio(1.0),
+        EnqueueOptions::default(),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(SchedulerError::IdempotencyConflict(_))),
+        "{r:?}"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn idempotency_ignores_payload_key_order() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let first = enqueue::<Email>(
+        &mut conn,
+        key("order"),
+        json!({"a": 1, "b": 2}),
+        EnqueueOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(first.inserted);
+    let second = enqueue::<Email>(
+        &mut conn,
+        key("order"),
+        json!({"b": 2, "a": 1}),
+        EnqueueOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!second.inserted);
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn accepted_args_decode_equal_after_storage() {
     use std::num::NonZeroU32;

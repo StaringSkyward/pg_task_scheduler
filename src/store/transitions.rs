@@ -94,7 +94,7 @@ const COMPLETE_WITH_OUTBOX: &str = concat!(
            EXISTS (SELECT 1 FROM outbox_insert) AS inserted_outbox_row,
            EXISTS (SELECT 1 FROM queue_outbox o
                    WHERE o.task_key = completed.task_key AND o.effect_name = $4
-                     AND o.command_key = $5 AND o.topic = $6 AND o.payload = $7) AS same_content
+                     AND o.command_key = $5 AND o.topic = $6 AND o.payload::text = $7::jsonb::text) AS same_content
     FROM completed"
 );
 
