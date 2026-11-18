@@ -551,10 +551,10 @@ recovers it after the lease expires.
   running.
 - Heartbeat is a two-statement transaction: the row lock, then the guarded
   `UPDATE`. The worker's heartbeat sets its timeouts first, so it is three.
-- A typed `enqueue`, and a typed schedule's `create` or `ensure_job`, run one
-  more query first, to check the arguments' stored form.
   Completion, retry, failure and release add the attempt close, so they are
   three.
+- A typed `enqueue`, and a typed schedule's `create` or `ensure_job`, run one
+  more query first, to check the arguments' stored form.
 - The reaper and cleanup loop over bounded batches on a separate task, so a large
   backlog never stalls claiming. A reap batch runs before every cleanup batch, so
   a cleanup backlog never delays lease recovery.
