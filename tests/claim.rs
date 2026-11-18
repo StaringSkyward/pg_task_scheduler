@@ -451,6 +451,16 @@ async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest(
         ))
         .await;
     assert_eq!(dead, 1);
+    // The dead letter can still be opened, with the raw key.
+    let view = store::task(&mut conn, bad).await.unwrap().unwrap();
+    match &view.task_key {
+        pg_task_scheduler::StoredTaskKey::Invalid { text, error } => {
+            assert_eq!(text.len(), 300);
+            assert_eq!(*error, pg_task_scheduler::IdentifierError::TooLong);
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(view.task_key.as_str().len(), 300);
     let attempts = store::attempts(&mut conn, bad).await.unwrap();
     assert_eq!(attempts.len(), 1);
     assert_eq!(common::outcome(&attempts[0]), Some(AttemptOutcome::Dead));

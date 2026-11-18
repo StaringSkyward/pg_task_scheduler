@@ -13,6 +13,7 @@ use axum::routing::post;
 use pg_task_scheduler::JobId;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::StoredTaskKey;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskPayload;
 use pg_task_scheduler::TaskState;
@@ -131,7 +132,7 @@ async fn delete_job<P: SchedulerPool>(
 #[derive(serde::Serialize)]
 struct TaskJson {
     id: i64,
-    task_key: String,
+    task_key: TaskKeyJson,
     task_name: String,
     queue: String,
     status: &'static str,
@@ -153,6 +154,15 @@ enum PayloadJson {
     Unreadable { text: String, error: String },
 }
 
+/// `{"valid": "<key>"}`, or `{"invalid": {"text": ..., "error": ...}}` when the stored key
+/// fails the identifier policy.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskKeyJson {
+    Valid(String),
+    Invalid { text: String, error: String },
+}
+
 impl From<TaskView> for TaskJson {
     fn from(t: TaskView) -> Self {
         let (locked_by, completed_at) = match &t.state {
@@ -167,7 +177,13 @@ impl From<TaskView> for TaskJson {
         TaskJson {
             payload,
             id: t.id.0,
-            task_key: t.task_key.as_str().to_owned(),
+            task_key: match t.task_key {
+                StoredTaskKey::Valid(k) => TaskKeyJson::Valid(k.as_str().to_owned()),
+                StoredTaskKey::Invalid { text, error } => TaskKeyJson::Invalid {
+                    text,
+                    error: error.to_string(),
+                },
+            },
             task_name: t.task_name.as_str().to_owned(),
             queue: t.queue.as_str().to_owned(),
             status: t.state.status().as_str(),

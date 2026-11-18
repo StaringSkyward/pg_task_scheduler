@@ -227,7 +227,9 @@ async fn task_route_returns_view_and_404() {
     assert_eq!(v["status"], "queued");
     assert_eq!(v["attempts"], 0);
     assert!(v["locked_by"].is_null() && v["last_error"].is_null() && v["completed_at"].is_null());
-    assert!(v["task_key"].is_string() && v["due_at"].is_string() && v["max_attempts"].is_i64());
+    assert!(
+        v["task_key"]["valid"].is_string() && v["due_at"].is_string() && v["max_attempts"].is_i64()
+    );
     let (status, _) = send(app.clone(), Method::GET, "/api/tasks/999999".into(), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = send(
@@ -284,6 +286,41 @@ async fn task_route_payload_is_json_or_unreadable() {
     assert!(text.starts_with(r#"{"x": 1000"#), "{text}");
     assert!(!p["unreadable"]["error"].as_str().unwrap().is_empty());
     assert!(v.get("payload_error").is_none());
+    db.cleanup().await;
+}
+
+/// `task_key` is `{"valid": ...}`, or `{"invalid": {"text", "error"}}` for a stored key that
+/// fails the identifier policy; such a dead letter still opens.
+#[tokio::test]
+async fn task_route_task_key_is_valid_or_invalid() {
+    let db = TestDb::new().await;
+    let good = enqueue_one(&db).await;
+    let bad = db
+        .scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name) \
+             VALUES (repeat('x', 300), 'admin-task') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await;
+    let get = |id: i64| send(app(&db), Method::GET, format!("/api/tasks/{id}"), None);
+
+    let (status, body) = get(good.0).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["task_key"]["valid"].is_string(), "{v}");
+
+    let (status, body) = get(bad).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["task_key"]["invalid"]["text"].as_str().unwrap().len(),
+        300
+    );
+    assert!(
+        !v["task_key"]["invalid"]["error"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
     db.cleanup().await;
 }
 

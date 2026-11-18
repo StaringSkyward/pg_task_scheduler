@@ -73,6 +73,7 @@ pub use crate::models::QueueStats;
 pub use crate::models::ReapSummary;
 pub use crate::models::Retention;
 pub use crate::models::RetryOutcome;
+pub use crate::models::StoredTaskKey;
 pub use crate::models::TaskLease;
 pub use crate::models::TaskPayload;
 pub use crate::models::TaskState;

@@ -13,6 +13,7 @@ use crate::cron::CronExpression;
 use crate::error::SchedulerError;
 use crate::ids::CommandKey;
 use crate::ids::EffectName;
+use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
 use crate::ids::JobId;
 use crate::ids::LockToken;
@@ -310,13 +311,45 @@ impl TaskPayload {
     }
 }
 
+/// A stored task key as read back: `queue_tasks.task_key` has no identifier CHECK, so a raw-SQL
+/// producer can store one that [`TaskKey`] rejects, and reading must not fail on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoredTaskKey {
+    /// The key satisfies the identifier policy.
+    Valid(TaskKey),
+    /// The key does not.
+    Invalid {
+        /// The stored text.
+        text: String,
+        /// Why [`TaskKey`] rejected it.
+        error: IdentifierError,
+    },
+}
+
+impl StoredTaskKey {
+    pub(crate) fn from_text(text: String) -> Self {
+        match TaskKey::try_from(text.as_str()) {
+            Ok(k) => StoredTaskKey::Valid(k),
+            Err(error) => StoredTaskKey::Invalid { text, error },
+        }
+    }
+
+    /// The key, or the raw text when it is invalid.
+    pub fn as_str(&self) -> &str {
+        match self {
+            StoredTaskKey::Valid(k) => k.as_str(),
+            StoredTaskKey::Invalid { text, .. } => text,
+        }
+    }
+}
+
 /// Every `queue_tasks` column as a domain type.
 #[derive(Debug, Clone)]
 pub struct TaskView {
     /// Row id.
     pub id: TaskId,
     /// The producer's idempotency key.
-    pub task_key: TaskKey,
+    pub task_key: StoredTaskKey,
     /// Selects the handler.
     pub task_name: TaskName,
     /// The queue it runs in.

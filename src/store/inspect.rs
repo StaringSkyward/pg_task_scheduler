@@ -9,7 +9,6 @@ use crate::error::SchedulerError;
 use crate::ids::LockToken;
 use crate::ids::QueueName;
 use crate::ids::TaskId;
-use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::Attempt;
@@ -18,6 +17,7 @@ use crate::models::AttemptState;
 use crate::models::MaxAttempts;
 use crate::models::QueueDepth;
 use crate::models::QueueStats;
+use crate::models::StoredTaskKey;
 use crate::models::TaskPayload;
 use crate::models::TaskState;
 use crate::models::TaskView;
@@ -28,7 +28,7 @@ struct TaskRow {
     #[diesel(sql_type = sql_types::BigInt)]
     id: TaskId,
     #[diesel(sql_type = sql_types::Text)]
-    task_key: TaskKey,
+    task_key: String,
     #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Text)]
@@ -87,7 +87,7 @@ pub async fn task(
     id: TaskId,
 ) -> Result<Option<TaskView>, SchedulerError> {
     let row = diesel::sql_query(
-        "SELECT id, task_key, task_name, queue, payload::text AS payload, status, priority, due_at, attempts, \
+        "SELECT id, task_key::text AS task_key, task_name, queue, payload::text AS payload, status, priority, due_at, attempts, \
          max_attempts, locked_by, lock_token, locked_until, last_error, created_at, \
          updated_at, completed_at, admin_action_id FROM queue_tasks WHERE id = $1",
     )
@@ -98,7 +98,7 @@ pub async fn task(
     row.map(|r| {
         Ok(TaskView {
             id: r.id,
-            task_key: r.task_key,
+            task_key: StoredTaskKey::from_text(r.task_key),
             task_name: r.task_name,
             queue: r.queue,
             payload: TaskPayload::from_text(r.payload),
