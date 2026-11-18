@@ -368,6 +368,26 @@ async fn names_with_url_characters_round_trip() {
     db.cleanup().await;
 }
 
+/// A dead letter with an invalid key opens, showing the raw key and why it is invalid.
+#[tokio::test]
+async fn task_page_shows_why_a_task_key_is_invalid() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, status, last_error, completed_at) \
+         VALUES (repeat('k', 300), 'n', 'q', 'dead', 'e', now())",
+    )
+    .await;
+    let (status, _, body) = get(app(&db), "/tasks/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&"k".repeat(300)), "{body}");
+    assert!(
+        body.contains("(invalid: identifier must be at most 255 characters)"),
+        "{body}"
+    );
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn task_data_is_escaped() {
     let db = TestDb::new().await;

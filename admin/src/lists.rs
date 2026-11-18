@@ -15,6 +15,7 @@ use pg_task_scheduler::AttemptRun;
 use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::QueueName;
 use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::StoredTaskKey;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::TaskState;
@@ -554,6 +555,7 @@ struct TaskPage {
     refresh: u64,
     t: store::TaskDetail,
     status: &'static str,
+    key: String,
     created: String,
     updated: String,
     due: String,
@@ -600,6 +602,10 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
         base: config.base_path.clone(),
         refresh: config.refresh_seconds,
         status: v.state.status().as_str(),
+        key: match &v.task_key {
+            StoredTaskKey::Valid(k) => k.as_str().to_owned(),
+            StoredTaskKey::Invalid { text, error } => format!("{text} (invalid: {error})"),
+        },
         created: ts(v.created_at),
         updated: ts(v.updated_at),
         due: ts(v.due_at),
