@@ -180,7 +180,6 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         let lease = LeaseDuration::try_from(self.lease_duration)
             .map_err(|e| SchedulerError::Config(e.to_string()))?;
         let c = &self.config;
-        let r = &c.retention;
         let durations = [
             c.heartbeat_interval,
             c.max_poll_interval,
@@ -191,10 +190,8 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             c.crash_retry_delay,
             c.shutdown_timeout,
             c.registry_interval,
-            r.done,
-            r.dead,
-            r.outbox_published,
         ];
+        c.retention.check()?;
         let invalid = if self.registry.is_empty() {
             Some("at least one handler must be registered")
         } else if durations.iter().any(|d| *d > MAX_DURATION) {

@@ -423,6 +423,21 @@ impl Default for Retention {
     }
 }
 
+impl Retention {
+    /// Rejects a retention PostgreSQL cannot subtract from `now()`.
+    pub(crate) fn check(&self) -> Result<(), SchedulerError> {
+        if [self.done, self.dead, self.outbox_published]
+            .iter()
+            .any(|d| *d > MAX_DURATION)
+        {
+            return Err(SchedulerError::Config(
+                "every retention duration must be at most 5 years".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Queued tasks of one queue, name and priority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueDepth {

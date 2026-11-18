@@ -282,6 +282,22 @@ async fn cleanup_deletes_only_eligible_terminal_rows_in_batches() {
 }
 
 #[tokio::test]
+async fn cleanup_rejects_retention_it_cannot_apply_before_deleting() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    insert_terminal(&mut conn, "done-old", "done", "31 days").await;
+    let r = Retention {
+        done: Duration::ZERO,
+        dead: Duration::from_micros(u64::try_from(i64::MAX).unwrap()),
+        ..Default::default()
+    };
+    let err = store::cleanup(&mut conn, &r).await.unwrap_err();
+    assert!(matches!(err, SchedulerError::Config(_)), "{err:?}");
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn cleanup_deletes_published_outbox_rows_only() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();

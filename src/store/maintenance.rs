@@ -124,11 +124,14 @@ pub async fn reap_expired(
 
 /// Delete one bounded batch of expired terminal tasks (`done` first, then `dead`, then `cancelled`, at most
 /// `retention.batch_size` in all) and one of published outbox rows. Call repeatedly until
-/// both counts are below `retention.batch_size`.
+/// both counts are below `retention.batch_size`. Retention over 5 years is rejected with
+/// `Config` before any delete. The batches commit separately, so a database error mid-call
+/// leaves earlier batches committed.
 pub async fn cleanup(
     conn: &mut AsyncPgConnection,
     retention: &Retention,
 ) -> Result<CleanupSummary, SchedulerError> {
+    retention.check()?;
     let batch = retention.batch_size;
     // Convert every interval first so invalid input is rejected before any delete.
     let done_age = pg_interval(retention.done)?;
