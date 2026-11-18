@@ -213,6 +213,47 @@ async fn bounded_heartbeat_gives_up_when_its_lock_wait_exceeds_the_bound() {
     db.cleanup().await;
 }
 
+/// The heartbeat's budget never raises a stricter timeout the host set on the session.
+#[tokio::test]
+async fn bounded_heartbeat_respects_a_stricter_session_timeout() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM queue_tasks WHERE id = {} FOR UPDATE",
+            c.lease.task_id.0
+        ))
+        .await
+        .unwrap();
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute("SET lock_timeout = '30ms'; SET statement_timeout = '30ms'")
+        .await
+        .unwrap();
+    let stop = CancellationToken::new();
+    let beat = store::heartbeat_bounded(
+        &mut conn,
+        &c.lease,
+        common::lease(Duration::from_secs(60)),
+        Duration::from_secs(2),
+        &stop,
+    );
+    let r = tokio::time::timeout(Duration::from_millis(500), beat)
+        .await
+        .expect("the heartbeat waited past the host's stricter timeout");
+    assert!(matches!(r, Err(SchedulerError::Database(_))), "{r:?}");
+    // Errors if either session value changed.
+    conn.batch_execute(
+        "DO $$ BEGIN IF current_setting('lock_timeout') <> '30ms' \
+         OR current_setting('statement_timeout') <> '30ms' \
+         THEN RAISE EXCEPTION 'session timeouts changed'; END IF; END $$",
+    )
+    .await
+    .unwrap();
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    db.cleanup().await;
+}
+
 /// A heartbeat whose dispatch has ended renews nothing.
 #[tokio::test]
 async fn cancelled_heartbeat_does_not_renew() {

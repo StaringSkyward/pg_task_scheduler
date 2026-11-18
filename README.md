@@ -521,9 +521,9 @@ scanning retained rows (see
   Status becomes stopped when `run_until_shutdown` returns or its future is
   dropped.
 - **Timeouts:** set `statement_timeout` and `lock_timeout` on pool connections.
-  Queue statements are short. The worker's heartbeat sets its own
-  transaction-local `lock_timeout` and `statement_timeout`, to the time left on
-  its lease, which override any pool-level value for that transaction.
+  Queue statements are short. The worker's heartbeat bounds its own
+  transaction by the time left on its lease, but never raises a stricter
+  `lock_timeout` or `statement_timeout` the host set.
 - **Connections:** each running scheduler holds one pool connection for
   `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
   finalization, and maintenance. Handlers hold no connection unless they take

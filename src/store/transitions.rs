@@ -50,9 +50,16 @@ const HEARTBEAT: &str = concat!(
 
 // Transaction-local (`is_local`), so both end with the heartbeat's transaction. `lock_timeout`
 // applies to each lock wait, and a statement can wait more than once, so `statement_timeout`
-// bounds each statement as a whole.
-const SET_TIMEOUTS: &str =
-    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)";
+// bounds each statement as a whole. A session value that is non-zero (0 means none) and
+// smaller than `$1` is the host's stricter bound, so it is kept; the session value is still
+// visible here because the override has not run yet.
+const SET_TIMEOUTS: &str = "SELECT \
+     set_config('lock_timeout', CASE WHEN current_setting('lock_timeout')::interval > interval '0' \
+              AND current_setting('lock_timeout')::interval < $1::interval \
+         THEN current_setting('lock_timeout') ELSE $1 END, true), \
+     set_config('statement_timeout', CASE WHEN current_setting('statement_timeout')::interval > interval '0' \
+              AND current_setting('statement_timeout')::interval < $1::interval \
+         THEN current_setting('statement_timeout') ELSE $1 END, true)";
 
 const LOCK_OWNED: &str = concat!("SELECT id FROM queue_tasks ", owned!(), " FOR UPDATE");
 
@@ -269,9 +276,9 @@ pub async fn heartbeat(
     .await
 }
 
-/// [`heartbeat`] for the worker's lease keeper, which spawns it. It sets `lock_timeout` and
-/// `statement_timeout` to `lock_wait` for its transaction, so its row lock statement cannot
-/// wait past the lease, and once it has the lock it renews nothing if `stop` is cancelled:
+/// [`heartbeat`] for the worker's lease keeper, which spawns it. It bounds `lock_timeout` and
+/// `statement_timeout` by `lock_wait` for its transaction, so its row lock statement cannot
+/// wait past the lease, but never raises a stricter non-zero value the host set on the session, and once it has the lock it renews nothing if `stop` is cancelled:
 /// its dispatch has ended. Either way it rolls back; a timeout is the database error, a
 /// cancelled `stop` is `LostOwnership`.
 #[doc(hidden)]
@@ -285,7 +292,7 @@ pub async fn heartbeat_bounded(
     let duration = pg_interval(duration.get())?;
     conn.transaction::<_, SchedulerError, _>(async |c| {
         diesel::sql_query(SET_TIMEOUTS)
-            .bind::<sql_types::Text, _>(lock_timeout(lock_wait))
+            .bind::<sql_types::Text, _>(timeout_budget(lock_wait))
             .execute(c)
             .await?;
         lock_task_row(c, lease).await?;
@@ -297,11 +304,11 @@ pub async fn heartbeat_bounded(
     .await
 }
 
-/// `lock_wait` as a `lock_timeout` and `statement_timeout` value: milliseconds rounded up, at
+/// `lock_wait` as a timeout budget for `lock_timeout` and `statement_timeout`: milliseconds rounded up, at
 /// least 1 because 0 means no timeout, and at most `i32::MAX` (about 24.8 days), the largest
 /// PostgreSQL accepts. A lease longer than that still ends its keeper at the local deadline;
 /// only the spawned heartbeat's waits are capped there.
-fn lock_timeout(lock_wait: Duration) -> String {
+fn timeout_budget(lock_wait: Duration) -> String {
     let ms = i32::try_from(lock_wait.as_micros().div_ceil(1000))
         .unwrap_or(i32::MAX)
         .max(1);
@@ -526,7 +533,7 @@ mod tests {
     use std::time::Duration;
 
     use super::Diagnostic;
-    use super::lock_timeout;
+    use super::timeout_budget;
 
     #[test]
     fn diagnostic_escapes_every_nul() {
@@ -534,11 +541,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_timeout_is_whole_ms_at_least_one_at_most_i32_max() {
-        assert_eq!(lock_timeout(Duration::ZERO), "1ms");
-        assert_eq!(lock_timeout(Duration::from_micros(1)), "1ms");
-        assert_eq!(lock_timeout(Duration::from_micros(1_001)), "2ms");
-        assert_eq!(lock_timeout(Duration::from_millis(100)), "100ms");
-        assert_eq!(lock_timeout(Duration::MAX), "2147483647ms");
+    fn timeout_budget_is_whole_ms_at_least_one_at_most_i32_max() {
+        assert_eq!(timeout_budget(Duration::ZERO), "1ms");
+        assert_eq!(timeout_budget(Duration::from_micros(1)), "1ms");
+        assert_eq!(timeout_budget(Duration::from_micros(1_001)), "2ms");
+        assert_eq!(timeout_budget(Duration::from_millis(100)), "100ms");
+        assert_eq!(timeout_budget(Duration::MAX), "2147483647ms");
     }
 }
