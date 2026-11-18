@@ -214,7 +214,8 @@ pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job
 /// PRESERVES the existing `next_run_at` and pause state. Because the cursor is never
 /// advanced here, ensure-on-startup can never skip a due occurrence, and a redeploy
 /// can never resurrect a job an operator paused (or pause one they resumed). Use
-/// [`reschedule`] to move the cursor explicitly.
+/// [`reschedule`] to move the cursor explicitly. If concurrent deletes of the job keep
+/// invalidating the operation, three passes later it returns [`SchedulerError::Contention`].
 pub async fn ensure_job(
     conn: &mut AsyncPgConnection,
     spec: CreateJob,
@@ -261,7 +262,9 @@ pub async fn ensure_job(
                 return reload(c, id).await;
             }
         }
-        Err(SchedulerError::Database(diesel::result::Error::NotFound))
+        Err(SchedulerError::Contention(
+            "schedule deleted during ensure_job",
+        ))
     })
     .await
 }

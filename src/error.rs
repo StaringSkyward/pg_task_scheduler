@@ -42,6 +42,9 @@ pub enum SchedulerError {
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+    /// Concurrent changes invalidated a bounded retry loop on every pass; retry the call.
+    #[error("concurrent changes kept invalidating the operation: {0}")]
+    Contention(&'static str),
     /// A page cursor cannot advance (its position would overflow).
     #[error("invalid cursor: {0}")]
     InvalidCursor(&'static str),

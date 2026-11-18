@@ -173,7 +173,8 @@ const EXISTING: &str = r#"
 /// returns the existing task; different content is an `IdempotencyConflict`. The queue
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
 /// A key starting with `schedule:` is reserved for the scheduler and returns
-/// [`SchedulerError::ReservedTaskKey`].
+/// [`SchedulerError::ReservedTaskKey`]. If concurrent cleanup keeps deleting the conflicting
+/// task before it can be read, three passes later it returns [`SchedulerError::Contention`].
 pub async fn enqueue<T: Task>(
     conn: &mut AsyncPgConnection,
     key: TaskKey,
@@ -190,43 +191,50 @@ pub async fn enqueue<T: Task>(
     };
     let payload = to_payload(&args)?;
 
-    let inserted = diesel::sql_query(INSERT)
-        .bind::<sql_types::Text, _>(&key)
-        .bind::<sql_types::Text, _>(&name)
-        .bind::<sql_types::Jsonb, _>(&payload)
-        .bind::<sql_types::Integer, _>(options.priority.get())
-        .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(options.due_at)
-        .bind::<sql_types::Integer, _>(options.max_attempts.to_i32())
-        .bind::<sql_types::Text, _>(&queue)
-        .get_results::<EnqueuedRow>(conn)
-        .await?
-        .pop();
-    if let Some(row) = inserted {
-        diesel::sql_query("SELECT pg_notify('queue_available', '')")
-            .execute(conn)
-            .await?;
-        return row.into_enqueued(true);
-    }
+    // The incumbent can be deleted (retention cleanup) between the conflicting insert and
+    // the read-back; the next pass then simply inserts.
+    for _ in 0..3 {
+        let inserted = diesel::sql_query(INSERT)
+            .bind::<sql_types::Text, _>(&key)
+            .bind::<sql_types::Text, _>(&name)
+            .bind::<sql_types::Jsonb, _>(&payload)
+            .bind::<sql_types::Integer, _>(options.priority.get())
+            .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(options.due_at)
+            .bind::<sql_types::Integer, _>(options.max_attempts.to_i32())
+            .bind::<sql_types::Text, _>(&queue)
+            .get_results::<EnqueuedRow>(conn)
+            .await?
+            .pop();
+        if let Some(row) = inserted {
+            diesel::sql_query("SELECT pg_notify('queue_available', '')")
+                .execute(conn)
+                .await?;
+            return row.into_enqueued(true);
+        }
 
-    let existing = diesel::sql_query(EXISTING)
-        .bind::<sql_types::Text, _>(&key)
-        .bind::<sql_types::Text, _>(&name)
-        .bind::<sql_types::Jsonb, _>(&payload)
-        .get_results::<ExistingRow>(conn)
-        .await?
-        .pop()
-        .ok_or(SchedulerError::Invariant(
-            "conflicting task_key not visible",
-        ))?;
-    if !existing.same {
-        return Err(SchedulerError::IdempotencyConflict(key));
+        let existing = diesel::sql_query(EXISTING)
+            .bind::<sql_types::Text, _>(&key)
+            .bind::<sql_types::Text, _>(&name)
+            .bind::<sql_types::Jsonb, _>(&payload)
+            .get_results::<ExistingRow>(conn)
+            .await?
+            .pop();
+        let Some(existing) = existing else {
+            continue;
+        };
+        if !existing.same {
+            return Err(SchedulerError::IdempotencyConflict(key));
+        }
+        return EnqueuedRow {
+            id: existing.id,
+            status: existing.status,
+            due_at: existing.due_at,
+        }
+        .into_enqueued(false);
     }
-    EnqueuedRow {
-        id: existing.id,
-        status: existing.status,
-        due_at: existing.due_at,
-    }
-    .into_enqueued(false)
+    Err(SchedulerError::Contention(
+        "task_key vanished during enqueue",
+    ))
 }
 
 // Administrative replay: dead or cancelled → queued with the same task_key, and lock_token + 1

@@ -346,3 +346,88 @@ async fn enqueue_rejects_a_payload_the_worker_cannot_parse() {
     assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn enqueue_survives_cleanup_deleting_the_incumbent() {
+    use std::num::NonZeroU32;
+
+    use pg_task_scheduler::Retention;
+    use pg_task_scheduler::TaskName;
+    use pg_task_scheduler::WorkerId;
+
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    enqueue::<Email>(
+        &mut conn,
+        key("k"),
+        json!({"a": 1}),
+        EnqueueOptions::immediate(),
+    )
+    .await
+    .unwrap();
+    let claimed = store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &QueueName::default(),
+        &[TaskName::try_from("email").unwrap()],
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    store::complete(&mut conn, &claimed[0].lease).await.unwrap();
+
+    // A statement-level trigger fires even when ON CONFLICT DO NOTHING inserts nothing, so
+    // the second enqueue parks between its conflict and its read-back.
+    db.install(
+        "CREATE FUNCTION barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         PERFORM pg_advisory_lock(4242); PERFORM pg_advisory_unlock(4242); RETURN NULL; END $$; \
+         CREATE TRIGGER barrier AFTER INSERT ON queue_tasks \
+         FOR EACH STATEMENT EXECUTE FUNCTION barrier();",
+    )
+    .await;
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute("SELECT pg_advisory_lock(4242)")
+        .await
+        .unwrap();
+
+    let mut enq_conn = db.pool.get().await.unwrap();
+    let pid = common::backend_pid(&mut enq_conn).await;
+    let handle = tokio::spawn(async move {
+        enqueue::<Email>(
+            &mut enq_conn,
+            key("k"),
+            json!({"a": 1}),
+            EnqueueOptions::immediate(),
+        )
+        .await
+    });
+    db.wait_until_lock_blocked(pid).await;
+
+    let summary = store::cleanup(
+        &mut conn,
+        &Retention {
+            done: Duration::ZERO,
+            ..Retention::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.tasks, 1);
+    holder
+        .batch_execute("SELECT pg_advisory_unlock(4242)")
+        .await
+        .unwrap();
+
+    let e = handle.await.unwrap().unwrap();
+    assert!(e.inserted);
+    assert_eq!(
+        db.scalar(
+            "SELECT count(*) AS n FROM queue_tasks WHERE task_key = 'k' AND status = 'queued'"
+        )
+        .await,
+        1
+    );
+    db.cleanup().await;
+}
