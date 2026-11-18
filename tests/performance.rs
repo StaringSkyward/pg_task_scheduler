@@ -162,9 +162,17 @@ async fn replay_matching_uses_failed_name_index() {
     use diesel::sql_types::Text;
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    conn.batch_execute("SET enable_seqscan = off")
-        .await
-        .unwrap();
+    // With real statistics, the selective task_name wins over the status-only index
+    // (an empty table leaves PostgreSQL 18 choosing the latter).
+    conn.batch_execute(
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         SELECT 'k' || g, CASE WHEN g % 50 = 0 THEN 'a' ELSE 'name' || (g % 50) END, \
+                'dead', now() - g * interval '1 second' \
+         FROM generate_series(1, 5000) g; ANALYZE queue_tasks; \
+         SET enable_seqscan = off",
+    )
+    .await
+    .unwrap();
     let plan = diesel::sql_query(format!(
         "EXPLAIN {}",
         pg_task_scheduler::store::REPLAY_BATCH

@@ -444,6 +444,12 @@ scanning retained rows (see
 
 ## Operations
 
+- **Database TLS:** `AsyncPgConnection::establish` connects without TLS. For a
+  database that requires TLS, build the pool with a TLS-capable connection
+  through `diesel_async::pooled_connection::ManagerConfig::custom_setup`; this
+  crate's pools accept it unchanged. See the
+  [`AsyncPgConnection` documentation](https://docs.rs/diesel-async/latest/diesel_async/struct.AsyncPgConnection.html)
+  for a TLS example.
 - **Reaper:** every worker runs it every `reaper_interval`. Expired leases go
   back to `queued` after `crash_retry_delay`, or to `dead` when no attempts
   remain. Running it on many instances is safe.

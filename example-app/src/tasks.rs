@@ -219,6 +219,12 @@ async fn place_order(pool: Pool, ctx: TaskContext, args: OrderArgs) -> Result<()
         PlaceOrderError::Crash => {
             TaskError::retry("simulated crash after writing the order (demo: fails on purpose)")
         }
+        // A conflicting outbox key or a value that can never encode will fail
+        // the same way every attempt; retrying only burns attempts.
+        e @ (PlaceOrderError::Scheduler(SchedulerError::OutboxConflict { .. })
+        | PlaceOrderError::Identifier(_)
+        | PlaceOrderError::Json(_)) => TaskError::permanent(e.to_string()),
+        // Database and other scheduler errors are transient.
         other => TaskError::retry(other.to_string()),
     })
 }
