@@ -330,9 +330,10 @@ async fn db_contained_handler_survives_heartbeat_while_holding_row_lock() {
     for _ in 0..50 {
         idle = db
             .scalar(
-                "SELECT count(*) AS n FROM pg_stat_activity \
-                 WHERE datname = current_database() AND state = 'idle in transaction' \
-                 AND pid <> pg_backend_pid()",
+                "SELECT count(*) AS n FROM pg_locks l \
+                 JOIN pg_stat_activity a ON a.pid = l.pid \
+                 WHERE a.state = 'idle in transaction' AND a.pid <> pg_backend_pid() \
+                 AND l.relation = 'queue_tasks'::regclass",
             )
             .await;
         if idle == 0 {

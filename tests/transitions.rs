@@ -114,6 +114,15 @@ where
 }
 
 #[tokio::test]
+async fn lock_owned_waiting_on_a_lock_past_expiry_loses_ownership() {
+    lost_after_lock_wait(|mut conn, lease| async move {
+        conn.transaction(async |t| store::lock_owned(t, &lease).await)
+            .await
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn complete_waiting_on_a_lock_past_expiry_loses_ownership() {
     lost_after_lock_wait(|mut conn, lease| async move { store::complete(&mut conn, &lease).await })
         .await;
