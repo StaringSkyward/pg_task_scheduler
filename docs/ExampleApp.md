@@ -258,7 +258,7 @@ entry in [Review decisions](ReviewDecisions.md) that says what changed and why.
   its name doubled as the task name
   ([Review decisions, entry 7](ReviewDecisions.md#7-a-schedule-has-its-own-name-and-a-typed-constructor));
   the pause was an `is_paused` column
-  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-is-in-targeted-sixth-normal-form)).
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 3.6 Workers log their start and clean stop
 

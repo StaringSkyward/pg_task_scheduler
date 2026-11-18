@@ -128,7 +128,7 @@ must be dropped and recreated.
   instead of failing the call
   ([entry 22](#22-claim-dead-letters-any-row-that-fails-conversion)).
 
-### 5. The schema is in targeted sixth normal form
+### 5. The schema puts optional and multi-valued facts in their own relations
 
 - **Finding:** The schema was intentionally wide, with nested relations: a
   worker's queues in a JSONB column and its task names in an array, with no keys
@@ -201,8 +201,8 @@ must be dropped and recreated.
     `schema_checks::attempt_cannot_close_without_an_outcome`,
     `schema_checks::admin_action_shape_is_checked`).
 - **Changed by review 02:** the policy is named 5NF, with optional and
-  multi-valued facts in their own relations, not "targeted sixth normal form",
-  and the approved exceptions now include the `scheduler_jobs` cursor and every
+  multi-valued facts in their own relations, not a form of 6NF, and the
+  approved exceptions now include the `scheduler_jobs` cursor and every
   observed registry value
   ([entry 24](#24-the-schema-is-in-5nf-with-approved-6nf-exceptions)). `due_at`
   and `next_run_at` have `isfinite` CHECKs (entries 22 and 23). The materializer
@@ -701,10 +701,9 @@ must be dropped and recreated.
 - **Source:** user (option a: keep the schema, name the policy honestly, and
   approve each exception explicitly).
 - **Decision:**
-  - [Normal Form](SchedulerDesign.md#normal-form) no longer says "targeted
-    sixth normal form". It names the policy, 5NF with optional facts and
-    multi-valued facts in their own relations, and says plainly that this is
-    not 6NF.
+  - [Normal Form](SchedulerDesign.md#normal-form) no longer uses that name.
+    It names the policy, 5NF with optional facts and multi-valued facts in
+    their own relations, and says plainly that this is not 6NF.
   - Each grouping that 6NF would split is an approved exception, with its
     reason in the design:
     - `queue_tasks` (its state-shape CHECKs);
@@ -721,9 +720,8 @@ must be dropped and recreated.
   write or a hot query needs them. Calling that 6NF overstated it. Naming the
   rule and approving each exception records the choice before the first schema
   is released.
-- **Expected behaviour:** No schema change beyond the two CHECKs. Only this
-  record still uses the old name, as history; entry 5 keeps its title so that
-  links to it still work.
+- **Expected behaviour:** No schema change beyond the two CHECKs. Entry 5's
+  title, which used the old name, was renamed, and its links updated.
 
 ### 25. The materializer runs at READ COMMITTED
 

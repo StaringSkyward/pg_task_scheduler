@@ -92,7 +92,7 @@ changed is updated and says **Changed by review 01**; an entry it replaced says
   `store::workers` and the bounded read APIs.
 - **Changed by review 01:** a registry write is now one transaction of five
   statements, not one upsert
-  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-is-in-targeted-sixth-normal-form)).
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 1.4 The JSON routes moved under `/api/` and take the operator from auth
 
@@ -1054,7 +1054,7 @@ changed is updated and says **Changed by review 01**; an entry it replaced says
   (`registry::reregistering_with_fewer_queues_drops_the_old_ones`).
 - **Changed by review 01:** queues were a JSONB column in configuration order,
   and task names an array
-  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-is-in-targeted-sixth-normal-form)).
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 6.3 `registry_interval`
 
@@ -1104,7 +1104,7 @@ changed is updated and says **Changed by review 01**; an entry it replaced says
   `registry::registry_reports_last_finished_and_paused`).
 - **Changed by review 01:** the upsert used to copy the flag into the row, so a
   pause showed only after the worker's next write
-  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-is-in-targeted-sixth-normal-form)).
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 6.7 Lifecycle: write, refresh, `stopping`, delete, prune
 
