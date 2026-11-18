@@ -5,7 +5,7 @@
 <h2>Task {{ t.task.id.0 }}</h2>
 <div class="scroll">
 <table class="details">
-<tr><th>Key</th><td>{{ key }}</td></tr>
+<tr><th>Key</th><td>{{ key }}{% if let Some(e) = key_error %} <small class="invalid">invalid: {{ e }}</small>{% endif %}</td></tr>
 <tr><th>Name</th><td>{{ t.task.task_name.as_str() }}</td></tr>
 <tr><th>Queue</th><td>{{ t.task.queue.as_str() }}</td></tr>
 <tr><th>Status</th><td>{{ status }}</td></tr>

@@ -382,7 +382,9 @@ async fn task_page_shows_why_a_task_key_is_invalid() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(&"k".repeat(300)), "{body}");
     assert!(
-        body.contains("(invalid: identifier must be at most 255 characters)"),
+        body.contains(
+            r#"<small class="invalid">invalid: identifier must be at most 255 characters</small>"#
+        ),
         "{body}"
     );
     db.cleanup().await;

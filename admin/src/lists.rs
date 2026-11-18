@@ -556,6 +556,7 @@ struct TaskPage {
     t: store::TaskDetail,
     status: &'static str,
     key: String,
+    key_error: Option<String>,
     created: String,
     updated: String,
     due: String,
@@ -590,6 +591,10 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
     };
     let v = &d.task;
     let none = || String::from("—");
+    let (key, key_error) = match &v.task_key {
+        StoredTaskKey::Valid(k) => (k.as_str().to_owned(), None),
+        StoredTaskKey::Invalid { text, error } => (text.clone(), Some(error.to_string())),
+    };
     let (completed, locked_by, locked_until) = match &v.state {
         TaskState::Queued => (none(), none(), none()),
         TaskState::Running {
@@ -602,10 +607,8 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
         base: config.base_path.clone(),
         refresh: config.refresh_seconds,
         status: v.state.status().as_str(),
-        key: match &v.task_key {
-            StoredTaskKey::Valid(k) => k.as_str().to_owned(),
-            StoredTaskKey::Invalid { text, error } => format!("{text} (invalid: {error})"),
-        },
+        key,
+        key_error,
         created: ts(v.created_at),
         updated: ts(v.updated_at),
         due: ts(v.due_at),
