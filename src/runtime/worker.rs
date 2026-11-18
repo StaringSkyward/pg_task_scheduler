@@ -487,6 +487,14 @@ fn dispatch<P: SchedulerPool>(
     async move {
         let _permit = permit;
         let name = task.task_name.as_str().to_owned();
+        // A slow claim response can arrive after the lease it claimed; never start external
+        // work on it. The reaper recovers the task.
+        if Instant::now() >= deadline {
+            metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
+                .increment(1);
+            tracing::warn!("claim arrived after its lease; handler not started");
+            return;
+        }
         // Cancelled when shutdown begins, and by the guard however dispatch ends: lease lost,
         // finished, released, or aborted.
         let cancellation = shutdown.begun.child_token();

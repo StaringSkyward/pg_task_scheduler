@@ -858,3 +858,44 @@ async fn healthy_task_in_a_batch_with_a_bad_payload_runs() {
     run.stop().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn handler_does_not_start_when_the_claim_arrives_after_its_lease() {
+    let db = TestDb::new().await;
+    // The claim's response is delayed past the lease, after the row is leased.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE FUNCTION slow_claim() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN NEW; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER slow_claim AFTER UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'running') EXECUTE FUNCTION slow_claim();",
+        )
+        .await
+        .unwrap();
+    enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(90))
+        .heartbeat_interval(ms(30))
+        .register_task::<Job, _, _>(move |_ctx, _args| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    run.stop().await;
+
+    assert!(!std::sync::atomic::AtomicBool::load(
+        &started,
+        std::sync::atomic::Ordering::SeqCst
+    ));
+    db.cleanup().await;
+}
