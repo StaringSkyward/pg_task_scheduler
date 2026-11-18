@@ -16,9 +16,9 @@ repository), the entry says so. Each entry has a source:
   implementation ledger (`.superpowers/sdd/2026-11-12-example-app/progress.md`).
 - **Ledger note**: behaviour the ledger flagged for documentation.
 
-Review 01 changed some of these entries after they shipped. A changed entry
-says **Changed by review 01** and links to the entry in
-[Review decisions](ReviewDecisions.md) that says what changed and why.
+Reviews 01 and 02 changed some of these entries after they shipped. A changed
+entry says **Changed by review 01** or **Changed by review 02** and links to the
+entry in [Review decisions](ReviewDecisions.md) that says what changed and why.
 
 **Contents**
 
@@ -367,11 +367,16 @@ says **Changed by review 01** and links to the entry in
   documented path. The handler ignores the `OutboxWrite` that
   `complete_with_outbox` returns: `Inserted` and `AlreadyPresent` both mean
   the command is recorded. An `OutboxConflict` (the same effect with different
-  content) would roll the transaction back, and the handler turns it into a
-  retry, like any other error.
+  content) would roll the transaction back, and the handler fails the task
+  permanently, because every retry would conflict the same way. Identifier and
+  JSON errors are permanent for the same reason; database and other scheduler
+  errors are retried.
 - **Changed by review 01:** `complete_with_outbox` returned a `bool`, and the
   outbox fields became the typed `EffectName`, `CommandKey` and `Topic`
   ([Review decisions, entry 6](ReviewDecisions.md#6-a-conflicting-outbox-effect-is-an-error)).
+- **Changed by review 02:** an `OutboxConflict` was retried, like any other
+  error
+  ([Review decisions, entry 32](ReviewDecisions.md#32-ci-checks-the-minimum-rust-and-postgresql-18)).
 - **Ledger note (implementation fact):** `demo_orders` ids have gaps, because
   the rolled-back first-attempt inserts use up identity values. That is visible
   proof of the rollback.

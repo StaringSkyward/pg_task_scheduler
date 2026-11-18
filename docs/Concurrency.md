@@ -27,13 +27,22 @@ AND locked_until > clock_timestamp()  -- hard lease, database time
 
 Heartbeat, completion, completion with outbox, retry, permanent failure, release,
 and the DB-contained `lock_owned` all use this predicate. Each first locks the row
-with `SELECT 1 FROM queue_tasks WHERE id = $1 FOR UPDATE` in its own statement, in
-the same transaction, and only then runs the guarded statement. The order matters:
-after a lock wait PostgreSQL re-evaluates a statement's `WHERE` only if the blocker
-updated the row, so a blocker that merely locked the row would leave the
-`clock_timestamp()` check stale. The separate statement evaluates expiry after the wait. A guarded statement that
-matches zero rows means ownership is lost (`SchedulerError::LostOwnership`). It
-never means success.
+in its own statement, in the same transaction:
+
+```sql
+SELECT id FROM queue_tasks
+WHERE id = $1 AND locked_by = $2 AND lock_token = $3
+FOR UPDATE
+```
+
+Only then does it run the guarded statement. The order matters: after a lock
+wait PostgreSQL re-evaluates a statement's `WHERE` only if the blocker updated
+the row, so a blocker that merely locked the row would leave the
+`clock_timestamp()` check stale. The separate statement evaluates expiry after
+the wait. The lock matches the ownership identity but not the expiry, so a
+stale or fenced worker matches no row at once instead of queueing behind the
+current owner. A guarded statement that matches zero rows means ownership is
+lost (`SchedulerError::LostOwnership`). It never means success.
 
 The lease is **hard**. Once `locked_until` passes, the old worker is stale even if
 no reaper has touched the row yet. It can no longer heartbeat or finalize.
@@ -126,7 +135,10 @@ Because the lease keeper is a separate future, the handler keeps being polled an
 commits, and the heartbeat then sees a `done` row. The lease is checked when the
 transition runs, after it has locked the row. A caller that commits after
 `locked_until` still holds exclusive ownership, because its row lock kept the
-reaper and every other worker away; it does not roll back.
+reaper and every other worker away; it does not roll back. Each heartbeat runs
+on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
+handler finished, or the local deadline passed) the heartbeat still commits or
+rolls back, and never leaves an open transaction holding the row lock.
 
 ## Admin Actions
 
@@ -206,12 +218,20 @@ Fencing protects PostgreSQL state, not remote systems. This is a valid history:
 
 So:
 
-- pass `ctx.task_key` as the remote idempotency key for every once-per-task
-  effect. It is stable across retries and replay.
-- where the remote supports ordered conditional writes, also pass
-  `ctx.lease.lock_token` as a fencing token.
-- without remote idempotency or fencing, duplicate external effects remain
-  possible.
+- a non-idempotent external effect needs deduplication on the receiving side,
+  keyed to the logical effect. Pass `ctx.task_key` as the remote idempotency
+  key, with the effect's name if a task has more than one effect. It is stable
+  across retries and replay.
+- fencing is a different guarantee. Where the remote supports ordered
+  conditional writes, also pass `ctx.lease.lock_token` as a fencing token: a
+  receiver that keeps the highest token it has seen rejects a stale write from
+  an earlier owner. It does not deduplicate. Worker A's call with token 1 and
+  worker B's retry with token 2 both pass the fence.
+- `lock_token` is ordered only within one task row. A `task_key` can be reused
+  once retention has deleted its row, and the new row's tokens start again, so
+  scope a remote fence to the task id (`ctx.lease.task_id`), not to the
+  `task_key`.
+- without remote deduplication, duplicate external effects remain possible.
 
 ## PostgreSQL-Contained Effects and the Outbox
 

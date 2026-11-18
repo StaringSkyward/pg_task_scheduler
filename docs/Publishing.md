@@ -131,10 +131,14 @@ it was a judgement call made during the work, open to change.
   dependencies need at most 1.86 (Diesel). The workspace was checked with 1.88,
   and failed to build with 1.87.
 - **Expected behaviour:** Cargo reports a clear error on an older toolchain.
-  CI's cargo builds, clippy runs and tests use the toolchain pinned in
-  `rust-toolchain.toml` (1.100.0); only the format check uses nightly. No CI
-  job runs on 1.88, so a newer language feature could raise the real minimum
-  without anyone noticing.
+  CI's `msrv` job runs `cargo +1.88 check --workspace --all-features --locked`,
+  so a newer language feature in either crate, or a locked dependency that
+  needs a newer Rust, fails CI. That job only checks: it runs no tests or
+  clippy on 1.88, and does not cover the example app. CI's other cargo builds,
+  clippy runs and tests use the toolchain pinned in `rust-toolchain.toml`
+  (1.100.0), against PostgreSQL 13 and 18; only the format check uses nightly.
+- **Changed by review 02:** no CI job ran on 1.88
+  ([Review decisions, entry 32](ReviewDecisions.md#32-ci-checks-the-minimum-rust-and-postgresql-18)).
 
 ### 11. First release is plain `0.1.0`
 

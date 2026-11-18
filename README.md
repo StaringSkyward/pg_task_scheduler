@@ -32,9 +32,13 @@ workers and the admin UI.
 - **Exactly-once PostgreSQL-contained effects:** business writes and the `done`
   transition can share one transaction.
 - **At-least-once external effects:** a worker can perform a remote effect and
-  crash before recording completion. External effects are effectively
-  exactly-once only when the destination deduplicates by `task_key` (or fences
-  by `lock_token`).
+  crash before recording completion, and the retry performs it again. A
+  non-idempotent effect needs deduplication on the receiving side, keyed to the
+  logical effect (for example by `task_key`). Fencing by `lock_token` does not
+  replace it: it only rejects a stale write from an earlier owner, and a retry
+  carries a newer token, so it passes the fence. Tokens are ordered per task
+  row, and a `task_key` can be reused after retention, so scope a remote fence
+  to the task id.
 - **Best-effort priority:** `FOR UPDATE SKIP LOCKED` can skip a locked
   high-priority task and run a lower one. Priority applies within a queue; use
   queues to isolate work that must not starve.
