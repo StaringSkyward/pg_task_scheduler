@@ -495,6 +495,11 @@ fn dispatch<P: SchedulerPool>(
             tracing::warn!("claim arrived after its lease; handler not started");
             return;
         }
+        // Cancelled when the lease keeper gives up, and by the guard however dispatch ends
+        // (finished, released, or dropped with the scheduler), so a heartbeat still in flight
+        // renews nothing. Not a child of `shutdown.begun`: draining handlers keep their leases.
+        let lease_stop = CancellationToken::new();
+        let _stop_heartbeats = lease_stop.clone().drop_guard();
         // Cancelled when shutdown begins, and by the guard however dispatch ends: lease lost,
         // finished, released, or aborted.
         let cancellation = shutdown.begun.child_token();
@@ -525,8 +530,9 @@ fn dispatch<P: SchedulerPool>(
                     return;
                 }
             },
-            () = keep_lease(&pool, &task.lease, &config, &name, deadline) => {
+            () = keep_lease(&pool, &task.lease, &config, &name, deadline, &lease_stop) => {
                 drop(cancel_on_drop); // cancel now, not after the check below
+                lease_stop.cancel(); // and end any heartbeat still in flight
                 // A DB-contained handler may have committed its own completion while a
                 // heartbeat waited on the row lock, or an operator cancelled the task; the
                 // heartbeat then matches no row. Bounded, so a database outage cannot hold
@@ -560,32 +566,36 @@ fn dispatch<P: SchedulerPool>(
 /// Heartbeat every `heartbeat_interval`; returns only once ownership is lost: a heartbeat
 /// matched no row, or the local deadline (claim send + lease, advanced by each successful
 /// heartbeat) passed. The deadline only gives up early; PostgreSQL decides validity.
+/// `stop` is the dispatch's: a heartbeat spawned before the dispatch ended renews nothing.
 async fn keep_lease<P: SchedulerPool>(
     pool: &P,
     lease: &TaskLease,
     config: &Config,
     name: &str,
     mut deadline: Instant,
+    stop: &CancellationToken,
 ) {
     loop {
         tokio::time::sleep_until((Instant::now() + config.heartbeat_interval).min(deadline)).await;
         let sent = Instant::now();
-        // Spawned so a dropped keep_lease (handler finished, deadline) cannot abandon the
-        // heartbeat's transaction mid-flight holding the row lock: dropping a JoinHandle
-        // does not cancel the task, so it always commits or rolls back.
-        let (pool, lease_c, lease_duration) = (pool.clone(), lease.clone(), config.lease_duration);
-        let handle = tokio::spawn(async move {
-            let mut conn = acquire(&pool).await?;
-            timed(
-                "heartbeat",
-                store::heartbeat(&mut conn, &lease_c, lease_duration),
-            )
-            .await
-        });
+        // A beat started now could not be awaited, and could renew after this keeper is gone.
+        if sent >= deadline {
+            return;
+        }
         let beat = tokio::time::timeout_at(deadline, async {
-            handle
-                .await
-                .map_err(|_| SchedulerError::Invariant("heartbeat task panicked"))?
+            let mut conn = acquire(pool).await?;
+            // Only the transaction is spawned, so a dropped keep_lease (handler finished,
+            // deadline, scheduler dropped) cannot abandon it mid-flight holding the row lock:
+            // dropping a JoinHandle does not cancel the task. Its lock wait ends at the
+            // deadline, and it renews nothing once `stop` fires.
+            let (lease, duration, stop) = (lease.clone(), config.lease_duration, stop.clone());
+            let lock_wait = deadline.saturating_duration_since(Instant::now());
+            tokio::spawn(async move {
+                let query = store::heartbeat_bounded(&mut conn, &lease, duration, lock_wait, &stop);
+                timed("heartbeat", query).await
+            })
+            .await
+            .map_err(|_| SchedulerError::Invariant("heartbeat task panicked"))?
         })
         .await;
         match beat {
@@ -596,9 +606,6 @@ async fn keep_lease<P: SchedulerPool>(
                     .increment(1);
                 tracing::warn!(%error, "heartbeat failed");
             }
-        }
-        if Instant::now() >= deadline {
-            return;
         }
     }
 }

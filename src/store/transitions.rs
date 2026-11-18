@@ -3,10 +3,12 @@ use std::time::Duration;
 use chrono::DateTime;
 use chrono::Utc;
 use diesel::OptionalExtension;
+use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::SchedulerError;
 use crate::ids::LockToken;
@@ -45,6 +47,9 @@ const HEARTBEAT: &str = concat!(
     owned!(),
     " RETURNING locked_until"
 );
+
+// Transaction-local (`is_local`), so it ends with the heartbeat's transaction.
+const SET_LOCK_TIMEOUT: &str = "SELECT set_config('lock_timeout', $1, true)";
 
 const LOCK_OWNED: &str = concat!("SELECT id FROM queue_tasks ", owned!(), " FOR UPDATE");
 
@@ -246,17 +251,64 @@ pub async fn heartbeat(
     let duration = pg_interval(duration.get())?;
     conn.transaction::<_, SchedulerError, _>(async |c| {
         lock_task_row(c, lease).await?;
-        owned_query!(HEARTBEAT, lease)
-            .bind::<sql_types::Interval, _>(duration)
-            .get_result::<HeartbeatRow>(c)
-            .await
-            .map(|r| r.locked_until)
-            .map_err(|e| match e {
-                diesel::result::Error::NotFound => lost(lease),
-                e => e.into(),
-            })
+        extend_lease(c, lease, duration).await
     })
     .await
+}
+
+/// [`heartbeat`] for the worker's lease keeper, which spawns it. It waits at most `lock_wait`
+/// for the row lock, so it cannot wait past the lease, and once it has the lock it renews
+/// nothing if `stop` is cancelled: its dispatch has ended. Either way it rolls back; a lock
+/// timeout is the database error, a cancelled `stop` is `LostOwnership`.
+#[doc(hidden)]
+pub async fn heartbeat_bounded(
+    conn: &mut AsyncPgConnection,
+    lease: &TaskLease,
+    duration: LeaseDuration,
+    lock_wait: Duration,
+    stop: &CancellationToken,
+) -> Result<DateTime<Utc>, SchedulerError> {
+    let duration = pg_interval(duration.get())?;
+    conn.transaction::<_, SchedulerError, _>(async |c| {
+        diesel::sql_query(SET_LOCK_TIMEOUT)
+            .bind::<sql_types::Text, _>(lock_timeout(lock_wait))
+            .execute(c)
+            .await?;
+        lock_task_row(c, lease).await?;
+        if stop.is_cancelled() {
+            return Err(lost(lease));
+        }
+        extend_lease(c, lease, duration).await
+    })
+    .await
+}
+
+/// `lock_wait` as a `lock_timeout` value: whole milliseconds, at least 1 because 0 means no
+/// timeout, and at most `i32::MAX` (about 24.8 days), the largest PostgreSQL accepts. A lease
+/// longer than that still ends its keeper at the local deadline; only the spawned heartbeat's
+/// lock wait is capped there.
+fn lock_timeout(lock_wait: Duration) -> String {
+    let ms = i32::try_from(lock_wait.as_millis())
+        .unwrap_or(i32::MAX)
+        .max(1);
+    format!("{ms}ms")
+}
+
+/// The guarded `HEARTBEAT` update, after `lock_task_row` in the same transaction.
+async fn extend_lease(
+    c: &mut AsyncPgConnection,
+    lease: &TaskLease,
+    duration: PgInterval,
+) -> Result<DateTime<Utc>, SchedulerError> {
+    owned_query!(HEARTBEAT, lease)
+        .bind::<sql_types::Interval, _>(duration)
+        .get_result::<HeartbeatRow>(c)
+        .await
+        .map(|r| r.locked_until)
+        .map_err(|e| match e {
+            diesel::result::Error::NotFound => lost(lease),
+            e => e.into(),
+        })
 }
 
 /// `SELECT ... FOR UPDATE` on the owned row, for DB-contained handlers. Call inside the
@@ -451,4 +503,19 @@ pub async fn lease_status(
                 .map_err(|_| SchedulerError::Invariant("unknown task status"))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::lock_timeout;
+
+    #[test]
+    fn lock_timeout_is_whole_ms_at_least_one_at_most_i32_max() {
+        assert_eq!(lock_timeout(Duration::ZERO), "1ms");
+        assert_eq!(lock_timeout(Duration::from_micros(1_999)), "1ms");
+        assert_eq!(lock_timeout(Duration::from_millis(100)), "100ms");
+        assert_eq!(lock_timeout(Duration::MAX), "2147483647ms");
+    }
 }

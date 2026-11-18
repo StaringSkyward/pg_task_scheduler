@@ -109,6 +109,8 @@ pub use transitions::complete_with_outbox;
 pub use transitions::completed_by;
 pub use transitions::fail_permanently;
 pub use transitions::heartbeat;
+#[doc(hidden)]
+pub use transitions::heartbeat_bounded;
 pub use transitions::lease_status;
 pub use transitions::lock_owned;
 pub use transitions::release;

@@ -11,6 +11,7 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::deadpool::Object;
 use pg_task_scheduler::AttemptNo;
 use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::CancellationToken;
 use pg_task_scheduler::ClaimedTask;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::LockToken;
@@ -172,6 +173,70 @@ async fn complete_marks_done_and_closes_attempt() {
     ));
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
     assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Done));
+    db.cleanup().await;
+}
+
+/// The worker's heartbeat waits at most `lock_wait` for the row lock, so a heartbeat left
+/// behind by a dropped keeper cannot outlast the lease waiting.
+#[tokio::test]
+async fn bounded_heartbeat_gives_up_when_its_lock_wait_exceeds_the_bound() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM queue_tasks WHERE id = {} FOR UPDATE",
+            c.lease.task_id.0
+        ))
+        .await
+        .unwrap();
+    let mut conn = db.pool.get().await.unwrap();
+    let stop = CancellationToken::new();
+    let beat = store::heartbeat_bounded(
+        &mut conn,
+        &c.lease,
+        common::lease(Duration::from_secs(60)),
+        Duration::from_millis(100),
+        &stop,
+    );
+    let r = tokio::time::timeout(Duration::from_secs(1), beat)
+        .await
+        .expect("the heartbeat waited past its lock bound");
+    assert!(
+        matches!(&r, Err(SchedulerError::Database(e)) if e.to_string().contains("lock timeout")),
+        "{r:?}"
+    );
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    db.cleanup().await;
+}
+
+/// A heartbeat whose dispatch has ended renews nothing.
+#[tokio::test]
+async fn cancelled_heartbeat_does_not_renew() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    let stop = CancellationToken::new();
+    stop.cancel();
+    let r = store::heartbeat_bounded(
+        &mut conn,
+        &c.lease,
+        common::lease(Duration::from_secs(120)),
+        Duration::from_secs(1),
+        &stop,
+    )
+    .await;
+    lost(r, &c.lease);
+    let t = store::task(&mut conn, c.lease.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(t.state, TaskState::Running { locked_until, .. } if locked_until == c.locked_until),
+        "{:?} vs claimed {}",
+        t.state,
+        c.locked_until
+    );
     db.cleanup().await;
 }
 

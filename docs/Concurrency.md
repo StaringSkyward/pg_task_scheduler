@@ -139,10 +139,16 @@ transaction, including its commit, must therefore finish within the lease. The
 lease is checked when a transition runs, after it has locked the row. A direct
 store caller that commits after `locked_until` still holds exclusive ownership,
 because its row lock kept the reaper and every other worker away; it does not
-roll back. Each heartbeat runs
+roll back. Each heartbeat's transaction runs
 on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
 handler finished, or the local deadline passed) the heartbeat still commits or
-rolls back, and never leaves an open transaction holding the row lock.
+rolls back, and never leaves an open transaction holding the row lock. The
+spawned heartbeat is bounded by the lease: its `lock_timeout` is the time left
+until the local deadline. Once its dispatch has ended (finished, lease lost,
+released, or dropped with the scheduler future), it renews nothing: after
+taking the row lock it sees the dispatch's token cancelled and rolls back.
+Graceful shutdown does not cancel that token, so handlers keep their leases
+while they drain.
 
 ## Admin Actions
 

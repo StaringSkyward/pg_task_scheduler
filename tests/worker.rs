@@ -29,6 +29,7 @@ use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::TaskView;
 use pg_task_scheduler::WorkerId;
@@ -344,6 +345,72 @@ async fn db_contained_handler_survives_heartbeat_while_holding_row_lock() {
     assert_eq!(idle, 0, "idle-in-transaction backend left behind");
 
     run.stop().await;
+    db.cleanup().await;
+}
+
+async fn locked_until(db: &TestDb, id: TaskId) -> chrono::DateTime<Utc> {
+    let mut conn = db.pool.get().await.unwrap();
+    match store::task(&mut conn, id).await.unwrap().unwrap().state {
+        TaskState::Running { locked_until, .. } => locked_until,
+        other => panic!("task not running: {other:?}"),
+    }
+}
+
+/// Dropping the scheduler future ends its dispatches, so a heartbeat already waiting on the
+/// row lock renews nothing once the lock is free.
+#[tokio::test]
+async fn dropped_scheduler_does_not_renew_a_pending_heartbeat() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(600))
+        .heartbeat_interval(ms(150))
+        .register_task::<Job, _, _>(|_ctx, _args| async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    wait_for(&db, id, TaskStatus::Running, Duration::from_secs(3)).await;
+
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM queue_tasks WHERE id = {} FOR UPDATE",
+            id.0
+        ))
+        .await
+        .unwrap();
+    // This test's schema resolves the regclass, so only its own heartbeat counts.
+    let start = Instant::now();
+    while db
+        .scalar(
+            "SELECT count(*) AS n FROM pg_locks l \
+             JOIN pg_stat_activity a ON a.pid = l.pid \
+             WHERE a.wait_event_type = 'Lock' AND l.relation = 'queue_tasks'::regclass",
+        )
+        .await
+        == 0
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "no heartbeat blocked on the row lock"
+        );
+        tokio::time::sleep(ms(10)).await;
+    }
+
+    run.handle.abort();
+    assert!(run.handle.await.unwrap_err().is_cancelled());
+    let before = locked_until(&db, id).await;
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(
+        locked_until(&db, id).await,
+        before,
+        "a heartbeat renewed the lease after its scheduler was dropped"
+    );
     db.cleanup().await;
 }
 
