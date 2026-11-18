@@ -1460,8 +1460,8 @@ earlier version of this repository must be dropped and recreated.
     `0.0`, so a negative zero is accepted and the worker decodes `+0.0`.
 - **Why:** A producer's success should mean the handler decodes the arguments
   the producer sent. Checking the stored form covers every codec, not just
-  untagged enums, and keeps the JSONB column and the equality idempotency
-  uses.
+  untagged enums, and keeps the JSONB column; idempotency compares the
+  canonical JSONB text, so it stays in step with what the handler decodes.
 - **Expected behaviour:**
   - `enqueue` of `Amount::Ratio(1e18)` is `PayloadNotPreserved` and inserts
     nothing (`enqueue::enqueue_rejects_args_whose_meaning_changes_in_jsonb`).
