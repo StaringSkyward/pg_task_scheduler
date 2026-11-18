@@ -174,7 +174,11 @@ const EXISTING: &str = r#"
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
 /// Arguments that do not serialize to JSON the worker can parse back and decode as
 /// `T::Args` (for example, nested deeper than 128, or an `f64` NaN, which serializes as
-/// `null`) are [`SchedulerError::Serde`], and nothing is written.
+/// `null`) are [`SchedulerError::Serde`], and nothing is written. Arguments that decode as
+/// different values once PostgreSQL stores them as JSONB are
+/// [`SchedulerError::PayloadNotPreserved`], and nothing is written: JSONB normalizes numbers, so
+/// an `f64` of `1e18` reads back as the integer `1000000000000000000`, which an untagged enum
+/// may decode as another variant. That check costs one extra round trip.
 /// A key starting with `schedule:` is reserved for the scheduler and returns
 /// [`SchedulerError::ReservedTaskKey`]. If concurrent cleanup keeps deleting the conflicting
 /// task before it can be read, three passes later it returns [`SchedulerError::Contention`].
@@ -192,7 +196,8 @@ pub async fn enqueue<T: Task>(
         Some(q) => q,
         None => QueueName::try_from(T::QUEUE)?,
     };
-    let payload = task_payload::<T>(&args)?;
+    let payload = to_payload(&args)?;
+    check_stored::<T::Args>(conn, &payload).await?;
 
     // The incumbent can be deleted (retention cleanup) between the conflicting insert and
     // the read-back; the next pass then simply inserts.
@@ -295,10 +300,35 @@ pub(crate) fn to_payload<T: serde::Serialize>(
     Ok(serde_json::from_str(&text)?)
 }
 
-/// [`to_payload`] for task `T`, which also checks that the payload decodes as `T::Args`, as
-/// the worker will decode it.
-pub(crate) fn task_payload<T: Task>(args: &T::Args) -> Result<serde_json::Value, SchedulerError> {
-    let payload = to_payload(args)?;
-    serde_json::from_value::<T::Args>(payload.clone())?;
-    Ok(payload)
+#[derive(diesel::QueryableByName)]
+struct StoredRow {
+    #[diesel(sql_type = sql_types::Text)]
+    stored: String,
+}
+
+/// Check that `payload` decodes as the same `A` once stored as JSONB, as the worker will
+/// decode it. JSONB normalizes numbers, so a value can decode differently (`1e18` reads back
+/// as an integer). A decode failure is [`SchedulerError::Serde`]; a different value is
+/// [`SchedulerError::PayloadNotPreserved`].
+pub(crate) async fn check_stored<A: serde::Serialize + DeserializeOwned>(
+    conn: &mut AsyncPgConnection,
+    payload: &serde_json::Value,
+) -> Result<(), SchedulerError> {
+    let text = diesel::sql_query("SELECT $1::jsonb::text AS stored")
+        .bind::<sql_types::Jsonb, _>(payload)
+        .get_result::<StoredRow>(conn)
+        .await?
+        .stored;
+    // Decoded as the worker does: the text parsed as a `Value`, then as `A`.
+    let stored: serde_json::Value = serde_json::from_str(&text)?;
+    let decoded = serde_json::from_value::<A>(stored.clone())?;
+    // Identical JSON decodes identically, so re-serialize only when JSONB changed a number's
+    // form, since a `HashSet` re-serializes in another order. `Value` equality tells a `u64`
+    // from an `f64`.
+    // ponytail: args with both, such as a `HashSet` beside an `f64` of 1e18, are still
+    // rejected; comparing decoded values would need `PartialEq` on `Task::Args`.
+    if stored != *payload && serde_json::to_value(&decoded)? != *payload {
+        return Err(SchedulerError::PayloadNotPreserved);
+    }
+    Ok(())
 }

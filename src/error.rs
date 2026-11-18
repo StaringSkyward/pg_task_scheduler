@@ -48,6 +48,10 @@ pub enum SchedulerError {
     /// A page cursor cannot advance (its position would overflow).
     #[error("invalid cursor: {0}")]
     InvalidCursor(&'static str),
+    /// A typed producer's arguments decode to different values once PostgreSQL stores them as
+    /// JSONB, which normalizes numbers (`1e18` reads back as an integer). Nothing is written.
+    #[error("task arguments change meaning when stored as JSONB")]
+    PayloadNotPreserved,
     /// The same `task_key` was enqueued with a different task name or payload.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),

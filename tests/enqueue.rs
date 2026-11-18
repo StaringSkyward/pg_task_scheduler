@@ -373,6 +373,117 @@ async fn enqueue_rejects_args_that_do_not_round_trip() {
     db.cleanup().await;
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum Amount {
+    Count(u64),
+    Ratio(f64),
+}
+struct Measure;
+impl Task for Measure {
+    const NAME: &'static str = "measure";
+    type Args = Amount;
+}
+
+/// JSONB stores `1e18` as `1000000000000000000`, which the untagged enum decodes as `Count`.
+#[tokio::test]
+async fn enqueue_rejects_args_whose_meaning_changes_in_jsonb() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let r = enqueue::<Measure>(
+        &mut conn,
+        key("ratio"),
+        Amount::Ratio(1e18),
+        EnqueueOptions::default(),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(SchedulerError::PayloadNotPreserved)),
+        "{r:?}"
+    );
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn accepted_args_decode_equal_after_storage() {
+    use std::num::NonZeroU32;
+
+    use pg_task_scheduler::TaskName;
+    use pg_task_scheduler::WorkerId;
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct Big {
+        x: f64,
+    }
+    struct Gauge;
+    impl Task for Gauge {
+        const NAME: &'static str = "gauge";
+        type Args = Big;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    enqueue::<Gauge>(
+        &mut conn,
+        key("big"),
+        Big { x: 1e18 },
+        EnqueueOptions::default(),
+    )
+    .await
+    .unwrap();
+    enqueue::<Measure>(
+        &mut conn,
+        key("count"),
+        Amount::Count(5),
+        EnqueueOptions::default(),
+    )
+    .await
+    .unwrap();
+    let mut claimed = store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &QueueName::default(),
+        &[
+            TaskName::try_from("gauge").unwrap(),
+            TaskName::try_from("measure").unwrap(),
+        ],
+        NonZeroU32::new(2).unwrap(),
+        common::lease(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    claimed.sort_by(|a, b| a.task_name.as_str().cmp(b.task_name.as_str()));
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(
+        serde_json::from_value::<Big>(claimed[0].payload.clone()).unwrap(),
+        Big { x: 1e18 }
+    );
+    assert_eq!(
+        serde_json::from_value::<Amount>(claimed[1].payload.clone()).unwrap(),
+        Amount::Count(5)
+    );
+    db.cleanup().await;
+}
+
+/// A fresh `HashSet` serializes in another order, so the check must not re-serialize JSON that
+/// JSONB left unchanged.
+#[tokio::test]
+async fn enqueue_accepts_args_that_reserialize_in_another_order() {
+    use std::collections::HashSet;
+
+    struct Tags;
+    impl Task for Tags {
+        const NAME: &'static str = "tags";
+        type Args = HashSet<String>;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let tags: HashSet<String> = (0..20).map(|i| format!("t{i}")).collect();
+    let r = enqueue::<Tags>(&mut conn, key("tags"), tags, EnqueueOptions::default()).await;
+    assert!(r.is_ok(), "{r:?}");
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn enqueue_survives_cleanup_deleting_the_incumbent() {
     use std::num::NonZeroU32;

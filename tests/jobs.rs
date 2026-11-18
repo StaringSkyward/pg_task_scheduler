@@ -482,3 +482,45 @@ fn for_task_rejects_args_that_do_not_round_trip() {
     );
     assert!(matches!(r, Err(SchedulerError::Serde(_))));
 }
+
+#[tokio::test]
+async fn for_task_rejects_args_whose_meaning_changes_in_jsonb() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(untagged)]
+    enum Amount {
+        Count(u64),
+        Ratio(f64),
+    }
+    struct Measure;
+    impl Task for Measure {
+        const NAME: &'static str = "measure";
+        type Args = Amount;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let spec = || {
+        CreateJob::for_task::<Measure>(
+            ScheduleName::try_from("ratio").unwrap(),
+            CronExpression::parse("* * * * *").unwrap(),
+            MaxAttempts::try_from(3u32).unwrap(),
+            JobLifecycle::Active,
+            Amount::Ratio(1e18),
+        )
+        .unwrap()
+    };
+    let created = jobs::create(&mut conn, spec()).await;
+    assert!(
+        matches!(created, Err(SchedulerError::PayloadNotPreserved)),
+        "{created:?}"
+    );
+    let ensured = jobs::ensure_job(&mut conn, spec()).await;
+    assert!(
+        matches!(ensured, Err(SchedulerError::PayloadNotPreserved)),
+        "{ensured:?}"
+    );
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM scheduler_jobs").await,
+        0
+    );
+    db.cleanup().await;
+}

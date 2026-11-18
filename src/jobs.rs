@@ -22,6 +22,8 @@ use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use futures::future::BoxFuture;
+use serde::de::DeserializeOwned;
 
 use crate::cron::CronExpression;
 use crate::error::SchedulerError;
@@ -48,6 +50,21 @@ pub struct CreateJob {
     max_attempts: MaxAttempts,
     lifecycle: JobLifecycle,
     queue: QueueName,
+    /// `check_stored::<T::Args>` from [`CreateJob::for_task`]; `None` for the untyped `new`.
+    stored_check: Option<StoredCheck>,
+}
+
+/// [`crate::queue::check_stored`] for one argument type, as a plain function pointer.
+type StoredCheck = for<'a> fn(
+    &'a mut AsyncPgConnection,
+    &'a serde_json::Value,
+) -> BoxFuture<'a, Result<(), SchedulerError>>;
+
+fn stored_check<'a, A: serde::Serialize + DeserializeOwned + 'static>(
+    conn: &'a mut AsyncPgConnection,
+    payload: &'a serde_json::Value,
+) -> BoxFuture<'a, Result<(), SchedulerError>> {
+    Box::pin(crate::queue::check_stored::<A>(conn, payload))
 }
 
 impl CreateJob {
@@ -55,7 +72,9 @@ impl CreateJob {
     /// `T::QUEUE`. The preferred constructor: the task name, queue and argument type
     /// all come from `T`. Fails if `T::NAME` or `T::QUEUE` is not a valid identifier,
     /// or `args` does not serialize to JSON the worker can parse back and decode as
-    /// `T::Args`.
+    /// `T::Args`. [`create`] and [`ensure_job`] also return
+    /// [`SchedulerError::PayloadNotPreserved`], writing nothing, if `args` decode as different
+    /// values once stored as JSONB, as `enqueue` does.
     pub fn for_task<T: Task>(
         name: ScheduleName,
         cron: CronExpression,
@@ -63,6 +82,9 @@ impl CreateJob {
         lifecycle: JobLifecycle,
         args: T::Args,
     ) -> Result<Self, SchedulerError> {
+        let payload = crate::queue::to_payload(&args)?;
+        // Fails here on what never decodes (an `f64` NaN serializes as `null`).
+        serde_json::from_value::<T::Args>(payload.clone())?;
         Ok(CreateJob {
             name,
             task_name: TaskName::try_from(T::NAME)?,
@@ -70,7 +92,8 @@ impl CreateJob {
             max_attempts,
             lifecycle,
             queue: QueueName::try_from(T::QUEUE)?,
-            args: crate::queue::task_payload::<T>(&args)?,
+            args: payload,
+            stored_check: Some(stored_check::<T::Args>),
         })
     }
 
@@ -98,6 +121,7 @@ impl CreateJob {
             lifecycle,
             queue: QueueName::default(),
             args: crate::queue::to_payload(&args)?, // SchedulerError::Serde on failure
+            stored_check: None,
         })
     }
 
@@ -201,6 +225,9 @@ async fn insert_pause(conn: &mut AsyncPgConnection, id: JobId) -> Result<(), Sch
 /// Strict insert: errors if a job with this name already exists. The initial
 /// cursor is computed from the DB clock; a `Paused` spec also gets its pause row.
 pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job, SchedulerError> {
+    if let Some(check) = spec.stored_check {
+        check(conn, &spec.args).await?;
+    }
     conn.transaction::<Job, SchedulerError, _>(async |c| {
         let db_now = fetch_db_now(c).await?;
         let id: JobId = diesel::insert_into(j::scheduler_jobs)
@@ -228,6 +255,9 @@ pub async fn ensure_job(
     conn: &mut AsyncPgConnection,
     spec: CreateJob,
 ) -> Result<Job, SchedulerError> {
+    if let Some(check) = spec.stored_check {
+        check(conn, &spec.args).await?;
+    }
     conn.transaction::<Job, SchedulerError, _>(async |c| {
         let db_now = fetch_db_now(c).await?;
         let row = new_job(&spec, db_now)?;
