@@ -13,6 +13,7 @@ use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
+use pg_task_scheduler::TaskPayload;
 use pg_task_scheduler::jobs::CreateJob;
 use pg_task_scheduler::jobs::ScheduleUpdate;
 use pg_task_scheduler::jobs::{self};
@@ -43,7 +44,7 @@ async fn materializes_missed_slot_and_advances() {
     assert_eq!(task.task_key.as_str(), occurrence_key(job, old_next_run_at));
     assert_eq!(task.task_name.as_str(), "j");
     assert_eq!(task.due_at, old_next_run_at);
-    assert_eq!(task.payload, serde_json::json!({}));
+    assert_eq!(task.payload, TaskPayload::Json(serde_json::json!({})));
     assert_eq!(task.max_attempts.get(), 3);
     assert!(db.job_next_run_at(job).await > Utc::now());
     // second pass: next_run_at now future → nothing
@@ -133,7 +134,10 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
         task.task_key.as_str(),
         occurrence_key(job.id.0, db_time(&due))
     );
-    assert_eq!(task.payload["version"], 1);
+    let TaskPayload::Json(p) = &task.payload else {
+        panic!("unreadable")
+    };
+    assert_eq!(p["version"], 1);
     db.cleanup().await;
 }
 

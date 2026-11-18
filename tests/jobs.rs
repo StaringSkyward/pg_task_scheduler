@@ -429,3 +429,17 @@ async fn recreated_schedule_is_not_paused() {
     assert_eq!(fresh.lifecycle, JobLifecycle::Active);
     db.cleanup().await;
 }
+
+#[test]
+fn create_job_rejects_a_payload_the_worker_cannot_parse() {
+    let deep = (0..140).fold(serde_json::json!([]), |v, _| serde_json::json!([v]));
+    let r = CreateJob::new(
+        ScheduleName::try_from("deep").unwrap(),
+        TaskName::try_from("report").unwrap(),
+        CronExpression::parse("* * * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        deep,
+    );
+    assert!(matches!(r, Err(SchedulerError::Serde(_))));
+}

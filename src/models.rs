@@ -283,6 +283,33 @@ pub enum OutboxWrite {
     AlreadyPresent,
 }
 
+/// A stored payload as read back: PostgreSQL accepts JSONB that `serde_json`
+/// cannot parse (for example `1e500`), so reading must not fail on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskPayload {
+    /// The payload parsed.
+    Json(serde_json::Value),
+    /// The payload did not parse.
+    Unreadable {
+        /// The stored text, as PostgreSQL prints it.
+        text: String,
+        /// Why `serde_json` rejected it.
+        error: String,
+    },
+}
+
+impl TaskPayload {
+    pub(crate) fn from_text(text: String) -> Self {
+        match serde_json::from_str(&text) {
+            Ok(v) => TaskPayload::Json(v),
+            Err(e) => TaskPayload::Unreadable {
+                error: e.to_string(),
+                text,
+            },
+        }
+    }
+}
+
 /// Every `queue_tasks` column as a domain type.
 #[derive(Debug, Clone)]
 pub struct TaskView {
@@ -294,8 +321,8 @@ pub struct TaskView {
     pub task_name: TaskName,
     /// The queue it runs in.
     pub queue: QueueName,
-    /// The task's arguments as JSON.
-    pub payload: serde_json::Value,
+    /// The task's arguments, or the raw text when it does not parse.
+    pub payload: TaskPayload,
     /// Lifecycle state, with the lease while running and the completion time once finished.
     pub state: TaskState,
     /// Higher is claimed first, within its queue.

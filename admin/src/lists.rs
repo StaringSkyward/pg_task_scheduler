@@ -606,7 +606,7 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
         completed,
         locked_by,
         locked_until,
-        payload: serde_json::to_string_pretty(&v.payload).unwrap_or_default(),
+        payload: payload_text(&v.payload),
         attempts: d
             .attempts
             .iter()
@@ -647,4 +647,14 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
         t: d,
     };
     render(page, StatusCode::OK)
+}
+
+/// Pretty JSON, or the raw text followed by why it does not parse.
+fn payload_text(p: &pg_task_scheduler::TaskPayload) -> String {
+    match p {
+        pg_task_scheduler::TaskPayload::Json(v) => format!("{v:#}"),
+        pg_task_scheduler::TaskPayload::Unreadable { text, error } => {
+            format!("{text}\n\nUnreadable payload: {error}")
+        }
+    }
 }

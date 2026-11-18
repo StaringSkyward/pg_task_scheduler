@@ -89,7 +89,7 @@ impl CreateJob {
             max_attempts,
             lifecycle,
             queue: QueueName::default(),
-            args: serde_json::to_value(args)?, // SchedulerError::Serde on failure
+            args: crate::queue::to_payload(&args)?, // SchedulerError::Serde on failure
         })
     }
 

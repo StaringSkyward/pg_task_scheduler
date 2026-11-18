@@ -14,6 +14,7 @@ use pg_task_scheduler::JobId;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskPayload;
 use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskView;
 #[cfg(feature = "cron")]
@@ -134,6 +135,10 @@ struct TaskJson {
     task_name: String,
     queue: String,
     status: &'static str,
+    /// The JSON value, or the raw text as a string when unreadable.
+    payload: serde_json::Value,
+    /// `None` when the payload parses.
+    payload_error: Option<String>,
     attempts: u32,
     max_attempts: u32,
     due_at: chrono::DateTime<chrono::Utc>,
@@ -149,7 +154,15 @@ impl From<TaskView> for TaskJson {
             TaskState::Running { locked_by, .. } => (Some(locked_by.as_str().to_owned()), None),
             TaskState::Finished { completed_at, .. } => (None, Some(*completed_at)),
         };
+        let (payload, payload_error) = match t.payload {
+            TaskPayload::Json(v) => (v, None),
+            TaskPayload::Unreadable { text, error } => {
+                (serde_json::Value::String(text), Some(error))
+            }
+        };
         TaskJson {
+            payload,
+            payload_error,
             id: t.id.0,
             task_key: t.task_key.as_str().to_owned(),
             task_name: t.task_name.as_str().to_owned(),

@@ -326,3 +326,23 @@ async fn enqueue_rejects_the_schedule_prefix() {
     assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
     db.cleanup().await;
 }
+
+fn too_deep() -> serde_json::Value {
+    (0..140).fold(json!([]), |v, _| json!([v]))
+}
+
+#[tokio::test]
+async fn enqueue_rejects_a_payload_the_worker_cannot_parse() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let r = enqueue::<Email>(
+        &mut conn,
+        key("deep"),
+        too_deep(),
+        EnqueueOptions::default(),
+    )
+    .await;
+    assert!(matches!(r, Err(SchedulerError::Serde(_))), "{r:?}");
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
+    db.cleanup().await;
+}

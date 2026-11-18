@@ -18,6 +18,7 @@ use crate::models::AttemptState;
 use crate::models::MaxAttempts;
 use crate::models::QueueDepth;
 use crate::models::QueueStats;
+use crate::models::TaskPayload;
 use crate::models::TaskState;
 use crate::models::TaskView;
 use crate::models::interval_to_duration;
@@ -32,8 +33,8 @@ struct TaskRow {
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Text)]
     queue: QueueName,
-    #[diesel(sql_type = sql_types::Jsonb)]
-    payload: serde_json::Value,
+    #[diesel(sql_type = sql_types::Text)]
+    payload: String,
     #[diesel(sql_type = sql_types::Text)]
     status: String,
     #[diesel(sql_type = sql_types::Integer)]
@@ -86,7 +87,7 @@ pub async fn task(
     id: TaskId,
 ) -> Result<Option<TaskView>, SchedulerError> {
     let row = diesel::sql_query(
-        "SELECT id, task_key, task_name, queue, payload, status, priority, due_at, attempts, \
+        "SELECT id, task_key, task_name, queue, payload::text AS payload, status, priority, due_at, attempts, \
          max_attempts, locked_by, lock_token, locked_until, last_error, created_at, \
          updated_at, completed_at, admin_action_id FROM queue_tasks WHERE id = $1",
     )
@@ -100,7 +101,7 @@ pub async fn task(
             task_key: r.task_key,
             task_name: r.task_name,
             queue: r.queue,
-            payload: r.payload,
+            payload: TaskPayload::from_text(r.payload),
             state: TaskState::from_columns(&r.status, r.locked_by, r.locked_until, r.completed_at)?,
             priority: r.priority,
             due_at: r.due_at,

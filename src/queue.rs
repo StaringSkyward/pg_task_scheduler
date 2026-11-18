@@ -188,7 +188,7 @@ pub async fn enqueue<T: Task>(
         Some(q) => q,
         None => QueueName::try_from(T::QUEUE)?,
     };
-    let payload = serde_json::to_value(args)?;
+    let payload = to_payload(&args)?;
 
     let inserted = diesel::sql_query(INSERT)
         .bind::<sql_types::Text, _>(&key)
@@ -272,4 +272,14 @@ pub async fn replay(
             .await?;
     }
     Ok(n == 1)
+}
+
+/// Serialize `args` to the JSON the worker will later parse. `serde_json::to_value`
+/// has no nesting limit but `from_str` (used when claiming) does, so a value is
+/// accepted only if its text parses back.
+pub(crate) fn to_payload<T: serde::Serialize>(
+    args: &T,
+) -> Result<serde_json::Value, SchedulerError> {
+    let text = serde_json::to_string(args)?;
+    Ok(serde_json::from_str(&text)?)
 }

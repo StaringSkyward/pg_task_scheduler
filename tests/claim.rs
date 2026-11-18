@@ -16,6 +16,7 @@ use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
 use pg_task_scheduler::TaskName;
+use pg_task_scheduler::TaskPayload;
 use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::WorkerId;
@@ -493,7 +494,7 @@ async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_r
     assert_eq!(claimed[0].lease.task_id, good);
     let t = store::task(&mut conn, good).await.unwrap().unwrap();
     assert_eq!(t.state.status(), TaskStatus::Running);
-    // `store::task` cannot decode the bad payload, so check the row in SQL.
+    // Check the dead letter in SQL.
     let dead = db
         .scalar(&format!(
             "SELECT count(*) AS n FROM queue_tasks WHERE id = {} AND status = 'dead' \
@@ -505,5 +506,37 @@ async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_r
     let attempts = store::attempts(&mut conn, bad).await.unwrap();
     assert_eq!(attempts.len(), 1);
     assert_eq!(common::outcome(&attempts[0]), Some(AttemptOutcome::Dead));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn task_with_an_unparseable_payload_is_still_readable() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let bad = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'email', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &default_queue(),
+        &names(),
+        one(),
+        lease(),
+    )
+    .await
+    .unwrap();
+    let view = store::task(&mut conn, bad).await.unwrap().unwrap();
+    assert_eq!(view.state.status(), TaskStatus::Dead);
+    let TaskPayload::Unreadable { text, error } = view.payload else {
+        panic!("expected unreadable");
+    };
+    // PostgreSQL prints the numeric expanded, not as `1e500`.
+    assert!(text.starts_with(r#"{"x": 1000"#), "{text}");
+    assert!(!error.is_empty());
     db.cleanup().await;
 }
