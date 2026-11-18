@@ -1,25 +1,27 @@
 # Review Decisions and Expected Behaviour
 
-This records what was decided about each finding of the two whole-repository
-reviews made before the first release, and what each decision looks like from
-outside. The reviews themselves are kept out of the repository, so each entry
-restates its finding.
+This records what was decided about each finding of the three
+whole-repository reviews made before the first release, and what each decision
+looks like from outside. The reviews themselves are kept out of the repository,
+so each entry restates its finding.
 
 - **Review 01** was run at `ee353a0` and triaged against `cade0a5`. Entries
   1–16 follow its findings in order; entries 17–20 cut across them.
 - **Review 02** was run at `8cc77e3`, the head of PR #9. Entries 21–32 follow
   its findings 1–12 in order; entry 33 cuts across them.
+- **Review 03** was run at `1390560`, the head of PR #9. Entries 34–42 follow
+  its findings 1–9 in order.
 
 It describes the code as shipped. Each entry has a source: **(user)** means the
 user decided it; **(call)** means it was a judgement call, open to change.
 **Ruling** marks a call made during implementation, recorded in the entry it
-affects. Where review 02 changed a review 01 entry, that entry ends with a
-**Changed by review 02** line that says what is different now and links to the
-review 02 entry.
+affects. Where a later review changed an entry, that entry ends with a
+**Changed by review 02** or **Changed by review 03** line that says what is
+different now and links to the later entry.
 
-**Existing databases:** the migrations were edited in place, in both reviews
-(entries 17 and 33). A database built by an earlier version of this repository
-must be dropped and recreated.
+**Existing databases:** the migrations were edited in place, in reviews 01 and
+02 (entries 17 and 33); review 03 changed none. A database built by an earlier
+version of this repository must be dropped and recreated.
 
 ## Review 01: findings
 
@@ -92,6 +94,9 @@ must be dropped and recreated.
     bypass.
   - `build()` no longer has a horizon rule; it still rejects any duration over
     5 years.
+- **Changed by review 03:** `store::cleanup` applies the same 5-year cap before
+  its first delete, so a retention it cannot apply deletes nothing
+  ([entry 39](#39-cleanup-checks-retention-before-its-first-delete)).
 
 ### 4. Identifiers are checked when read from the database
 
@@ -539,6 +544,9 @@ must be dropped and recreated.
   `cron_expression` and `is_paused` (`api::list_jobs_returns_view`). Ruling: the
   names `is_paused` in `admin/src/api.rs` and `admin/tests/api.rs` are this
   wire field, kept on purpose.
+- **Changed by review 03:** `GET /api/tasks/:id` gains `payload` and
+  `payload_error`
+  ([entry 36](#36-producers-reject-payloads-the-worker-cannot-parse)).
 
 ### 19. Left out of scope
 
@@ -626,6 +634,10 @@ must be dropped and recreated.
     no connection is left idle in a transaction
     (`worker::db_contained_handler_survives_heartbeat_while_holding_row_lock`).
   - Each transition runs one more statement.
+- **Changed by review 03:** the lease keeper takes the connection itself and
+  spawns only the transaction, which waits for the row lock at most until the
+  local deadline and renews nothing once its dispatch has ended
+  ([entry 35](#35-a-heartbeat-is-bounded-by-the-lease-and-ends-with-its-dispatch)).
 
 ### 22. Claim dead-letters any row that fails conversion
 
@@ -669,6 +681,12 @@ must be dropped and recreated.
   - Unchanged: a task dead-lettered for its payload still fails to decode in
     `store::task`, the one view that reads the payload, as entry 4 accepts for
     reads.
+- **Changed by review 03:** `enqueue` and `CreateJob` reject a payload the claim
+  could not parse, and `store::task` returns an unparseable payload as
+  `TaskPayload::Unreadable` instead of failing, so the last item no longer
+  holds ([entry 36](#36-producers-reject-payloads-the-worker-cannot-parse)).
+  The dead letter's error text has each NUL escaped
+  ([entry 37](#37-task-diagnostics-escape-nul)).
 
 ### 23. The materializer decodes nothing a stored value can break
 
@@ -726,6 +744,9 @@ must be dropped and recreated.
   is released.
 - **Expected behaviour:** No schema change beyond the two CHECKs. Entry 5's
   title, which used the old name, was renamed, and its links updated.
+- **Changed by review 03:** `queue_admin_actions` is described as one durable
+  row per action with a running `affected` count, not as append-only
+  ([entry 42](#42-queue_admin_actions-is-one-durable-row-per-action)).
 
 ### 25. The materializer runs at READ COMMITTED
 
@@ -774,6 +795,10 @@ must be dropped and recreated.
     COMMITTED.
   - `SchedulerError::Config` is no longer only a builder error, and its doc
     says so.
+- **Changed by review 03:** the doc of `materialize_due_jobs` says it runs one
+  bounded pass of at most 100 due schedules, not that it materializes all due
+  jobs
+  ([entry 41](#41-max_poll_interval-is-a-wake-cadence-not-a-latency-bound)).
 
 ### 26. Enqueue rejects the reserved schedule prefix
 
@@ -895,6 +920,9 @@ must be dropped and recreated.
     (`builder::tests::build_stores_the_checked_lease`).
   - The admin JSON and pages show the same values as before: `attempts` and
     the attempt numbers now come from a `u32`.
+- **Changed by review 03:** `build()` checks retention second, also before the
+  empty registry
+  ([entry 39](#39-cleanup-checks-retention-before-its-first-delete)).
 
 ### 30. `ensure_job` survives a concurrent delete
 
@@ -906,9 +934,9 @@ must be dropped and recreated.
 - **Decision:** When the reconcile update finds no row, `ensure_job` runs its
   insert-then-update pass again, for at most 3 passes in its one transaction.
   Each statement is new, so at READ COMMITTED it sees the delete. If all 3
-  passes find the row gone, it returns `SchedulerError::Database(NotFound)`. Creating still adds the pause for a
-  `Paused` spec, and reconciling still leaves the pause and the `next_run_at`
-  cursor alone.
+  passes find the row gone, it returns `SchedulerError::Database(NotFound)`.
+  Creating still adds the pause for a `Paused` spec, and reconciling still
+  leaves the pause and the `next_run_at` cursor alone.
 - **Why:** A delete racing an ensure is a normal interleaving of two public
   operations, and an ensure should end with the schedule in place.
 - **Expected behaviour:** When the schedule's row is locked by a transaction
@@ -918,6 +946,9 @@ must be dropped and recreated.
   new id and a cursor computed from the database's `now()`, and, like any
   schedule recreated under the same name, it does not inherit the deleted
   one's pause.
+- **Changed by review 03:** exhausting the 3 passes returns
+  `SchedulerError::Contention`, not `Database(NotFound)`
+  ([entry 38](#38-enqueue-retries-when-cleanup-deletes-the-incumbent)).
 
 ### 31. The worker registry is read in one statement
 
@@ -996,3 +1027,297 @@ must be dropped and recreated.
   upgrade history.
 - **Expected behaviour:** A database built before these changes lacks the
   CHECKs and must be dropped and recreated, as must the example's.
+
+## Review 03: findings
+
+### 34. A handler never starts on a claim that arrived after its lease
+
+- **Finding:** The claim cycle computes a local deadline from when it sent the
+  claim, but the worker spawned the dispatch, and polled the handler first,
+  even when the claim's response arrived after that deadline. A handler could
+  start external work on a lease that had already expired. A later
+  `LostOwnership` protects the database, not an external effect. The review
+  reproduced it with a 60 ms lease and a trigger that delayed the claim's
+  response by 200 ms.
+- **Source:** call.
+- **Decision:** `dispatch` checks the claim's monotonic deadline (`sent +
+  lease`, with `sent` taken before the claim request) before it builds the
+  `TaskContext` or polls the handler. If the deadline has passed, it starts
+  nothing: it increments `pg_task_scheduler_leases_lost_total`, logs a warning
+  (`claim arrived after its lease; handler not started`), and leaves the task
+  to the reaper. The post-lock checks in SQL stay the authority for every
+  transition.
+- **Why:** An external effect cannot be undone, so the worker must not start one
+  on a lease it already knows has passed.
+- **Expected behaviour:**
+  - With a 90 ms lease and a trigger that delays the claim's response past it,
+    the handler never runs
+    (`worker::handler_does_not_start_when_the_claim_arrives_after_its_lease`).
+  - The task stays `running` until its lease expires. The reaper then closes
+    the attempt as `lease_expired`, and requeues the task or marks it `dead`,
+    as for any expired lease, so the attempt counts.
+
+### 35. A heartbeat is bounded by the lease and ends with its dispatch
+
+- **Finding:** The spawned heartbeat of entry 21 owned both the pool
+  acquisition and the whole update, so cancelling the lease keeper dropped only
+  a `JoinHandle`. A heartbeat waiting on a pool or a row lock could renew a
+  valid lease after its dispatch and its scheduler had stopped, which postponed
+  crash recovery for a task with no handler, and a stuck wait could keep the
+  task and its pool reference alive past shutdown. The review reproduced the
+  renewal after aborting the scheduler future.
+- **Source:** user (approach b: keep the two-statement heartbeat, and bound it).
+- **Decision:**
+  - **Acquisition:** the lease keeper takes the pool connection itself, in its
+    cancellable future, so a wait for one is dropped with the keeper. Only the
+    transaction is spawned, and it owns the connection. `SchedulerPool::Conn`
+    gains a `'static` bound, which the deadpool, bb8 and mobc adapters already
+    meet.
+  - **Bounded lock wait:** the transaction first sets `lock_timeout`, local to
+    the transaction, to the time left until the local deadline, in whole
+    milliseconds and at least 1 (0 would mean no timeout). The spawned
+    transaction's lock wait therefore ends with the lease, even after the
+    keeper has stopped awaiting it. PostgreSQL applies the setting to each lock
+    wait.
+  - **Cancellation check:** after the lock statement, the transaction checks a
+    per-dispatch token, and if it is cancelled rolls back without renewing
+    (`LostOwnership`). A drop guard cancels the token however the dispatch ends:
+    finished, lease lost, released, or dropped with the scheduler future.
+    Graceful shutdown does not cancel it, so handlers keep their leases while
+    they drain. A window of one round trip remains between the check and the
+    update: a dispatch that ends inside it gets one last renewal, which delays
+    the reaper by at most one lease.
+  - **API:** `store::heartbeat` is unchanged. The worker calls
+    `store::heartbeat_bounded`, which also takes the lock wait and the token; it
+    is exported hidden from the docs, like the SQL constants, for the
+    integration tests.
+  - Ruling: `lock_timeout` is capped at `i32::MAX` milliseconds (about 24.8
+    days), the largest value PostgreSQL accepts. `LeaseDuration` allows 5
+    years, and without the cap every heartbeat of a lease over 24.8 days would
+    fail. With such a lease, an orphaned heartbeat can wait on a lock for up to
+    24.8 days, but it still renews nothing once its dispatch has ended.
+  - Ruling: the lease keeper checks the deadline after each sleep, and returns
+    before starting a beat it could not await. Before, after failing beats it
+    slept to the deadline and then started one more, which a pool with a free
+    connection could spawn after the keeper had given up.
+  - Ruling: when the lease keeper gives up, the dispatch cancels the token at
+    once. Otherwise the guard would fire only after the check for a completion
+    or cancel made elsewhere, which can take up to `heartbeat_interval`, and an
+    in-flight heartbeat could renew meanwhile.
+- **Why:** Ending a dispatch must end its hold on the lease, and no spawned
+  work should outlive the lease it serves. Keeping the two statements keeps
+  entry 21's guarantee that a dropped heartbeat never leaves an idle
+  transaction holding the row.
+- **Expected behaviour:**
+  - With a heartbeat blocked on a row lock, aborting the scheduler future and
+    then releasing the lock leaves `locked_until` unchanged
+    (`worker::dropped_scheduler_does_not_renew_a_pending_heartbeat`).
+  - A bounded heartbeat whose lock wait outlasts its bound returns a database
+    error (`lock timeout`) soon after the bound
+    (`transitions::bounded_heartbeat_gives_up_when_its_lock_wait_exceeds_the_bound`),
+    and one whose token is cancelled returns `LostOwnership` without moving
+    `locked_until` (`transitions::cancelled_heartbeat_does_not_renew`).
+  - The `lock_timeout` value is whole milliseconds, from `1ms` to
+    `2147483647ms`
+    (`transitions::tests::lock_timeout_is_whole_ms_at_least_one_at_most_i32_max`).
+  - A DB-contained handler that commits while a heartbeat waits on its lock
+    still leaves no connection idle in a transaction
+    (`worker::db_contained_handler_survives_heartbeat_while_holding_row_lock`).
+  - The worker's heartbeat runs three statements: the `lock_timeout` setting,
+    the row lock and the update.
+  - A custom `SchedulerPool` whose `Conn` borrows from the pool no longer
+    compiles.
+
+### 36. Producers reject payloads the worker cannot parse
+
+- **Finding:** `enqueue` and `CreateJob` converted arguments with
+  `serde_json::to_value`, which has no nesting limit, while the claim parses
+  the payload text with `serde_json::from_str`, which stops at 128 levels. A
+  payload 140 arrays deep was enqueued and then dead-lettered by the claim with
+  a recursion-limit error. `store::task` decoded the same payload, so it could
+  not read that row either, and the operator could not open the record that
+  explained the dead letter.
+- **Source:** call.
+- **Decision:**
+  - **Producer boundary:** `enqueue` and `CreateJob::{new, for_task}` serialize
+    the arguments to JSON text and parse it back with the claim's parser, in
+    one shared crate-private helper. A failure is `SchedulerError::Serde`, and
+    nothing is written. The claim still dead-letters a row written outside
+    this boundary, by direct SQL (entry 22).
+  - **Reading back:** `TaskView.payload` is a `TaskPayload`, exported from the
+    crate root: `Json(serde_json::Value)`, or `Unreadable { text, error }`,
+    with the stored text as PostgreSQL prints it and `serde_json`'s error.
+    `store::task` reads `payload::text`, and returns every other field even
+    when the payload does not parse.
+  - **Admin:** the task page shows an unreadable payload as its text, then
+    `Unreadable payload:` and the error. `GET /api/tasks/:id` gains `payload`
+    (the JSON value, or the raw text as a JSON string when it does not parse)
+    and `payload_error` (`null` when it parses). The spec said the JSON kept
+    `payload`, but it had no such field, so both are new.
+  - Ruling: the test checks the `Unreadable` text by its `{"x": 1000` prefix,
+    not by containing `1e500`, because PostgreSQL prints the JSONB number
+    `1e500` as a 1 followed by 500 zeros. The plan's expected text was wrong
+    about PostgreSQL's output; the intent, that the raw text is preserved,
+    holds. If wrong, it is a test string.
+- **Why:** A producer's success should mean the worker can run the task, and
+  the record that explains a dead letter must stay readable.
+- **Expected behaviour:**
+  - `enqueue` of a value 140 arrays deep is `Serde` and inserts nothing
+    (`enqueue::enqueue_rejects_a_payload_the_worker_cannot_parse`);
+    `CreateJob::new` rejects the same value
+    (`jobs::create_job_rejects_a_payload_the_worker_cannot_parse`).
+  - A task stored by SQL with the payload `{"x":1e500}` is dead-lettered by the
+    claim, and `store::task` then returns it, `dead`, with an `Unreadable`
+    payload (`claim::task_with_an_unparseable_payload_is_still_readable`).
+  - Code that read `TaskView.payload` as a `serde_json::Value` matches on
+    `TaskPayload` instead.
+
+### 37. Task diagnostics escape NUL
+
+- **Finding:** The worker binds a failure's text as PostgreSQL `TEXT`, which
+  cannot hold NUL. A NUL from handler code or a dependency made the retry or
+  permanent-failure update fail, the transition and its attempt close rolled
+  back, and the task stayed `running`. The reaper could then run it again with
+  the attempts it had left, and replace the diagnostic with `worker lease
+  expired`.
+- **Source:** call.
+- **Decision:** A crate-private `Diagnostic` escapes each NUL as the two
+  characters `\0`. It is the one place task error text is bound: the
+  `last_error` of `retry` and of `fail_permanently` (whose path the claim's
+  dead-letter also takes), and the attempt close's `error`. The public
+  parameters stay `&str`. Fixed texts, such as the reaper's `worker lease
+  expired`, do not go through it, and the admin replay's `last_error` filter is
+  an operator's search, not a diagnostic.
+- **Why:** The outcome the worker chose, retry or permanent, must land whatever
+  the message says; the message only describes it.
+- **Expected behaviour:**
+  - `fail_permanently` and `retry` with the error `"bad\0news"` (a Rust string
+    with a NUL) record `bad\0news`, a backslash and a zero, as `last_error`, and
+    close the attempt (`transitions::fail_permanently_with_a_nul_is_recorded`,
+    `transitions::retry_with_a_nul_is_recorded`,
+    `transitions::tests::diagnostic_escapes_every_nul`).
+  - A handler that returns `TaskError::permanent("bad\0news")` leaves its task
+    `dead` after one attempt, with that `last_error`
+    (`worker::permanent_failure_with_a_nul_in_its_message_is_recorded`).
+  - Text that already contains a backslash followed by `0` reads the same as an
+    escaped NUL.
+
+### 38. Enqueue retries when cleanup deletes the incumbent
+
+- **Finding:** `enqueue` inserts with `ON CONFLICT DO NOTHING`, then reads the
+  conflicting row in a second statement. Cleanup could delete that finished row
+  in between, even at READ COMMITTED, and `enqueue` returned
+  `Invariant("conflicting task_key not visible")` with no task in place.
+- **Source:** call.
+- **Decision:**
+  - When the read-back finds the row gone, `enqueue` runs its insert again, for
+    at most 3 passes, all on the caller's connection, so the task still
+    commits with the caller's transaction. The content check applies to every
+    incumbent it does find.
+  - Exhausting the passes returns a new `SchedulerError::Contention(&'static
+    str)`, which says to retry the call (`concurrent changes kept invalidating
+    the operation: task_key vanished during enqueue`).
+  - `ensure_job`'s exhausted passes (entry 30) return the same variant
+    (`schedule deleted during ensure_job`), replacing the manufactured
+    `Database(NotFound)`.
+- **Why:** Cleanup and enqueue are both supported concurrent operations, so
+  their interleaving is not a broken invariant. An enqueue should end with the
+  task in place, or with an error that says to retry.
+- **Expected behaviour:**
+  - With `enqueue` held between its conflicting insert and its read-back while
+    cleanup deletes the finished incumbent, it inserts a fresh `queued` task
+    and returns `inserted = true`
+    (`enqueue::enqueue_survives_cleanup_deleting_the_incumbent`).
+  - `SchedulerError` has a new variant.
+
+### 39. Cleanup checks retention before its first delete
+
+- **Finding:** `cleanup` converted every interval before deleting, but
+  `pg_interval` checks only that a duration fits a PostgreSQL interval, not
+  that `now()` minus it is a valid timestamp. With `done = 0` and `dead` near
+  `i64::MAX` microseconds, the `done` delete committed, the next delete failed
+  with `timestamp out of range`, and the error did not say what had been
+  deleted. The builder's 5-year cap excluded this input, but direct callers
+  bypassed it.
+- **Source:** call.
+- **Decision:**
+  - A crate-private `Retention::check` applies the 5-year cap to `done`, `dead`
+    and `outbox_published` (`SchedulerError::Config`, `every retention duration
+    must be at most 5 years`). `build()` and `store::cleanup` both run it
+    before anything else.
+  - `cleanup`'s doc says that its batches commit separately, so a database
+    error mid-call leaves the earlier batches committed. The error does not
+    report them.
+  - Ruling: `build()` checks retention right after the lease, before the
+    empty-registry check, so a bad retention is reported even when no handler
+    is registered. Its message was `every duration must be at most 5 years`.
+- **Why:** The builder's cap is a range the deletes can use, and a public
+  function must not rely on the builder having run. Checking first means a bad
+  input deletes nothing.
+- **Expected behaviour:** `cleanup` with `done = 0` and `dead = i64::MAX` µs
+  returns `Config` and leaves the old `done` row in place
+  (`maintenance::cleanup_rejects_retention_it_cannot_apply_before_deleting`).
+  Retention from zero to 5 years behaves as before.
+
+### 40. Schedule reads do not decode arguments
+
+- **Finding:** `jobs::get` and `jobs::list` selected the whole `SchedulerJob`
+  row, including `job_args`, which the public `Job` does not return. A schedule
+  whose arguments PostgreSQL accepts but `serde_json` cannot read
+  (`{"x":1e500}`) materialized, as entry 23 intends, but broke both reads, so
+  `GET /api/jobs` hid every schedule from the operator who needed to find it.
+- **Source:** call.
+- **Decision:**
+  - The crate-internal `SchedulerJob` read projection drops `job_args`, so no
+    read of a `Job` decodes them. The write path (`NewJob`) and the
+    materializer's copy in SQL keep them.
+  - The README says where each schedule defect shows:
+    - **Arguments:** an argument the worker cannot parse dead-letters that
+      occurrence's task, and the schedule keeps advancing.
+    - **Cron or routing:** a bad cron expression, task name, queue or
+      `max_attempts` pauses the schedule.
+- **Why:** A read should decode only what it returns, as entry 23 settled for
+  the materializer.
+- **Expected behaviour:**
+  - A schedule with unreadable `job_args` is listed and found by id
+    (`jobs::schedules_list_even_when_their_args_are_unreadable`), and
+    `GET /api/jobs` returns 200 with it
+    (`api::list_jobs_survives_unreadable_args`).
+  - Its occurrences are still created, and the claim dead-letters each of them
+    (entries 22 and 23).
+
+### 41. `max_poll_interval` is a wake cadence, not a latency bound
+
+- **Finding:** The README said an occurrence becomes a task within
+  `max_poll_interval` of its time. A materializer pass handles at most 100 due
+  schedules, counting any it pauses or skips, so with 101 due at once one pass
+  cannot reach them all, and query time and lock contention add delay of their
+  own. `materialize_due_jobs`'s doc said it materializes all due jobs.
+- **Source:** call.
+- **Decision:** Documentation only; the cap stays.
+  - The README calls `max_poll_interval` the wake cadence for one bounded pass
+    of at most 100 due schedules, and says a larger backlog catches up over
+    later passes and that query time and lock contention add delay.
+  - `materialize_due_jobs`'s doc says it runs one bounded pass, and that each
+    due job the pass reaches uses one of the 100, inserted or not.
+- **Why:** The cap limits how long materializing can delay the claims that
+  follow it in the worker's loop. The docs should state the timing the cap
+  gives, not a bound it cannot meet.
+- **Expected behaviour:** No code change. A backlog of N due schedules needs at
+  least ⌈N / 100⌉ passes, shared by the running schedulers.
+
+### 42. `queue_admin_actions` is one durable row per action
+
+- **Finding:** [Normal Form](SchedulerDesign.md#normal-form) called
+  `queue_admin_actions` append-only and said its rows are never updated, but
+  bulk cancel and replay add to `affected` after every batch. A role
+  configured from the design could lack `UPDATE` and fail on bulk actions; the
+  admin README's grants already include it.
+- **Source:** call.
+- **Decision:** Documentation only. The exception describes one durable row per
+  action, with a running `affected` count that each bulk batch updates, and
+  says that a role running bulk actions needs `UPDATE`. Its reason stays the
+  action's shape CHECK. The table's own section says the same of `affected`.
+- **Why:** A downstream role is configured from the design, so the design must
+  say which statements the table takes.
+- **Expected behaviour:** No code or schema change.

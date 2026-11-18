@@ -172,6 +172,8 @@ const EXISTING: &str = r#"
 /// caller's data. Re-enqueueing the same `key` with the same task name and payload
 /// returns the existing task; different content is an `IdempotencyConflict`. The queue
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
+/// Arguments that do not serialize to JSON the worker can parse back (for example,
+/// nested deeper than 128) are [`SchedulerError::Serde`], and nothing is written.
 /// A key starting with `schedule:` is reserved for the scheduler and returns
 /// [`SchedulerError::ReservedTaskKey`]. If concurrent cleanup keeps deleting the conflicting
 /// task before it can be read, three passes later it returns [`SchedulerError::Contention`].

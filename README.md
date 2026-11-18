@@ -616,23 +616,31 @@ queue. `CreateJob::queue(..)` overrides the queue for either.
 
 Each due occurrence becomes an ordinary queue task with
 `task_key = "schedule:{id}:{scheduled_for}"`, so a re-materialized occurrence
-never creates a second task. Every running scheduler materializes due schedules
-at most once per `max_poll_interval`, so an occurrence becomes a task within
-`max_poll_interval` of its time. Deleting or editing a schedule does not change
-tasks it already created. After downtime, one occurrence is created for the
-missed slot (`run_once`). Task keys starting with `schedule:` are reserved for
-schedule occurrences; `enqueue` rejects such keys with `ReservedTaskKey`. The
-first materialization of an occurrence defines its content, for as long as its
-task row is retained: re-pointing a schedule at a slot it already ran creates
-nothing new.
+never creates a second task. Every running scheduler wakes to materialize due
+schedules once per `max_poll_interval`, and each wake runs one bounded pass of
+at most 100 due schedules. A larger backlog catches up over later passes, and
+query time and lock contention add to the delay, so `max_poll_interval` is the
+cadence, not a bound on how late an occurrence becomes a task. Deleting or
+editing a schedule does not change tasks it already created. After downtime,
+one occurrence is created for the missed slot (`run_once`). Task keys starting
+with `schedule:` are reserved for schedule occurrences; `enqueue` rejects such
+keys with `ReservedTaskKey`. The first materialization of an occurrence defines
+its content, for as long as its task row is retained: re-pointing a schedule at
+a slot it already ran creates nothing new.
 
 A paused schedule has a row in `scheduler_job_pauses`; `jobs::pause` adds it and
 `jobs::resume` removes it. `ensure_job` reconciles a schedule's configuration but
 never its pause state or `next_run_at`, so a redeploy cannot resume a schedule an
 operator paused. Deleting a schedule deletes its pause, so a schedule recreated
-under the same name does not inherit it. A schedule whose stored row is invalid (only
-possible through direct SQL) is paused and logged rather than stopping other
-schedules.
+under the same name does not inherit it. Where a schedule's defect shows
+depends on what is wrong:
+
+- **Arguments:** an argument the worker cannot parse dead-letters that
+  occurrence's task, and the schedule keeps advancing. Such arguments come from
+  direct SQL, or from `CreateJob::new` with the wrong type for the handler.
+- **Cron or routing:** a bad cron expression, task name, queue or `max_attempts`
+  (only possible through direct SQL) pauses the schedule, with an error logged,
+  rather than stopping other schedules.
 
 ## Feature Flags
 

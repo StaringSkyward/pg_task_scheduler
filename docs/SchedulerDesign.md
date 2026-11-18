@@ -133,8 +133,8 @@ The audit trail for administrative actions: one row per replay, cancel, pause or
 resume, never one per task, so a bulk cancel of 100,000 tasks writes one row. It
 holds the action, `task_id` (single-task actions only), the filter of a bulk
 action (`task_name`, `queue`, `last_error_filter`), `max_task_id` (the bulk id
-bound), `affected`, `operator`, `reason` and `at`. It has no foreign key, so the
-audit outlives retention.
+bound), `affected` (a running count that each bulk batch adds to), `operator`,
+`reason` and `at`. It has no foreign key, so the audit outlives retention.
 
 A CHECK fixes the shape of each action:
 
@@ -211,7 +211,7 @@ is an approved exception:
 | `queue_tasks` is one wide row, with nullable `locked_by`, `locked_until`, `completed_at`, `last_error` and `admin_action_id` | Its state-shape CHECKs (running ⇔ owner and lease set; terminal ⇔ `completed_at` set) relate those columns, and a CHECK sees only one row. Each transition changes them in one guarded statement. `last_error` and `admin_action_id` change only in the statements that change the state. |
 | `queue_task_attempts` keeps `finished_at`, `outcome` and `error` on the attempt row | They are written together when the attempt closes, and the CHECK `(finished_at IS NULL) = (outcome IS NULL)` keeps them a pair. `error` is a detail of the close. |
 | `queue_outbox.published_at` is a nullable column (user decision) | A row is either published or not, so the column cannot contradict itself. The partial index `WHERE published_at IS NULL` keeps relay polling proportional to the pending rows; a separate table would make every poll an anti-join over every retained published row. |
-| `queue_admin_actions` is one append-only audit table with nullable target columns | Each action's shape CHECK decides which columns it carries, so the nulls are the action's shape, not independent facts. Rows are never updated. |
+| `queue_admin_actions` is one audit table with nullable target columns: one durable row per action, with a running `affected` count | Each action's shape CHECK decides which columns it carries, so the nulls are the action's shape, not independent facts. Only `affected` changes after the insert: each bulk batch adds its count in the batch's own statement, so a role that runs bulk actions needs `UPDATE` on the table. |
 | `scheduler_jobs` keeps the `next_run_at` cursor in the row with the definition (`name`, `task_name`, `cron_expression`, `job_args`, `max_attempts`, `queue`) | The cursor is computed from the row's own cron expression, by the materializer and by `jobs::reschedule`, under one row lock that orders it against `ensure_job`, pause and delete. `scheduler_jobs_due_idx (next_run_at)` then finds a due schedule and its definition with one index scan and no join. |
 | The worker registry keeps its observed values in its rows: `queue_workers.label`, `last_error`, `status`, `last_seen_at` and `lost_after`; `queue_worker_queues.in_use` and `last_finished_at` | They are display-only observations. Their one writer, the worker, rewrites them together in one transaction at every registry write, and nothing reads them for correctness. `in_use` also has a CHECK against `slot_limit` in the same row. |
 
@@ -271,7 +271,7 @@ transaction (nested transactions become savepoints).
 
 | Operation | Function | Notes |
 | --- | --- | --- |
-| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison (JSONB equality ignores key order). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. A key starting with `schedule:` is `SchedulerError::ReservedTaskKey`, before any SQL. |
+| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison (JSONB equality ignores key order). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. If that row is gone (cleanup deleted it in between), the insert runs again, for at most 3 passes, then `SchedulerError::Contention`. A key starting with `schedule:` is `SchedulerError::ReservedTaskKey`, and `args` whose JSON text the claim's parser rejects (nesting deeper than 128, for example) are `SchedulerError::Serde`, both before any SQL. |
 | Claim | `store::claim(conn, worker, queue, names, limit, lease)` | One writable CTE: `SKIP LOCKED` candidates → `running`, `attempts + 1`, `lock_token + 1`, `locked_until = clock_timestamp() + lease` → attempt rows inserted → rows returned, `payload` as text. Each row is then converted on its own: one whose attempt number, `task_key`, payload or `max_attempts` fails is logged and dead-lettered by its ownership key, and the rest are returned as typed claims; an error while dead-lettering is logged and that row skipped. Returns nothing while the queue has a `queue_pauses` row. |
 | Heartbeat | `store::heartbeat(conn, lease, duration)` | In one transaction, locks the row, then extends `locked_until` from `clock_timestamp()`. |
 | Lock for DB work | `store::lock_owned(conn, lease)` | `SELECT … FOR UPDATE` with the ownership predicate. |
@@ -285,7 +285,7 @@ transaction (nested transactions become savepoints).
 | Cancel | `store::cancel(conn, id, operator, reason)` | `queued` or `running` → `cancelled`: lock fields cleared, `completed_at` set, open attempt closed as `cancelled`, audit row, `admin_action_id`. One statement that locks the row `SKIP LOCKED`; a row held elsewhere is retried every 100 ms for 2 s, then `Busy`. Terminal or missing: `NotCancellable`. |
 | Bulk cancel / replay | `store::cancel_matching`, `store::replay_matching` | By task name (and optionally queue; replay optionally by exact `last_error`). One audit row with `max_task_id = max(id)` at the start; then batches of 500 `SKIP LOCKED` rows with `id ≤ max_task_id`, each one statement that also adds to the row's `affected`; a replay batch sends one `NOTIFY`. `BulkOutcome::stopped` says why it stopped: `ShortBatch` (a batch came back short, so the matches ran out or locked rows were skipped) or `BudgetSpent` (a full batch ended after the 10 s budget). |
 | Pause / resume | `store::pause_queue`, `store::resume_queue` | Insert or delete the `queue_pauses` row, with an audit row only when the state changed. Resume sends `NOTIFY queue_available`. |
-| Cleanup | `store::cleanup(conn, &retention)` | One bounded delete per terminal status (so `completed_at` is an index condition): `done`, then `dead`, then `cancelled` (kept for `Retention.dead`), sharing one `batch_size` budget; then one of published outbox rows. |
+| Cleanup | `store::cleanup(conn, &retention)` | One bounded delete per terminal status (so `completed_at` is an index condition): `done`, then `dead`, then `cancelled` (kept for `Retention.dead`), sharing one `batch_size` budget; then one of published outbox rows. A retention over 5 years is `SchedulerError::Config` before any delete. The deletes commit separately, so a database error mid-call leaves the earlier ones committed. |
 
 Every worker-owned transition uses the full ownership predicate:
 
@@ -336,7 +336,7 @@ for a task whose type is not at hand.
   paused. If a concurrent `jobs::delete` removes the row while the update waits
   on its lock, the update finds nothing and `ensure_job` inserts again, for at
   most 3 passes in its one transaction; if every pass finds the row gone, it
-  returns `SchedulerError::Database(NotFound)`.
+  returns `SchedulerError::Contention`.
 - `jobs::pause` and `jobs::resume` lock the job row `FOR KEY SHARE`, so it
   cannot be deleted under them, then add or delete its `scheduler_job_pauses`
   row. They do not change `updated_at`.
@@ -393,9 +393,12 @@ loop:     [cron] materialize due schedules, at most once per max_poll_interval
           a handler finishing, shutdown
 maintain: every reaper_interval, prune registry rows not written for 24 h, then
           rounds of one reap batch then one cleanup batch until both run short
-dispatch: run the handler and the lease keeper concurrently
-          lease keeper: heartbeat every heartbeat_interval, each on a spawned
-                        task; on LostOwnership or local deadline → drop the
+dispatch: if the local deadline has already passed (a slow claim response),
+          start nothing: count a lost lease and leave the task to the reaper
+          run the handler and the lease keeper concurrently
+          lease keeper: heartbeat every heartbeat_interval: take a connection,
+                        then run the heartbeat's transaction on a spawned task;
+                        on LostOwnership or local deadline → drop the
                         handler, then cancel ctx.cancellation;
                         if the row under this lock_token is cancelled, count a
                         cancellation, otherwise a lost lease
@@ -419,10 +422,18 @@ dropped:  if the run future is dropped instead (aborted, or a failed try_join! s
 
 The lease keeper is a separate future, not a `select!` arm body. A DB-contained
 handler holds its task row lock while the heartbeat waits on that lock, and the
-handler must keep being polled so it can commit. Each heartbeat runs on a
-spawned task, so a lease keeper dropped mid-heartbeat (its handler finished, or
-the local deadline passed) cannot leave the heartbeat's transaction open,
-holding the row lock.
+handler must keep being polled so it can commit. Each heartbeat's transaction
+runs on a spawned task, which owns its connection, so a lease keeper dropped
+mid-heartbeat (its handler finished, or the local deadline passed) cannot leave
+the heartbeat's transaction open, holding the row lock. The keeper takes the
+connection itself, so a wait for one is dropped with it. The spawned
+transaction first sets `lock_timeout` to the time left until the local deadline
+(whole milliseconds, at least 1, at most `i32::MAX`, about 24.8 days), so its
+lock wait ends with the lease. After the row lock it checks a token that the
+dispatch cancels however it ends (finished, lease lost, released, or dropped
+with the scheduler future, but not when graceful shutdown begins), and rolls
+back without renewing if it is cancelled. A dispatch that ends between that
+check and the update still gets that one renewal.
 
 The local deadline is `Instant` at claim send + `lease_duration`, moved forward
 on each successful heartbeat. It only gives up ownership early. PostgreSQL alone
@@ -456,9 +467,10 @@ recovers it after the lease expires.
 | `registry_interval` | 15 s; the row reads as lost after 3 × this |
 | `label` | `HOSTNAME` if set and non-empty, else none (the worker id is shown) |
 
-`build()` rejects, checking the lease first:
+`build()` rejects, checking the lease first and retention second:
 
 - a `lease_duration` under 1 µs or over 5 years;
+- a retention duration over 5 years (`store::cleanup` applies the same check);
 - a scheduler with no handler registered;
 - any other duration over 5 years;
 - a heartbeat, poll, reaper or registry interval under 1 µs, the resolution
@@ -473,7 +485,12 @@ recovers it after the lease expires.
 
 - `Task` ties a stable name, a default queue and one
   `Serialize + DeserializeOwned` payload type together. `enqueue::<T>`,
-  `register_task::<T>` and `CreateJob::for_task::<T>` all use it.
+  `register_task::<T>` and `CreateJob::for_task::<T>` all use it. `enqueue`
+  and `CreateJob` parse the JSON text of the arguments back with the claim's
+  parser, so they reject a payload the worker could not parse. `store::task`
+  returns the payload as a `TaskPayload`: `Json`, or
+  `Unreadable { text, error }` for a stored value that does not parse (one
+  written by direct SQL), so its dead letter can still be read.
 - Text identifiers are validated newtypes: `TaskKey`, `TaskName`, `QueueName`,
   `WorkerId`, `ScheduleName` (`cron`), `EffectName` and `Topic` (1 to 255
   characters, no leading or trailing whitespace, no NUL), and `CommandKey`
@@ -503,7 +520,9 @@ recovers it after the lease expires.
   arithmetic, and one that would overflow is `SchedulerError::InvalidCursor`.
 - `TaskError::{retry, permanent, interrupted}` is the handler's failure
   classification: retryable when a later attempt may succeed, permanent when
-  repeating the same operation cannot help.
+  repeating the same operation cannot help. The error text is stored with each
+  NUL escaped as `\0`, because PostgreSQL text cannot hold NUL, so the chosen
+  outcome always lands.
 - Observability goes through the `tracing` and `metrics` facades. The crate
   installs no subscriber or recorder. The metric names and labels are a public
   contract, listed in the [README](../README.md#observability).
@@ -513,8 +532,9 @@ recovers it after the lease expires.
 - Claiming is one round trip per batch. Handlers hold no connection while
   running.
 - Heartbeat is a two-statement transaction: the row lock, then the guarded
-  `UPDATE`. Completion, retry, failure and release add the attempt close, so
-  they are three.
+  `UPDATE`. The worker's heartbeat sets `lock_timeout` first, so it is three.
+  Completion, retry, failure and release add the attempt close, so they are
+  three.
 - The reaper and cleanup loop over bounded batches on a separate task, so a large
   backlog never stalls claiming. A reap batch runs before every cleanup batch, so
   a cleanup backlog never delays lease recovery.

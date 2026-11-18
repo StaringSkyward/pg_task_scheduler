@@ -22,10 +22,11 @@ Tests are cited as `file::test`, under `tests/` for the core crate and
 `admin/tests/` (or a `src` module) for the admin crate. "Spec §N" is a section
 of the design spec; a bare "§N.M" is an entry in this document.
 
-Review 01 changed some of these decisions after they shipped. An entry it
-changed is updated and says **Changed by review 01**; an entry it replaced says
-**Superseded** and is kept as history. Both link to the entry in
-[Review decisions](ReviewDecisions.md) that says what changed and why.
+Reviews 01 and 03 changed some of these decisions after they shipped. An entry
+a review changed is updated and says **Changed by review 01** or **Changed by
+review 03**; an entry it replaced says **Superseded** and is kept as history.
+Both link to the entry in [Review decisions](ReviewDecisions.md) that says what
+changed and why.
 
 **Contents**
 
@@ -113,6 +114,11 @@ changed is updated and says **Changed by review 01**; an entry it replaced says
 - **Changed by review 01:** `GET /api/jobs` rows gain `task_name`. Their
   `is_paused` field stays, derived from the new pause relation
   ([Review decisions, entry 18](ReviewDecisions.md#18-the-admin-json-api-keeps-its-wire-fields)).
+- **Changed by review 03:** `GET /api/tasks/:id` gains `payload`, and
+  `payload_error` for a stored payload that does not parse. `GET /api/jobs`
+  lists a schedule whose arguments do not parse
+  ([Review decisions, entries 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)
+  and [40](ReviewDecisions.md#40-schedule-reads-do-not-decode-arguments)).
 
 ### 1.5 `queue_admin_actions` replaces `queue_task_replays`
 
@@ -1261,6 +1267,10 @@ changed is updated and says **Changed by review 01**; an entry it replaced says
   attempt with outcome `retry` and a `cancel` action
   (`browse::task_detail_has_attempts_and_actions`). An unknown id is a 404 page
   (`pages::task_page_shows_attempts_and_404s`).
+- **Changed by review 03:** a payload that does not parse is shown as its
+  stored text, followed by `Unreadable payload:` and the parse error; before,
+  the whole page failed to load
+  ([Review decisions, entry 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)).
 
 ### 7.7 Mounted under a prefix
 

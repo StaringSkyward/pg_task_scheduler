@@ -54,7 +54,7 @@ impl CreateJob {
     /// A schedule `name` that runs task `T` with `args` at each `cron` occurrence, in
     /// `T::QUEUE`. The preferred constructor: the task name, queue and argument type
     /// all come from `T`. Fails if `T::NAME` or `T::QUEUE` is not a valid identifier,
-    /// or `args` does not serialize.
+    /// or `args` does not serialize to JSON the worker can parse back.
     pub fn for_task<T: Task>(
         name: ScheduleName,
         cron: CronExpression,
@@ -68,7 +68,8 @@ impl CreateJob {
     }
 
     /// A schedule `name` that runs task `task_name` with `args` at each `cron`
-    /// occurrence, in the `default` queue. Fails only if `args` does not serialize.
+    /// occurrence, in the `default` queue. Fails only if `args` does not serialize to
+    /// JSON the worker can parse back (for example, nested deeper than 128).
     ///
     /// The untyped boundary: nothing ties `task_name` to a handler or `args` to its
     /// argument type. Prefer [`CreateJob::for_task`] when the [`Task`] type is at hand.

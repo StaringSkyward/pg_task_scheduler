@@ -130,8 +130,8 @@ impl<P: SchedulerPool> Scheduler<P> {
             // past its bound. A claim cut off after it committed leaves its tasks `running`
             // until the reaper recovers them, as when a claim's response is lost.
             let step = async {
-                // At most once per `max_poll_interval`; the wait below wakes for it, so a due
-                // schedule is materialized within `max_poll_interval`.
+                // At most once per `max_poll_interval`; the wait below wakes for it. Each run
+                // is one bounded pass, so a backlog of due schedules takes several.
                 #[cfg(feature = "cron")]
                 let materialized_now = Instant::now() >= next_materialize;
                 #[cfg(feature = "cron")]

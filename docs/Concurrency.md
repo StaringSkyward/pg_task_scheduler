@@ -112,7 +112,9 @@ future when either:
   or hang, for example during a database outage.
 
 The local deadline only makes the worker give up early. It never extends
-ownership, and host clocks never decide validity.
+ownership, and host clocks never decide validity. A claim whose response
+arrives after that deadline starts no handler: the dispatch counts a lost lease
+and leaves the task to the reaper.
 
 `ctx.cancellation` is cancelled when worker shutdown begins, when the lease
 keeper gives up, or when the dispatch ends. When the lease keeper gives up, the
@@ -144,11 +146,15 @@ on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
 handler finished, or the local deadline passed) the heartbeat still commits or
 rolls back, and never leaves an open transaction holding the row lock. The
 spawned heartbeat is bounded by the lease: its `lock_timeout` is the time left
-until the local deadline. Once its dispatch has ended (finished, lease lost,
-released, or dropped with the scheduler future), it renews nothing: after
-taking the row lock it sees the dispatch's token cancelled and rolls back.
-Graceful shutdown does not cancel that token, so handlers keep their leases
-while they drain.
+until the local deadline. PostgreSQL applies `lock_timeout` to each lock wait,
+and accepts at most `i32::MAX` milliseconds (about 24.8 days), so for a longer
+lease the wait is capped there instead. Once its dispatch has ended (finished,
+lease lost, released, or dropped with the scheduler future), it renews nothing:
+after taking the row lock it sees the dispatch's token cancelled and rolls back.
+The token is checked once, between the lock and the update, so a dispatch that
+ends in that window still gets one last renewal, which delays the reaper by at
+most one lease. Graceful shutdown does not cancel that token, so handlers keep
+their leases while they drain.
 
 ## Admin Actions
 

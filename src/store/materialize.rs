@@ -94,9 +94,11 @@ pub(crate) fn schedule_task_key(
     ))
 }
 
-/// Materialize all due jobs, one transaction per job. Returns the number of
-/// tasks inserted: an occurrence already present as a task, or a job paused (by an
-/// operator, or below for a job-local defect), counts nothing.
+/// Materialize due jobs in one bounded pass of at most 100, one transaction per job.
+/// Returns the number of tasks inserted: an occurrence already present as a task, or a
+/// job paused (by an operator, or below for a job-local defect), counts nothing. Each
+/// due job the pass reaches uses one of the 100, inserted or not, and a larger backlog
+/// is left for later passes.
 ///
 /// Each job is handled in its own transaction so a single bad row cannot block
 /// the rest. For a due job, the occurrence for its *current* `next_run_at` (the
