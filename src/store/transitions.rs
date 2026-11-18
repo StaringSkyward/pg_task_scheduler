@@ -205,12 +205,22 @@ fn lost(lease: &TaskLease) -> SchedulerError {
     SchedulerError::LostOwnership(lease.task_id)
 }
 
+/// Task error text made safe to bind: PostgreSQL `TEXT` cannot hold NUL, and a bind failure would
+/// roll back the whole transition, so each NUL becomes the two characters `\0`.
+pub(crate) struct Diagnostic(String);
+
+impl Diagnostic {
+    pub(crate) fn new(s: &str) -> Self {
+        Self(s.replace('\0', "\\0"))
+    }
+}
+
 /// Close the attempt row for `lease`; exactly one must match or the caller's transaction rolls back.
 async fn close_attempt(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
     outcome: &str,
-    error: Option<&str>,
+    error: Option<&Diagnostic>,
 ) -> Result<(), SchedulerError> {
     close_attempt_by(conn, lease.task_id, lease.lock_token, outcome, error).await
 }
@@ -220,13 +230,13 @@ async fn close_attempt_by(
     task_id: TaskId,
     lock_token: LockToken,
     outcome: &str,
-    error: Option<&str>,
+    error: Option<&Diagnostic>,
 ) -> Result<(), SchedulerError> {
     let n = diesel::sql_query(CLOSE_ATTEMPT)
         .bind::<sql_types::BigInt, _>(&task_id)
         .bind::<sql_types::BigInt, _>(&lock_token)
         .bind::<sql_types::Text, _>(outcome)
-        .bind::<sql_types::Nullable<sql_types::Text>, _>(error)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(error.map(|d| d.0.as_str()))
         .execute(conn)
         .await?;
     if n == 1 {
@@ -409,18 +419,19 @@ pub async fn retry(
     delay: Duration,
 ) -> Result<RetryOutcome, SchedulerError> {
     let delay = pg_interval(delay)?;
+    let error = Diagnostic::new(error);
     conn.transaction::<_, SchedulerError, _>(async |c| {
         lock_task_row(c, lease).await?;
         let rows = owned_query!(RETRY, lease)
             .bind::<sql_types::Interval, _>(delay)
-            .bind::<sql_types::Text, _>(error)
+            .bind::<sql_types::Text, _>(&error.0)
             .get_results::<RetryRow>(c)
             .await?;
         let Some(row) = rows.into_iter().next() else {
             return Err(lost(lease));
         };
         let dead = row.status == "dead";
-        close_attempt(c, lease, if dead { "dead" } else { "retry" }, Some(error)).await?;
+        close_attempt(c, lease, if dead { "dead" } else { "retry" }, Some(&error)).await?;
         Ok(if dead {
             RetryOutcome::Dead
         } else {
@@ -454,19 +465,20 @@ pub(crate) async fn fail_owned(
     lock_token: LockToken,
     error: &str,
 ) -> Result<(), SchedulerError> {
+    let error = Diagnostic::new(error);
     conn.transaction::<_, SchedulerError, _>(async |c| {
         lock_task_row_by(c, task_id, worker, lock_token).await?;
         let rows = diesel::sql_query(FAIL)
             .bind::<sql_types::BigInt, _>(&task_id)
             .bind::<sql_types::Text, _>(worker)
             .bind::<sql_types::BigInt, _>(&lock_token)
-            .bind::<sql_types::Text, _>(error)
+            .bind::<sql_types::Text, _>(&error.0)
             .get_results::<IdRow>(c)
             .await?;
         if rows.is_empty() {
             return Err(SchedulerError::LostOwnership(task_id));
         }
-        close_attempt_by(c, task_id, lock_token, "dead", Some(error)).await
+        close_attempt_by(c, task_id, lock_token, "dead", Some(&error)).await
     })
     .await
 }
@@ -509,7 +521,13 @@ pub async fn lease_status(
 mod tests {
     use std::time::Duration;
 
+    use super::Diagnostic;
     use super::lock_timeout;
+
+    #[test]
+    fn diagnostic_escapes_every_nul() {
+        assert_eq!(Diagnostic::new("a\0b\0").0, "a\\0b\\0");
+    }
 
     #[test]
     fn lock_timeout_is_whole_ms_at_least_one_at_most_i32_max() {

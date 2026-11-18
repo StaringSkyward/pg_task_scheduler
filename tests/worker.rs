@@ -254,6 +254,25 @@ async fn permanent_error_marks_dead_after_one_attempt() {
 }
 
 #[tokio::test]
+async fn permanent_failure_with_a_nul_in_its_message_is_recorded() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .register_task::<Job, _, _>(|_ctx, _args| async { Err(TaskError::permanent("bad\0news")) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    let task = wait_for(&db, id, TaskStatus::Dead, Duration::from_secs(5)).await;
+    assert_eq!(task.attempts, 1);
+    assert_eq!(task.last_error.as_deref(), Some("bad\\0news"));
+
+    run.stop().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn interrupted_without_shutdown_is_a_counted_retry() {
     let db = TestDb::new().await;
     let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;

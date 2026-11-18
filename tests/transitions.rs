@@ -313,6 +313,44 @@ async fn fail_permanently_marks_dead() {
 }
 
 #[tokio::test]
+async fn fail_permanently_with_a_nul_is_recorded() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    store::fail_permanently(&mut conn, &c.lease, "bad\0news")
+        .await
+        .unwrap();
+    let t = store::task(&mut conn, c.lease.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.state.status(), TaskStatus::Dead);
+    assert_eq!(t.last_error.as_deref(), Some("bad\\0news"));
+    let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Dead));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn retry_with_a_nul_is_recorded() {
+    let db = TestDb::new().await;
+    let c = claimed(&db).await;
+    let mut conn = db.pool.get().await.unwrap();
+    store::retry(&mut conn, &c.lease, "bad\0news", Duration::from_secs(2))
+        .await
+        .unwrap();
+    let t = store::task(&mut conn, c.lease.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.last_error.as_deref(), Some("bad\\0news"));
+    let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::Retry));
+    assert_eq!(a[0].error.as_deref(), Some("bad\\0news"));
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn every_transition_fails_after_hard_lease_expiry() {
     let db = TestDb::new().await;
     let c = claimed(&db).await;
