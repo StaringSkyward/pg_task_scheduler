@@ -203,7 +203,9 @@ async fn bounded_heartbeat_gives_up_when_its_lock_wait_exceeds_the_bound() {
         .await
         .expect("the heartbeat waited past its lock bound");
     assert!(
-        matches!(&r, Err(SchedulerError::Database(e)) if e.to_string().contains("lock timeout")),
+        // Both timeouts are `lock_wait`; the statement's starts first, so it usually fires.
+        matches!(&r, Err(SchedulerError::Database(e))
+            if ["statement timeout", "lock timeout"].iter().any(|t| e.to_string().contains(t))),
         "{r:?}"
     );
     holder.batch_execute("ROLLBACK").await.unwrap();

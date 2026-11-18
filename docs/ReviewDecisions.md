@@ -1073,12 +1073,13 @@ version of this repository must be dropped and recreated.
     transaction is spawned, and it owns the connection. `SchedulerPool::Conn`
     gains a `'static` bound, which the deadpool, bb8 and mobc adapters already
     meet.
-  - **Bounded lock wait:** the transaction first sets `lock_timeout`, local to
-    the transaction, to the time left until the local deadline, in whole
-    milliseconds and at least 1 (0 would mean no timeout). The spawned
-    transaction's lock wait therefore ends with the lease, even after the
-    keeper has stopped awaiting it. PostgreSQL applies the setting to each lock
-    wait.
+  - **Bounded wait:** the transaction first sets `lock_timeout` and
+    `statement_timeout`, local to the transaction, both to the time left until
+    the local deadline, in milliseconds rounded up and at least 1 (0 would mean
+    no timeout). PostgreSQL applies `lock_timeout` to each lock wait, and a
+    statement can wait more than once, so `statement_timeout` bounds each
+    statement as a whole. The spawned transaction's lock statement therefore
+    ends by the local deadline, even after the keeper has stopped awaiting it.
   - **Cancellation check:** after the lock statement, the transaction checks a
     per-dispatch token, and if it is cancelled rolls back without renewing
     (`LostOwnership`). A drop guard cancels the token however the dispatch ends:
@@ -1091,7 +1092,7 @@ version of this repository must be dropped and recreated.
     `store::heartbeat_bounded`, which also takes the lock wait and the token; it
     is exported hidden from the docs, like the SQL constants, for the
     integration tests.
-  - Ruling: `lock_timeout` is capped at `i32::MAX` milliseconds (about 24.8
+  - Ruling: both timeouts are capped at `i32::MAX` milliseconds (about 24.8
     days), the largest value PostgreSQL accepts. `LeaseDuration` allows 5
     years, and without the cap every heartbeat of a lease over 24.8 days would
     fail. With such a lease, an orphaned heartbeat can wait on a lock for up to
@@ -1099,7 +1100,9 @@ version of this repository must be dropped and recreated.
   - Ruling: the lease keeper checks the deadline after each sleep, and returns
     before starting a beat it could not await. Before, after failing beats it
     slept to the deadline and then started one more, which a pool with a free
-    connection could spawn after the keeper had given up.
+    connection could spawn after the keeper had given up. It checks again after
+    taking a connection, and returns without spawning if no time is left, so a
+    slow pool cannot start a beat at the deadline either.
   - Ruling: when the lease keeper gives up, the dispatch cancels the token at
     once. Otherwise the guard would fire only after the check for a completion
     or cancel made elsewhere, which can take up to `heartbeat_interval`, and an
@@ -1112,19 +1115,22 @@ version of this repository must be dropped and recreated.
   - With a heartbeat blocked on a row lock, aborting the scheduler future and
     then releasing the lock leaves `locked_until` unchanged
     (`worker::dropped_scheduler_does_not_renew_a_pending_heartbeat`).
+  - A handler that ignores `ctx.cancellation` and outlives three leases while
+    graceful shutdown drains it still completes its task, `done` with one
+    `done` attempt (`worker::draining_handler_keeps_its_lease`).
   - A bounded heartbeat whose lock wait outlasts its bound returns a database
-    error (`lock timeout`) soon after the bound
+    error (`statement timeout`, or `lock timeout`) soon after the bound
     (`transitions::bounded_heartbeat_gives_up_when_its_lock_wait_exceeds_the_bound`),
     and one whose token is cancelled returns `LostOwnership` without moving
     `locked_until` (`transitions::cancelled_heartbeat_does_not_renew`).
-  - The `lock_timeout` value is whole milliseconds, from `1ms` to
+  - The timeout value is milliseconds rounded up, from `1ms` to
     `2147483647ms`
     (`transitions::tests::lock_timeout_is_whole_ms_at_least_one_at_most_i32_max`).
   - A DB-contained handler that commits while a heartbeat waits on its lock
     still leaves no connection idle in a transaction
     (`worker::db_contained_handler_survives_heartbeat_while_holding_row_lock`).
-  - The worker's heartbeat runs three statements: the `lock_timeout` setting,
-    the row lock and the update.
+  - The worker's heartbeat runs three statements: the timeout settings, the
+    row lock and the update.
   - A custom `SchedulerPool` whose `Conn` borrows from the pool no longer
     compiles.
 

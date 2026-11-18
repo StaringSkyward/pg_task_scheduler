@@ -48,8 +48,11 @@ const HEARTBEAT: &str = concat!(
     " RETURNING locked_until"
 );
 
-// Transaction-local (`is_local`), so it ends with the heartbeat's transaction.
-const SET_LOCK_TIMEOUT: &str = "SELECT set_config('lock_timeout', $1, true)";
+// Transaction-local (`is_local`), so both end with the heartbeat's transaction. `lock_timeout`
+// applies to each lock wait, and a statement can wait more than once, so `statement_timeout`
+// bounds each statement as a whole.
+const SET_TIMEOUTS: &str =
+    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)";
 
 const LOCK_OWNED: &str = concat!("SELECT id FROM queue_tasks ", owned!(), " FOR UPDATE");
 
@@ -266,10 +269,11 @@ pub async fn heartbeat(
     .await
 }
 
-/// [`heartbeat`] for the worker's lease keeper, which spawns it. It waits at most `lock_wait`
-/// for the row lock, so it cannot wait past the lease, and once it has the lock it renews
-/// nothing if `stop` is cancelled: its dispatch has ended. Either way it rolls back; a lock
-/// timeout is the database error, a cancelled `stop` is `LostOwnership`.
+/// [`heartbeat`] for the worker's lease keeper, which spawns it. It sets `lock_timeout` and
+/// `statement_timeout` to `lock_wait` for its transaction, so its row lock statement cannot
+/// wait past the lease, and once it has the lock it renews nothing if `stop` is cancelled:
+/// its dispatch has ended. Either way it rolls back; a timeout is the database error, a
+/// cancelled `stop` is `LostOwnership`.
 #[doc(hidden)]
 pub async fn heartbeat_bounded(
     conn: &mut AsyncPgConnection,
@@ -280,7 +284,7 @@ pub async fn heartbeat_bounded(
 ) -> Result<DateTime<Utc>, SchedulerError> {
     let duration = pg_interval(duration.get())?;
     conn.transaction::<_, SchedulerError, _>(async |c| {
-        diesel::sql_query(SET_LOCK_TIMEOUT)
+        diesel::sql_query(SET_TIMEOUTS)
             .bind::<sql_types::Text, _>(lock_timeout(lock_wait))
             .execute(c)
             .await?;
@@ -293,12 +297,12 @@ pub async fn heartbeat_bounded(
     .await
 }
 
-/// `lock_wait` as a `lock_timeout` value: whole milliseconds, at least 1 because 0 means no
-/// timeout, and at most `i32::MAX` (about 24.8 days), the largest PostgreSQL accepts. A lease
-/// longer than that still ends its keeper at the local deadline; only the spawned heartbeat's
-/// lock wait is capped there.
+/// `lock_wait` as a `lock_timeout` and `statement_timeout` value: milliseconds rounded up, at
+/// least 1 because 0 means no timeout, and at most `i32::MAX` (about 24.8 days), the largest
+/// PostgreSQL accepts. A lease longer than that still ends its keeper at the local deadline;
+/// only the spawned heartbeat's waits are capped there.
 fn lock_timeout(lock_wait: Duration) -> String {
-    let ms = i32::try_from(lock_wait.as_millis())
+    let ms = i32::try_from(lock_wait.as_micros().div_ceil(1000))
         .unwrap_or(i32::MAX)
         .max(1);
     format!("{ms}ms")
@@ -532,7 +536,8 @@ mod tests {
     #[test]
     fn lock_timeout_is_whole_ms_at_least_one_at_most_i32_max() {
         assert_eq!(lock_timeout(Duration::ZERO), "1ms");
-        assert_eq!(lock_timeout(Duration::from_micros(1_999)), "1ms");
+        assert_eq!(lock_timeout(Duration::from_micros(1)), "1ms");
+        assert_eq!(lock_timeout(Duration::from_micros(1_001)), "2ms");
         assert_eq!(lock_timeout(Duration::from_millis(100)), "100ms");
         assert_eq!(lock_timeout(Duration::MAX), "2147483647ms");
     }

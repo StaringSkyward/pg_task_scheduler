@@ -426,14 +426,17 @@ handler must keep being polled so it can commit. Each heartbeat's transaction
 runs on a spawned task, which owns its connection, so a lease keeper dropped
 mid-heartbeat (its handler finished, or the local deadline passed) cannot leave
 the heartbeat's transaction open, holding the row lock. The keeper takes the
-connection itself, so a wait for one is dropped with it. The spawned
-transaction first sets `lock_timeout` to the time left until the local deadline
-(whole milliseconds, at least 1, at most `i32::MAX`, about 24.8 days), so its
-lock wait ends with the lease. After the row lock it checks a token that the
-dispatch cancels however it ends (finished, lease lost, released, or dropped
-with the scheduler future, but not when graceful shutdown begins), and rolls
-back without renewing if it is cancelled. A dispatch that ends between that
-check and the update still gets that one renewal.
+connection itself, so a wait for one is dropped with it, and spawns nothing if
+the deadline has passed by then. The spawned transaction first sets
+`lock_timeout` and `statement_timeout` to the time left until the local
+deadline (milliseconds rounded up, at least 1, at most `i32::MAX`, about 24.8
+days). `lock_timeout` applies to each lock wait, and a statement can wait more
+than once, so `statement_timeout` bounds each statement as a whole, and the
+lock statement ends by the deadline. After the row lock it checks a token that
+the dispatch cancels however it ends (finished, lease lost, released, or
+dropped with the scheduler future, but not when graceful shutdown begins), and
+rolls back without renewing if it is cancelled. A dispatch that ends between
+that check and the update still gets that one renewal.
 
 The local deadline is `Instant` at claim send + `lease_duration`, moved forward
 on each successful heartbeat. It only gives up ownership early. PostgreSQL alone
@@ -532,7 +535,7 @@ recovers it after the lease expires.
 - Claiming is one round trip per batch. Handlers hold no connection while
   running.
 - Heartbeat is a two-statement transaction: the row lock, then the guarded
-  `UPDATE`. The worker's heartbeat sets `lock_timeout` first, so it is three.
+  `UPDATE`. The worker's heartbeat sets its timeouts first, so it is three.
   Completion, retry, failure and release add the attempt close, so they are
   three.
 - The reaper and cleanup loop over bounded batches on a separate task, so a large

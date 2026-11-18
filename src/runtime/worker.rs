@@ -72,7 +72,10 @@ impl<P: SchedulerPool> Scheduler<P> {
     /// Claim and run tasks until `cancel` fires. Then stop claiming and maintenance, cancel
     /// every handler's `ctx.cancellation`, and drain for up to `shutdown_timeout`. Handlers
     /// still running then are dropped and their tasks released; after 5 s more, whatever is
-    /// left is aborted and the reaper recovers those tasks after the lease.
+    /// left is aborted and the reaper recovers those tasks after the lease. After it returns,
+    /// each heartbeat still in flight may hold one pool connection, renewing nothing, until
+    /// its transaction ends; each of its statements is bounded by the lease it had left. Only
+    /// one that passed its cancellation check before its dispatch ended can still renew.
     pub async fn run_until_shutdown(self, cancel: CancellationToken) -> Result<(), SchedulerError> {
         let Scheduler {
             pool,
@@ -584,23 +587,30 @@ async fn keep_lease<P: SchedulerPool>(
         }
         let beat = tokio::time::timeout_at(deadline, async {
             let mut conn = acquire(pool).await?;
+            // The pool wait may have used up the lease; never spawn a beat with no time left.
+            let Some(lock_wait) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                return Ok(None);
+            };
             // Only the transaction is spawned, so a dropped keep_lease (handler finished,
             // deadline, scheduler dropped) cannot abandon it mid-flight holding the row lock:
-            // dropping a JoinHandle does not cancel the task. Its lock wait ends at the
-            // deadline, and it renews nothing once `stop` fires.
+            // dropping a JoinHandle does not cancel the task. Each of its statements runs for
+            // at most `lock_wait`, and it renews nothing once `stop` fires.
             let (lease, duration, stop) = (lease.clone(), config.lease_duration, stop.clone());
-            let lock_wait = deadline.saturating_duration_since(Instant::now());
             tokio::spawn(async move {
                 let query = store::heartbeat_bounded(&mut conn, &lease, duration, lock_wait, &stop);
                 timed("heartbeat", query).await
             })
             .await
             .map_err(|_| SchedulerError::Invariant("heartbeat task panicked"))?
+            .map(Some)
         })
         .await;
         match beat {
-            Ok(Ok(_)) => deadline = sent + config.lease_duration.get(),
-            Ok(Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
+            Ok(Ok(Some(_))) => deadline = sent + config.lease_duration.get(),
+            Ok(Ok(None) | Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
             Ok(Err(error)) => {
                 metrics::counter!("pg_task_scheduler_heartbeat_failures_total", "task_name" => name.to_owned())
                     .increment(1);

@@ -433,6 +433,34 @@ async fn dropped_scheduler_does_not_renew_a_pending_heartbeat() {
     db.cleanup().await;
 }
 
+/// Graceful shutdown does not stop heartbeats: a handler that ignores `ctx.cancellation` and
+/// outlives three leases while draining still completes its task.
+#[tokio::test]
+async fn draining_handler_keeps_its_lease() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(300))
+        .heartbeat_interval(ms(100))
+        .reaper_interval(ms(50))
+        .shutdown_timeout(Duration::from_secs(5))
+        .register_task::<Job, _, _>(|_ctx, _args| async {
+            tokio::time::sleep(ms(1000)).await;
+            Ok(())
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    wait_for(&db, id, TaskStatus::Running, Duration::from_secs(3)).await;
+    run.stop().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let task = store::task(&mut conn, id).await.unwrap().unwrap();
+    assert_eq!(task.state.status(), TaskStatus::Done);
+    assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn bulk_workers_process_each_task_once() {
     let db = TestDb::new().await;

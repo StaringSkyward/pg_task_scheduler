@@ -145,9 +145,11 @@ roll back. Each heartbeat's transaction runs
 on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
 handler finished, or the local deadline passed) the heartbeat still commits or
 rolls back, and never leaves an open transaction holding the row lock. The
-spawned heartbeat is bounded by the lease: its `lock_timeout` is the time left
-until the local deadline. PostgreSQL applies `lock_timeout` to each lock wait,
-and accepts at most `i32::MAX` milliseconds (about 24.8 days), so for a longer
+spawned heartbeat is bounded by the lease: its `lock_timeout` and
+`statement_timeout` are both the time left until the local deadline.
+PostgreSQL applies `lock_timeout` to each lock wait, and a statement can wait
+more than once, so `statement_timeout` bounds each statement as a whole. Both
+accept at most `i32::MAX` milliseconds (about 24.8 days), so for a longer
 lease the wait is capped there instead. Once its dispatch has ended (finished,
 lease lost, released, or dropped with the scheduler future), it renews nothing:
 after taking the row lock it sees the dispatch's token cancelled and rolls back.
