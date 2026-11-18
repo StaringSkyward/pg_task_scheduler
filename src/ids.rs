@@ -51,9 +51,10 @@ impl From<std::convert::Infallible> for IdentifierError {
 /// [`EffectName`], [`Topic`] and (with `cron`) `ScheduleName`.
 ///
 /// Non-empty, no NUL, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
-/// The queue tables carry no SQL CHECKs for this, but database reads re-validate
-/// (`#[diesel_newtype(try_from)]`): a row edited in SQL that breaks the policy is
-/// a decode error rather than a silently loaded value.
+/// Every identifier column carries the same rule as a named SQL CHECK
+/// (`queue_is_identifier`, migration 0001), so a raw-SQL producer cannot store a breaking
+/// value. Database reads still re-validate (`#[diesel_newtype(try_from)]`): a row stored
+/// after the CHECK was dropped by hand is a decode error rather than a silently loaded value.
 fn validate_identifier(s: &str) -> Result<(), IdentifierError> {
     if s.is_empty() {
         return Err(IdentifierError::Empty);

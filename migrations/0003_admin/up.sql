@@ -4,8 +4,10 @@ CREATE TABLE queue_admin_actions (
     id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     action            TEXT NOT NULL CHECK (action IN ('replay', 'cancel', 'pause', 'resume')),
     task_id           BIGINT,
-    task_name         TEXT,
-    queue             TEXT,
+    task_name         TEXT
+        CONSTRAINT queue_admin_actions_task_name_identifier CHECK (queue_is_identifier(task_name)),
+    queue             TEXT
+        CONSTRAINT queue_admin_actions_queue_identifier CHECK (queue_is_identifier(queue)),
     last_error_filter TEXT,
     max_task_id       BIGINT,
     affected          BIGINT NOT NULL DEFAULT 0,
@@ -36,7 +38,8 @@ CREATE INDEX queue_tasks_failed_name_idx
 
 -- 3. queue pauses: a row stops every worker claiming from that queue.
 CREATE TABLE queue_pauses (
-    queue     TEXT PRIMARY KEY,
+    queue     TEXT PRIMARY KEY
+        CONSTRAINT queue_pauses_queue_identifier CHECK (queue_is_identifier(queue)),
     operator  TEXT NOT NULL,
     reason    TEXT NOT NULL,
     paused_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -46,7 +49,8 @@ CREATE TABLE queue_pauses (
 -- row every registry_interval and deletes it after a clean shutdown. lost_after is
 -- now() + 3 × registry_interval at each write, so readers need no worker config.
 CREATE TABLE queue_workers (
-    worker_id    TEXT PRIMARY KEY,
+    worker_id    TEXT PRIMARY KEY
+        CONSTRAINT queue_workers_worker_id_identifier CHECK (queue_is_identifier(worker_id)),
     label        TEXT,
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -57,8 +61,10 @@ CREATE TABLE queue_workers (
 
 -- One row per queue a worker serves; rewritten at each registry write.
 CREATE TABLE queue_worker_queues (
-    worker_id        TEXT NOT NULL REFERENCES queue_workers (worker_id) ON DELETE CASCADE,
-    queue            TEXT NOT NULL,
+    worker_id        TEXT NOT NULL REFERENCES queue_workers (worker_id) ON DELETE CASCADE
+        CONSTRAINT queue_worker_queues_worker_id_identifier CHECK (queue_is_identifier(worker_id)),
+    queue            TEXT NOT NULL
+        CONSTRAINT queue_worker_queues_queue_identifier CHECK (queue_is_identifier(queue)),
     slot_limit       BIGINT NOT NULL CHECK (slot_limit >= 1),
     in_use           BIGINT NOT NULL CHECK (in_use >= 0 AND in_use <= slot_limit),
     last_finished_at TIMESTAMPTZ,
@@ -67,8 +73,12 @@ CREATE TABLE queue_worker_queues (
 
 -- One row per task name a worker has a handler for.
 CREATE TABLE queue_worker_task_names (
-    worker_id TEXT NOT NULL REFERENCES queue_workers (worker_id) ON DELETE CASCADE,
-    task_name TEXT NOT NULL,
+    worker_id TEXT NOT NULL REFERENCES queue_workers (worker_id) ON DELETE CASCADE
+        CONSTRAINT queue_worker_task_names_worker_id_identifier
+        CHECK (queue_is_identifier(worker_id)),
+    task_name TEXT NOT NULL
+        CONSTRAINT queue_worker_task_names_task_name_identifier
+        CHECK (queue_is_identifier(task_name)),
     PRIMARY KEY (worker_id, task_name)
 );
 

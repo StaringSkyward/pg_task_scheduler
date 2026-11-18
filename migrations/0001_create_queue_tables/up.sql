@@ -1,14 +1,30 @@
+-- The crate's identifier rule, mirroring `validate_identifier` in src/ids.rs: 1 to 255
+-- characters, with no leading or trailing Unicode White_Space (what Rust's `str::trim`
+-- strips). Every identifier column's CHECK calls it. The class is spelled out because
+-- `[[:space:]]` follows the locale and misses U+0085 and U+00A0. NUL needs no test: text
+-- cannot hold it.
+CREATE FUNCTION queue_is_identifier(s TEXT) RETURNS BOOLEAN
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT char_length(s) BETWEEN 1 AND 255
+       AND s !~ '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+       AND s !~ '[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]$'
+$$;
+
 CREATE TABLE queue_tasks (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 
     -- Stable producer idempotency key for one logical task.
-    task_key TEXT NOT NULL UNIQUE,
+    task_key TEXT NOT NULL UNIQUE
+        CONSTRAINT queue_tasks_task_key_identifier CHECK (queue_is_identifier(task_key)),
 
     -- Handler/type name and immutable input payload.
-    task_name TEXT NOT NULL,
+    task_name TEXT NOT NULL
+        CONSTRAINT queue_tasks_task_name_identifier CHECK (queue_is_identifier(task_name)),
 
     -- Logical queue; workers run each queue with its own concurrency.
-    queue TEXT NOT NULL DEFAULT 'default',
+    queue TEXT NOT NULL DEFAULT 'default'
+        CONSTRAINT queue_tasks_queue_identifier CHECK (queue_is_identifier(queue)),
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     status TEXT NOT NULL DEFAULT 'queued'
@@ -31,7 +47,8 @@ CREATE TABLE queue_tasks (
         CHECK (max_attempts >= 1),
 
     -- Valid only while status = 'running'.
-    locked_by TEXT,
+    locked_by TEXT
+        CONSTRAINT queue_tasks_locked_by_identifier CHECK (queue_is_identifier(locked_by)),
     lock_token BIGINT NOT NULL DEFAULT 0
         CHECK (lock_token >= 0),
     locked_until TIMESTAMPTZ,
@@ -89,7 +106,8 @@ CREATE TABLE queue_task_attempts (
         REFERENCES queue_tasks(id) ON DELETE CASCADE,
     attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
     lock_token BIGINT NOT NULL,
-    worker_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL
+        CONSTRAINT queue_task_attempts_worker_id_identifier CHECK (queue_is_identifier(worker_id)),
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ,
     outcome TEXT
@@ -110,10 +128,16 @@ CREATE INDEX queue_task_attempts_started_idx
 
 CREATE TABLE queue_outbox (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    task_key TEXT NOT NULL,
-    effect_name TEXT NOT NULL,
-    command_key TEXT NOT NULL UNIQUE,
-    topic TEXT NOT NULL,
+    task_key TEXT NOT NULL
+        CONSTRAINT queue_outbox_task_key_identifier CHECK (queue_is_identifier(task_key)),
+    effect_name TEXT NOT NULL
+        CONSTRAINT queue_outbox_effect_name_identifier CHECK (queue_is_identifier(effect_name)),
+    -- `CommandKey`'s rule: whitespace allowed, at most 2048 bytes for the unique index.
+    command_key TEXT NOT NULL UNIQUE
+        CONSTRAINT queue_outbox_command_key_length
+        CHECK (octet_length(command_key) BETWEEN 1 AND 2048),
+    topic TEXT NOT NULL
+        CONSTRAINT queue_outbox_topic_identifier CHECK (queue_is_identifier(topic)),
     payload JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     published_at TIMESTAMPTZ,

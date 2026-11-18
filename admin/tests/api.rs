@@ -300,6 +300,9 @@ async fn task_route_payload_is_json_or_unreadable() {
 async fn task_route_task_key_is_valid_or_invalid() {
     let db = TestDb::new().await;
     let good = enqueue_one(&db).await;
+    // Simulates a database whose CHECK was dropped by hand, which `StoredTaskKey` still covers.
+    db.drop_constraint("queue_tasks", "queue_tasks_task_key_identifier")
+        .await;
     let bad = db
         .scalar(
             "WITH t AS (INSERT INTO queue_tasks (task_key, task_name) \

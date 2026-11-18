@@ -311,8 +311,9 @@ impl TaskPayload {
     }
 }
 
-/// A stored task key as read back: `queue_tasks.task_key` has no identifier CHECK, so a raw-SQL
-/// producer can store one that [`TaskKey`] rejects, and reading must not fail on it.
+/// A stored task key as read back. `queue_tasks.task_key`'s identifier CHECK keeps out keys
+/// that [`TaskKey`] rejects, but a database whose CHECK was dropped by hand can hold one, and
+/// reading must not fail on it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoredTaskKey {
     /// The key satisfies the identifier policy.

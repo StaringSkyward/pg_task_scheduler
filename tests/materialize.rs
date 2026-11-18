@@ -335,7 +335,9 @@ async fn invalid_stored_queue_pauses_its_job_and_the_pass_continues() {
         .insert_job("good", "*/1 * * * *", past + Duration::minutes(1))
         .await;
     let mut conn = db.pool.get().await.unwrap();
-    // scheduler_jobs has no CHECK on queue; only direct SQL can store an invalid one.
+    // Simulates a database whose CHECK was dropped by hand, which `parse_due` still covers.
+    db.drop_constraint("scheduler_jobs", "scheduler_jobs_queue_identifier")
+        .await;
     diesel::sql_query("UPDATE scheduler_jobs SET queue = '' WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(bad)
         .execute(&mut conn)

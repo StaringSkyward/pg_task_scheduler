@@ -426,8 +426,10 @@ async fn claim_poisons_a_row_with_an_invalid_task_key_and_returns_the_rest() {
     )
     .await
     .unwrap();
-    // A raw-SQL producer: queue_tasks has no identifier CHECK, so a 300-char key (TaskKey allows
-    // 255) can be stored.
+    // A raw-SQL producer stores a 300-char key (TaskKey allows 255). Dropping the CHECK first
+    // simulates a database whose CHECK was dropped by hand, which claim's quarantine still covers.
+    db.drop_constraint("queue_tasks", "queue_tasks_task_key_identifier")
+        .await;
     let bad = TaskId(
         db.scalar(
             "WITH t AS (INSERT INTO queue_tasks (task_key, task_name) \

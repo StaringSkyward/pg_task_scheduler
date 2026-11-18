@@ -372,6 +372,9 @@ async fn names_with_url_characters_round_trip() {
 #[tokio::test]
 async fn task_page_shows_why_a_task_key_is_invalid() {
     let db = TestDb::new().await;
+    // Simulates a database whose CHECK was dropped by hand, which `StoredTaskKey` still covers.
+    db.drop_constraint("queue_tasks", "queue_tasks_task_key_identifier")
+        .await;
     sql(
         &db,
         "INSERT INTO queue_tasks (task_key, task_name, queue, status, last_error, completed_at) \

@@ -133,9 +133,9 @@ pub async fn claim(
     };
     for r in rows {
         // The claim has already committed, so a row that fails conversion must not fail the call:
-        // that would strand the whole batch running until its leases expire. `queue_tasks` has no
-        // identifier CHECK and JSONB accepts numbers serde_json rejects, so a raw-SQL producer can
-        // store such rows. Return that one row as poisoned, and the rest as ready.
+        // that would strand the whole batch running until its leases expire. JSONB accepts numbers
+        // serde_json rejects, so a raw-SQL producer can store such rows; a bad task_key needs the
+        // identifier CHECK dropped by hand. Return that one row as poisoned, and the rest as ready.
         match convert(r, worker) {
             Ok(task) => batch.ready.push(task),
             Err(poisoned) => batch.poisoned.push(poisoned),

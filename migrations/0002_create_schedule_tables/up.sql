@@ -2,16 +2,16 @@
 CREATE TABLE scheduler_jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name            TEXT NOT NULL UNIQUE
-                    CHECK (char_length(name) BETWEEN 1 AND 255
-                           AND name !~ '^[[:space:]]|[[:space:]]$'),
+                    CONSTRAINT scheduler_jobs_name_identifier CHECK (queue_is_identifier(name)),
     task_name       TEXT NOT NULL
-                    CHECK (char_length(task_name) BETWEEN 1 AND 255
-                           AND task_name !~ '^[[:space:]]|[[:space:]]$'),
+                    CONSTRAINT scheduler_jobs_task_name_identifier
+                    CHECK (queue_is_identifier(task_name)),
     cron_expression TEXT NOT NULL,
     job_args        JSONB NOT NULL DEFAULT '{}'::jsonb,
     next_run_at     TIMESTAMPTZ NOT NULL CHECK (isfinite(next_run_at)),
     max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
-    queue           TEXT NOT NULL DEFAULT 'default',
+    queue           TEXT NOT NULL DEFAULT 'default'
+                    CONSTRAINT scheduler_jobs_queue_identifier CHECK (queue_is_identifier(queue)),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

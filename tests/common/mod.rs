@@ -134,6 +134,16 @@ impl TestDb {
         }
     }
 
+    /// Drop one of the migrations' named constraints, so a test can store a value the
+    /// identifier CHECKs reject: a database whose CHECK was dropped by hand.
+    pub async fn drop_constraint(&self, table: &str, constraint: &str) {
+        let mut conn = self.pool.get().await.unwrap();
+        diesel::sql_query(format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
     /// Run a `SELECT ... AS n` count query and return `n`.
     pub async fn scalar(&self, sql: &str) -> i64 {
         let mut conn = self.pool.get().await.unwrap();
