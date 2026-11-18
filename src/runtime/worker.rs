@@ -125,8 +125,10 @@ impl<P: SchedulerPool> Scheduler<P> {
         let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
         while !cancel.is_cancelled() {
-            // The wait below collects at most one finished dispatch per wake, and a full batch
-            // skips it entirely; collect them all here so the set stays bounded by the permits.
+            // The wait below collects at most one finished task per wake, and a full batch
+            // skips it entirely; collect them all here. Dispatches are bounded by the permits.
+            // Dead-letter tasks are paced by the wait: a cycle starts at most one per queue, and
+            // poisoned rows never make a batch full, so they never skip the wait on their own.
             while let Some(joined) = in_flight.try_join_next() {
                 log_join(joined);
             }
@@ -373,9 +375,10 @@ async fn claim_cycle<P: SchedulerPool>(
             ),
         )
         .await?;
-        let leased = batch.ready.len() + batch.poisoned.len();
-        let full_batch = count(leased) == u64::from(want.get());
-        claimed_any |= leased > 0;
+        // Ready rows only: a poisoned row takes no permit, so counting it would loop at once
+        // and spawn a dead-letter task per batch of a poisoned backlog.
+        let full_batch = count(batch.ready.len()) == u64::from(want.get());
+        claimed_any |= !batch.ready.is_empty();
         for task in batch.ready {
             let name = task.task_name.as_str().to_owned();
             let queue_label = queue.name.as_str().to_owned();
