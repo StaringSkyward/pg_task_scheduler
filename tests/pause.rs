@@ -49,6 +49,7 @@ async fn claim(db: &TestDb, queue: &str) -> Vec<pg_task_scheduler::ClaimedTask> 
     )
     .await
     .unwrap()
+    .ready
 }
 
 async fn pause(db: &TestDb, queue: &str) -> bool {

@@ -230,6 +230,7 @@ async fn task_detail_has_attempts_and_actions() {
     )
     .await
     .unwrap()
+    .ready
     .pop()
     .unwrap();
     store::retry(&mut conn, &claimed.lease, "boom", Duration::from_secs(3600))

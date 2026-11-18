@@ -61,6 +61,7 @@ async fn claim_lease(conn: &mut AsyncPgConnection, lease: Duration) -> Option<Cl
     )
     .await
     .unwrap()
+    .ready
     .pop()
 }
 

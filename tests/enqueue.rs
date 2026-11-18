@@ -451,7 +451,8 @@ async fn accepted_args_decode_equal_after_storage() {
         common::lease(Duration::from_secs(30)),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .ready;
     claimed.sort_by(|a, b| a.task_name.as_str().cmp(b.task_name.as_str()));
     assert_eq!(claimed.len(), 2);
     assert_eq!(
@@ -511,7 +512,8 @@ async fn enqueue_survives_cleanup_deleting_the_incumbent() {
         common::lease(Duration::from_secs(30)),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .ready;
     store::complete(&mut conn, &claimed[0].lease).await.unwrap();
 
     // A statement-level trigger fires even when ON CONFLICT DO NOTHING inserts nothing, so

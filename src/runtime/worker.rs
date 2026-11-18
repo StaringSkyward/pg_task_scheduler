@@ -38,6 +38,7 @@ use crate::runtime::health::WorkerHealth;
 use crate::runtime::registry::Handler;
 use crate::runtime::registry::Registry;
 use crate::store;
+use crate::store::PoisonedClaim;
 
 /// Shortest idle wait before a task due soon (a due task the cycle could not claim waits
 /// `max_poll_interval` instead: another transaction holds it).
@@ -360,7 +361,7 @@ async fn claim_cycle<P: SchedulerPool>(
             continue;
         };
         let sent = Instant::now();
-        let claimed = timed(
+        let batch = timed(
             "claim",
             store::claim(
                 &mut conn,
@@ -372,9 +373,10 @@ async fn claim_cycle<P: SchedulerPool>(
             ),
         )
         .await?;
-        let full_batch = count(claimed.len()) == u64::from(want.get());
-        claimed_any |= !claimed.is_empty();
-        for task in claimed {
+        let leased = batch.ready.len() + batch.poisoned.len();
+        let full_batch = count(leased) == u64::from(want.get());
+        claimed_any |= leased > 0;
+        for task in batch.ready {
             let name = task.task_name.as_str().to_owned();
             let queue_label = queue.name.as_str().to_owned();
             let latency = (task.claimed_at - task.due_at).to_std().unwrap_or_default();
@@ -406,6 +408,11 @@ async fn claim_cycle<P: SchedulerPool>(
                     Some(Instant::now());
             });
         }
+        // After the dispatches, and never awaited here: a slow dead-letter must not use up the
+        // healthy rows' leases. In `in_flight`, so shutdown drains it like a dispatch.
+        if !batch.poisoned.is_empty() {
+            in_flight.spawn(dead_letter(pool.clone(), batch.poisoned));
+        }
         // A full batch only means "loop now" if this queue can still take more.
         full |= full_batch && queue.permits.available_permits() > 0;
     }
@@ -429,6 +436,26 @@ async fn claim_cycle<P: SchedulerPool>(
         Some(Duration::ZERO) if !claimed_any => max,
         next => next.unwrap_or(max).max(MIN_WAIT).min(max),
     }))
+}
+
+/// Dead-letter rows the claim could not convert, on a connection of their own. A row this
+/// misses stays `running` until the reaper requeues it, and the next claim poisons it again.
+async fn dead_letter<P: SchedulerPool>(pool: P, poisoned: Vec<PoisonedClaim>) {
+    for claim in &poisoned {
+        tracing::error!(task_id = claim.task_id.0, reason = %claim.reason, "claimed task is unusable; marking it dead");
+    }
+    let mut conn = match acquire(&pool).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::error!(%error, "could not dead-letter the tasks; skipping them");
+            return;
+        }
+    };
+    for claim in &poisoned {
+        if let Err(error) = timed("fail", store::dead_letter(&mut conn, claim)).await {
+            tracing::error!(task_id = claim.task_id.0, %error, "could not dead-letter the task; skipping it");
+        }
+    }
 }
 
 /// Publish health. `fresh` is whether `error` happened in this cycle; a standing error

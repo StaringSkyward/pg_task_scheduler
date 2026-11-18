@@ -77,7 +77,8 @@ async fn claim_marks_running_and_records_attempt() {
         lease(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .ready;
     assert_eq!(claimed.len(), 1);
     let c = &claimed[0];
     assert_eq!(c.lease.task_id, e.id);
@@ -130,6 +131,7 @@ async fn concurrent_claims_produce_one_owner() {
             )
             .await
             .unwrap()
+            .ready
         }));
     }
     let mut owners = 0;
@@ -159,6 +161,7 @@ async fn future_task_is_not_claimed_until_due() {
         store::claim(&mut conn, &w, &default_queue(), &names(), one(), lease())
             .await
             .unwrap()
+            .ready
             .is_empty()
     );
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -166,6 +169,7 @@ async fn future_task_is_not_claimed_until_due() {
         store::claim(&mut conn, &w, &default_queue(), &names(), one(), lease())
             .await
             .unwrap()
+            .ready
             .len(),
         1
     );
@@ -210,7 +214,8 @@ async fn higher_priority_due_task_is_claimed_first() {
         lease(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .ready;
     assert_eq!(claimed[0].lease.task_id, high.id);
     for id in [low.id, delayed.id] {
         let t = store::task(&mut conn, id).await.unwrap().unwrap();
@@ -236,7 +241,7 @@ async fn unregistered_task_name_is_never_claimed() {
     )
     .await
     .unwrap();
-    assert!(claimed.is_empty());
+    assert!(claimed.ready.is_empty() && claimed.poisoned.is_empty());
     let t = store::task(&mut conn, e.id).await.unwrap().unwrap();
     assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
@@ -266,7 +271,8 @@ async fn batch_claim_respects_limit() {
         lease(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .ready;
     assert_eq!(claimed.len(), 3);
     for c in &claimed {
         assert_eq!(c.lease.lock_token, LockToken(1));
@@ -356,13 +362,15 @@ async fn claim_takes_only_the_requested_queue() {
     let w = WorkerId::generate();
     let got = store::claim(&mut conn, &w, &bulk(), &names(), two, lease())
         .await
-        .unwrap();
+        .unwrap()
+        .ready;
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].task_key, key("b"));
     assert_eq!(got[0].queue, bulk());
     let got = store::claim(&mut conn, &w, &default_queue(), &names(), two, lease())
         .await
-        .unwrap();
+        .unwrap()
+        .ready;
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].task_key, key("d"));
     db.cleanup().await;
@@ -407,7 +415,7 @@ async fn next_due_in_covers_only_the_given_queues() {
 }
 
 #[tokio::test]
-async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest() {
+async fn claim_poisons_a_row_with_an_invalid_task_key_and_returns_the_rest() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     let good = enqueue::<Email>(
@@ -428,7 +436,7 @@ async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest(
         .await,
     );
     let worker = WorkerId::generate();
-    let claimed = store::claim(
+    let batch = store::claim(
         &mut conn,
         &worker,
         &default_queue(),
@@ -438,10 +446,15 @@ async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest(
     )
     .await
     .unwrap();
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].lease.task_id, good.id);
+    assert_eq!(batch.ready.len(), 1);
+    assert_eq!(batch.ready[0].lease.task_id, good.id);
     let t = store::task(&mut conn, good.id).await.unwrap().unwrap();
     assert_eq!(t.state.status(), TaskStatus::Running);
+    assert_eq!(batch.poisoned.len(), 1);
+    assert_eq!(batch.poisoned[0].task_id, bad);
+    for poisoned in &batch.poisoned {
+        store::dead_letter(&mut conn, poisoned).await.unwrap();
+    }
 
     let dead = db
         .scalar(&format!(
@@ -472,7 +485,7 @@ async fn claim_dead_letters_a_row_with_an_invalid_task_key_and_returns_the_rest(
 }
 
 #[tokio::test]
-async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_rest() {
+async fn claim_poisons_a_row_whose_payload_does_not_parse_and_returns_the_rest() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     // PostgreSQL accepts this JSONB; serde_json rejects the out-of-range number.
@@ -490,7 +503,7 @@ async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_r
         )
         .await,
     );
-    let claimed = store::claim(
+    let batch = store::claim(
         &mut conn,
         &WorkerId::generate(),
         &default_queue(),
@@ -500,10 +513,15 @@ async fn claim_dead_letters_a_row_whose_payload_does_not_parse_and_returns_the_r
     )
     .await
     .unwrap();
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].lease.task_id, good);
+    assert_eq!(batch.ready.len(), 1);
+    assert_eq!(batch.ready[0].lease.task_id, good);
     let t = store::task(&mut conn, good).await.unwrap().unwrap();
     assert_eq!(t.state.status(), TaskStatus::Running);
+    assert_eq!(batch.poisoned.len(), 1);
+    assert_eq!(batch.poisoned[0].task_id, bad);
+    for poisoned in &batch.poisoned {
+        store::dead_letter(&mut conn, poisoned).await.unwrap();
+    }
     // Check the dead letter in SQL.
     let dead = db
         .scalar(&format!(
@@ -530,7 +548,7 @@ async fn task_with_an_unparseable_payload_is_still_readable() {
         )
         .await,
     );
-    store::claim(
+    let batch = store::claim(
         &mut conn,
         &WorkerId::generate(),
         &default_queue(),
@@ -540,6 +558,9 @@ async fn task_with_an_unparseable_payload_is_still_readable() {
     )
     .await
     .unwrap();
+    for poisoned in &batch.poisoned {
+        store::dead_letter(&mut conn, poisoned).await.unwrap();
+    }
     let view = store::task(&mut conn, bad).await.unwrap().unwrap();
     assert_eq!(view.state.status(), TaskStatus::Dead);
     let TaskPayload::Unreadable { text, error } = view.payload else {
@@ -548,5 +569,48 @@ async fn task_with_an_unparseable_payload_is_still_readable() {
     // PostgreSQL prints the numeric expanded, not as `1e500`.
     assert!(text.starts_with(r#"{"x": 1000"#), "{text}");
     assert!(!error.is_empty());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn claim_returns_poisoned_rows_without_touching_them() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let bad = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'email', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let worker = WorkerId::generate();
+    let batch = store::claim(
+        &mut conn,
+        &worker,
+        &default_queue(),
+        &names(),
+        one(),
+        lease(),
+    )
+    .await
+    .unwrap();
+    assert!(batch.ready.is_empty());
+    let [poisoned] = batch.poisoned.as_slice() else {
+        panic!("expected one poisoned row: {:?}", batch.poisoned);
+    };
+    assert_eq!(poisoned.task_id, bad);
+    assert_eq!(poisoned.worker_id, worker);
+    assert_eq!(poisoned.lock_token, LockToken(1));
+    assert!(
+        poisoned.reason.starts_with("invalid payload: "),
+        "{}",
+        poisoned.reason
+    );
+    // Leased, not dead-lettered: the row and its attempt are as the claim left them.
+    let view = store::task(&mut conn, bad).await.unwrap().unwrap();
+    assert_eq!(view.state.status(), TaskStatus::Running);
+    let attempts = store::attempts(&mut conn, bad).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, AttemptState::Open);
     db.cleanup().await;
 }

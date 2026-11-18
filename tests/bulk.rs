@@ -66,7 +66,8 @@ async fn cancel_matching_cancels_queued_and_running_of_that_name_only() {
         common::lease(Duration::from_secs(60)),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .ready;
     assert_eq!(claimed.len(), 1);
 
     let out = store::cancel_matching(&mut conn, &filter("a"), "ops", "why", store::BULK_BUDGET)

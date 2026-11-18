@@ -244,7 +244,7 @@ async fn task_route_returns_view_and_404() {
 }
 
 /// `payload` is `{"json": ...}`, or `{"unreadable": {"text", "error"}}` for a stored payload
-/// `serde_json` cannot parse, which the claim dead-letters.
+/// `serde_json` cannot parse, which the claim poisons and the caller dead-letters.
 #[tokio::test]
 async fn task_route_payload_is_json_or_unreadable() {
     let db = TestDb::new().await;
@@ -257,7 +257,7 @@ async fn task_route_payload_is_json_or_unreadable() {
         )
         .await;
     let mut conn = db.pool.get().await.unwrap();
-    pg_task_scheduler::store::claim(
+    let batch = pg_task_scheduler::store::claim(
         &mut conn,
         &pg_task_scheduler::WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
@@ -267,6 +267,11 @@ async fn task_route_payload_is_json_or_unreadable() {
     )
     .await
     .unwrap();
+    for poisoned in &batch.poisoned {
+        pg_task_scheduler::store::dead_letter(&mut conn, poisoned)
+            .await
+            .unwrap();
+    }
     let get = |id: i64| send(app(&db), Method::GET, format!("/api/tasks/{id}"), None);
 
     let (status, body) = get(readable.0).await;

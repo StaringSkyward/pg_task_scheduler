@@ -661,6 +661,7 @@ async fn claim_elsewhere(db: &TestDb, name: &str) -> TaskId {
     )
     .await
     .unwrap()
+    .ready
     .pop()
     .unwrap()
     .lease
@@ -960,14 +961,8 @@ async fn healthy_task_in_a_batch_with_a_bad_payload_runs() {
     let run = start(scheduler);
 
     wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
-    // `store::task` cannot decode the bad payload, so check the row in SQL.
-    let dead = db
-        .scalar(&format!(
-            "SELECT count(*) AS n FROM queue_tasks WHERE id = {} AND status = 'dead'",
-            bad.0
-        ))
-        .await;
-    assert_eq!(dead, 1);
+    // Dead-lettered on its own task, after the dispatch.
+    wait_for(&db, bad, TaskStatus::Dead, Duration::from_secs(5)).await;
 
     run.stop().await;
     db.cleanup().await;
@@ -1011,5 +1006,52 @@ async fn handler_does_not_start_when_the_claim_arrives_after_its_lease() {
         &started,
         std::sync::atomic::Ordering::SeqCst
     ));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn slow_dead_letter_does_not_delay_a_healthy_claim() {
+    let db = TestDb::new().await;
+    // Every dead-letter takes longer than the whole lease.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE FUNCTION slow_dead() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.25); RETURN NEW; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER slow_dead BEFORE UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'dead') EXECUTE FUNCTION slow_dead();",
+        )
+        .await
+        .unwrap();
+    // Both queued before the worker starts, so one claim takes them together.
+    db.scalar(
+        "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+         VALUES ('bad', 'job', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+    )
+    .await;
+    let good = enqueue_job(&db, "good", EnqueueOptions::immediate()).await;
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(90))
+        .heartbeat_interval(ms(30))
+        .register_task::<Job, _, _>(move |_ctx, _args| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
+    assert!(std::sync::atomic::AtomicBool::load(
+        &started,
+        std::sync::atomic::Ordering::SeqCst
+    ));
+    run.stop().await;
     db.cleanup().await;
 }

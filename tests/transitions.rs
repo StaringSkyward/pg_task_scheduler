@@ -59,6 +59,7 @@ async fn claim_one_with_lease(
     )
     .await
     .unwrap()
+    .ready
     .pop()
 }
 
@@ -399,6 +400,7 @@ async fn stale_token_cannot_complete_after_reclaim() {
     )
     .await
     .unwrap()
+    .ready
     .pop()
     .unwrap();
     assert_eq!(new.lease.worker_id, old.lease.worker_id);

@@ -62,6 +62,7 @@ async fn claim_one(conn: &mut AsyncPgConnection) -> ClaimedTask {
     )
     .await
     .unwrap()
+    .ready
     .pop()
     .unwrap()
 }
