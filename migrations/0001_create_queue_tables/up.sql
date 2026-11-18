@@ -2,9 +2,10 @@
 -- characters, with no leading or trailing Unicode White_Space (what Rust's `str::trim`
 -- strips). Every identifier column's CHECK calls it. The class is spelled out because
 -- `[[:space:]]` follows the locale and misses U+0085 and U+00A0. NUL needs no test: text
--- cannot hold it.
+-- cannot hold it. Not STRICT: that would stop PostgreSQL inlining the body into each CHECK,
+-- and NULL already yields NULL, which a CHECK accepts (so nullable columns stay nullable).
 CREATE FUNCTION queue_is_identifier(s TEXT) RETURNS BOOLEAN
-    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
 AS $$
     SELECT char_length(s) BETWEEN 1 AND 255
        AND s !~ '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'

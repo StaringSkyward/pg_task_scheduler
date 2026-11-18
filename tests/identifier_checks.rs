@@ -157,6 +157,22 @@ async fn queue_tasks_rejects_an_invalid_task_name() {
     db.cleanup().await;
 }
 
+/// NULL passes the identifier CHECK, so the nullable identifier columns stay nullable.
+#[tokio::test]
+async fn nullable_identifier_columns_accept_null() {
+    use diesel_async::SimpleAsyncConnection;
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "INSERT INTO queue_tasks (task_key, task_name, locked_by) VALUES ('k', 'n', NULL); \
+         INSERT INTO queue_admin_actions (action, task_name, queue, max_task_id, operator, reason) \
+         VALUES ('replay', 'n', NULL, 1, 'op', 'r'), ('pause', NULL, 'q', NULL, 'op', 'r')",
+    )
+    .await
+    .unwrap();
+    db.cleanup().await;
+}
+
 #[cfg(feature = "cron")]
 /// Raw insert of a job with the given names, bypassing the Rust `ScheduleName` and
 /// `TaskName` constructors so the SQL CHECK is what is under test.
