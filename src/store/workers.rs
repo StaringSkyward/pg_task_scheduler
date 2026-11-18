@@ -1,17 +1,14 @@
 //! The display-only worker registry (`queue_workers`). Claims and ownership never read it.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::DateTime;
 use chrono::Utc;
 use diesel::pg::data_types::PgInterval;
 use diesel::sql_types;
-use diesel_async::AnsiTransactionManager;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use diesel_async::TransactionManager;
 
 use crate::error::SchedulerError;
 use crate::ids::QueueName;
@@ -184,7 +181,7 @@ pub async fn prune_workers(conn: &mut AsyncPgConnection) -> Result<usize, Schedu
 }
 
 /// One queue a worker serves.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct WorkerQueueView {
     /// The queue.
     pub name: QueueName,
@@ -237,98 +234,38 @@ struct WorkerRow {
     last_error: Option<String>,
     #[diesel(sql_type = sql_types::Bool)]
     lost: bool,
-}
-
-#[derive(diesel::QueryableByName)]
-struct QueueRow {
-    #[diesel(sql_type = sql_types::Text)]
-    worker_id: WorkerId,
-    #[diesel(sql_type = sql_types::Text)]
-    queue: QueueName,
-    #[diesel(sql_type = sql_types::BigInt)]
-    slot_limit: i64,
-    #[diesel(sql_type = sql_types::BigInt)]
-    in_use: i64,
-    #[diesel(sql_type = sql_types::Bool)]
-    paused: bool,
-    #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
-    last_finished_at: Option<DateTime<Utc>>,
-}
-
-#[derive(diesel::QueryableByName)]
-struct TaskNameRow {
-    #[diesel(sql_type = sql_types::Text)]
-    worker_id: WorkerId,
-    #[diesel(sql_type = sql_types::Text)]
-    task_name: TaskName,
-}
-
-type RegistryRows = (Vec<WorkerRow>, Vec<QueueRow>, Vec<TaskNameRow>);
-
-async fn registry_rows(conn: &mut AsyncPgConnection) -> Result<RegistryRows, SchedulerError> {
-    let rows = diesel::sql_query(
-        "SELECT worker_id, label, started_at, last_seen_at, status, last_error, \
-                lost_after < now() AS lost \
-         FROM queue_workers ORDER BY lost, coalesce(label, worker_id), worker_id",
-    )
-    .get_results::<WorkerRow>(conn)
-    .await?;
-    let queue_rows = diesel::sql_query(
-        "SELECT q.worker_id, q.queue, q.slot_limit, q.in_use, q.last_finished_at, \
-                EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = q.queue) AS paused \
-         FROM queue_worker_queues q ORDER BY q.worker_id, q.queue",
-    )
-    .get_results::<QueueRow>(conn)
-    .await?;
-    let name_rows = diesel::sql_query(
-        "SELECT worker_id, task_name FROM queue_worker_task_names ORDER BY worker_id, task_name",
-    )
-    .get_results::<TaskNameRow>(conn)
-    .await?;
-    Ok((rows, queue_rows, name_rows))
+    #[diesel(sql_type = sql_types::Json)]
+    queues: serde_json::Value,
+    #[diesel(sql_type = sql_types::Array<sql_types::Text>)]
+    task_names: Vec<TaskName>,
 }
 
 /// Every registered worker: live ones first, then by label (or id when unlabelled). Each
 /// worker's queues are ordered by queue name; `paused` is read live.
 ///
-/// Its three reads run in one `REPEATABLE READ READ ONLY` transaction, so they share a snapshot.
-/// When `conn` is already in a transaction they run in that one, and its isolation decides.
+/// One statement, so one snapshot whatever the caller's transaction and isolation.
 pub async fn workers(conn: &mut AsyncPgConnection) -> Result<Vec<WorkerView>, SchedulerError> {
-    // diesel-async cannot begin a REPEATABLE READ transaction inside another one.
-    let nested = AnsiTransactionManager::transaction_manager_status_mut(conn)
-        .transaction_depth()?
-        .is_some();
-    let (rows, queue_rows, name_rows) = if nested {
-        registry_rows(conn).await?
-    } else {
-        conn.build_transaction()
-            .repeatable_read()
-            .read_only()
-            .run(async |c| registry_rows(c).await)
-            .await?
-    };
-    let mut queues: HashMap<WorkerId, Vec<WorkerQueueView>> = HashMap::new();
-    for r in queue_rows {
-        queues
-            .entry(r.worker_id)
-            .or_default()
-            .push(WorkerQueueView {
-                name: r.queue,
-                limit: r.slot_limit,
-                in_use: r.in_use,
-                paused: r.paused,
-                last_finished_at: r.last_finished_at,
-            });
-    }
-    let mut names: HashMap<WorkerId, Vec<TaskName>> = HashMap::new();
-    for r in name_rows {
-        names.entry(r.worker_id).or_default().push(r.task_name);
-    }
+    let rows = diesel::sql_query(
+        "SELECT w.worker_id, w.label, w.started_at, w.last_seen_at, w.status, w.last_error, \
+                w.lost_after < now() AS lost, \
+                coalesce((SELECT json_agg(json_build_object('name', q.queue, \
+                        'limit', q.slot_limit, 'in_use', q.in_use, \
+                        'paused', EXISTS (SELECT 1 FROM queue_pauses p WHERE p.queue = q.queue), \
+                        'last_finished_at', q.last_finished_at) ORDER BY q.queue) \
+                    FROM queue_worker_queues q WHERE q.worker_id = w.worker_id), '[]') AS queues, \
+                coalesce((SELECT array_agg(t.task_name ORDER BY t.task_name) \
+                    FROM queue_worker_task_names t WHERE t.worker_id = w.worker_id), '{}') \
+                    AS task_names \
+         FROM queue_workers w ORDER BY lost, coalesce(w.label, w.worker_id), w.worker_id",
+    )
+    .get_results::<WorkerRow>(conn)
+    .await?;
     rows.into_iter()
         .map(|r| {
             Ok(WorkerView {
-                queues: queues.remove(&r.worker_id).unwrap_or_default(),
-                task_names: names.remove(&r.worker_id).unwrap_or_default(),
+                queues: serde_json::from_value(r.queues)
+                    .map_err(|_| SchedulerError::Invariant("malformed worker queue json"))?,
+                task_names: r.task_names,
                 worker_id: r.worker_id,
                 label: r.label,
                 started_at: r.started_at,

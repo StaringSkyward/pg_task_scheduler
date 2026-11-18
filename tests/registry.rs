@@ -427,3 +427,22 @@ async fn removing_a_worker_removes_its_queues_and_names() {
     );
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn workers_reads_consistently_inside_a_read_committed_transaction() {
+    use diesel_async::AsyncConnection;
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    store::upsert_worker(&mut conn, &registration(&["b", "a"], &["job"]))
+        .await
+        .unwrap();
+    let ws = conn
+        .transaction::<_, pg_task_scheduler::SchedulerError, _>(async |c| store::workers(c).await)
+        .await
+        .unwrap();
+    let names: Vec<&str> = ws[0].queues.iter().map(|q| q.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    let tasks: Vec<&str> = ws[0].task_names.iter().map(TaskName::as_str).collect();
+    assert_eq!(tasks, ["job"]);
+    db.cleanup().await;
+}
