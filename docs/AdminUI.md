@@ -22,9 +22,10 @@ Tests are cited as `file::test`, under `tests/` for the core crate and
 `admin/tests/` (or a `src` module) for the admin crate. "Spec §N" is a section
 of the design spec; a bare "§N.M" is an entry in this document.
 
-Reviews 01 and 03 changed some of these decisions after they shipped. An entry
-a review changed is updated and says **Changed by review 01** or **Changed by
-review 03**; an entry it replaced says **Superseded** and is kept as history.
+Reviews 01, 03 and 04 changed some of these decisions after they shipped. An
+entry a review changed is updated and says **Changed by review 01**, **Changed
+by review 03** or **Changed by review 04**; an entry it replaced says
+**Superseded** and is kept as history.
 Both link to the entry in [Review decisions](ReviewDecisions.md) that says what
 changed and why.
 
@@ -120,6 +121,11 @@ changed and why.
   lists a schedule whose arguments do not parse
   ([Review decisions, entries 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)
   and [40](ReviewDecisions.md#40-schedule-reads-do-not-decode-arguments)).
+- **Changed by review 04:** `task_key` in `GET /api/tasks/:id` is tagged like
+  `payload`: `{"valid": "<key>"}`, or `{"invalid": {"text", "error"}}` for a
+  stored key that breaks the identifier rule. It was a string, and such a task
+  could not be read at all
+  ([Review decisions, entry 44](ReviewDecisions.md#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
 
 ### 1.5 `queue_admin_actions` replaces `queue_task_replays`
 
@@ -1272,6 +1278,10 @@ changed and why.
   stored text, followed by `Unreadable payload:` and the parse error; before,
   the whole page failed to load
   ([Review decisions, entry 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)).
+- **Changed by review 04:** a key that breaks the identifier rule is shown as
+  its stored text followed by `(invalid: <error>)`; before, the whole page
+  failed to load
+  ([Review decisions, entry 44](ReviewDecisions.md#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
 
 ### 7.7 Mounted under a prefix
 

@@ -271,8 +271,9 @@ transaction (nested transactions become savepoints).
 
 | Operation | Function | Notes |
 | --- | --- | --- |
-| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison (JSONB equality ignores key order). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. If that row is gone (cleanup deleted it in between), the insert runs again, for at most 3 passes, then `SchedulerError::Contention`. A key starting with `schedule:` is `SchedulerError::ReservedTaskKey`, and `args` whose JSON text the claim's parser rejects (nesting deeper than 128, for example) are `SchedulerError::Serde`, both before any SQL. |
-| Claim | `store::claim(conn, worker, queue, names, limit, lease)` | One writable CTE: `SKIP LOCKED` candidates → `running`, `attempts + 1`, `lock_token + 1`, `locked_until = clock_timestamp() + lease` → attempt rows inserted → rows returned, `payload` as text. Each row is then converted on its own: one whose attempt number, `task_key`, payload or `max_attempts` fails is logged and dead-lettered by its ownership key, and the rest are returned as typed claims; an error while dead-lettering is logged and that row skipped. Returns nothing while the queue has a `queue_pauses` row. |
+| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison (JSONB equality ignores key order). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. If that row is gone (cleanup deleted it in between), the insert runs again, for at most 3 passes, then `SchedulerError::Contention`. A key starting with `schedule:` is `SchedulerError::ReservedTaskKey`, and `args` whose JSON text the claim's parser rejects (nesting deeper than 128, for example) are `SchedulerError::Serde`, both before any SQL. Before the insert, `SELECT $1::jsonb::text` returns the payload as PostgreSQL will store it, and that text is decoded as `T::Args`, as the worker decodes it: a decode failure (an `f64` NaN, stored as `null`) is `Serde`, and a value that differs from the arguments (JSONB normalizes numbers, so `1e18` comes back as an integer) is `SchedulerError::PayloadNotPreserved`. Nothing is written either way. |
+| Claim | `store::claim(conn, worker, queue, names, limit, lease)` | One writable CTE: `SKIP LOCKED` candidates → `running`, `attempts + 1`, `lock_token + 1`, `locked_until = clock_timestamp() + lease` → attempt rows inserted → rows returned, `payload` as text. Each row is then converted on its own, and the call returns a `ClaimBatch`: `ready` holds the typed claims, and `poisoned` each row whose attempt number, `task_key`, payload or `max_attempts` fails, still leased and untouched. `claim` runs no dead-letter statement. Returns nothing while the queue has a `queue_pauses` row. |
+| Dead-letter | `store::dead_letter(conn, &poisoned)` | Fails a `PoisonedClaim` permanently by its ownership key, through the same lock-then-check path as permanent failure, with its reason (for example `invalid payload: …`) as the error. `LostOwnership` once the lease has expired or moved on. The worker calls it on a task of its own after dispatching the batch's ready rows; a row it misses stays `running` until the reaper requeues it, and a later claim poisons it again until its attempts run out. |
 | Heartbeat | `store::heartbeat(conn, lease, duration)` | In one transaction, locks the row, then extends `locked_until` from `clock_timestamp()`. |
 | Lock for DB work | `store::lock_owned(conn, lease)` | `SELECT … FOR UPDATE` with the ownership predicate. |
 | Complete | `store::complete(conn, lease)` | Task → `done`, attempt → `done`. |
@@ -328,7 +329,10 @@ row closes.
 With the `cron` feature, `jobs::create` and `jobs::ensure_job` write a schedule.
 `CreateJob::for_task::<T>` takes the task name, queue and argument type from
 `T: Task`; `CreateJob::new` takes a `TaskName` and any serializable arguments,
-for a task whose type is not at hand.
+for a task whose type is not at hand. For a `for_task` spec, `create` and
+`ensure_job` first check the arguments' stored form as `enqueue` does, and
+return `SchedulerError::PayloadNotPreserved` without writing if it decodes to
+different values.
 
 - `ensure_job` inserts by name, or on conflict updates the task name, cron,
   arguments, `max_attempts` and queue. It never changes the pause state or the
@@ -384,13 +388,15 @@ loop:     [cron] materialize due schedules, at most once per max_poll_interval
           max_poll_interval (a finishing handler, a notification or shutdown wakes it)
           for each queue with a free permit, in configuration order, on one connection:
             claim up to min(its free permits, claim_batch_size) from that queue
-            spawn one dispatch per claim, holding one of that queue's permits
-          if any batch was full: loop again immediately
+            spawn one dispatch per ready claim, holding one of that queue's permits
+            then, if any rows were poisoned, spawn one task that dead-letters them
+            on a connection of its own (logged on failure; the reaper recovers them)
+          if any batch was full of ready claims: loop again immediately
           otherwise wait for the first of: notification, next due_at among queues
           that still have a free permit (clamped to 10 ms..max_poll_interval;
           max_poll_interval if none has, or if a due task could not be claimed
           because another transaction locks it), [cron] the next materialization,
-          a handler finishing, shutdown
+          a dispatch or dead-letter task finishing, shutdown
 maintain: every reaper_interval, prune registry rows not written for 24 h, then
           rounds of one reap batch then one cleanup batch until both run short
 dispatch: if the local deadline has already passed (a slow claim response),
@@ -430,13 +436,15 @@ connection itself, so a wait for one is dropped with it, and spawns nothing if
 the deadline has passed by then. The spawned transaction first sets
 `lock_timeout` and `statement_timeout` to the time left until the local
 deadline (milliseconds rounded up, at least 1, at most `i32::MAX`, about 24.8
-days). `lock_timeout` applies to each lock wait, and a statement can wait more
-than once, so `statement_timeout` bounds each statement as a whole, and the
-lock statement ends by the deadline. After the row lock it checks a token that
-the dispatch cancels however it ends (finished, lease lost, released, or
-dropped with the scheduler future, but not when graceful shutdown begins), and
-rolls back without renewing if it is cancelled. A dispatch that ends between
-that check and the update still gets that one renewal.
+days), except that each keeps the session's value when that is non-zero and
+smaller, so the heartbeat never raises a timeout the host set. `lock_timeout`
+applies to each lock wait, and a statement can wait more than once, so
+`statement_timeout` bounds each statement as a whole, and the lock statement
+ends by the deadline. After the row lock it checks a token that the dispatch
+cancels however it ends (finished, lease lost, released, or dropped with the
+scheduler future, but not when graceful shutdown begins), and rolls back without
+renewing if it is cancelled. A dispatch that ends between that check and the
+update still gets that one renewal.
 
 The local deadline is `Instant` at claim send + `lease_duration`, moved forward
 on each successful heartbeat. It only gives up ownership early. PostgreSQL alone
@@ -490,17 +498,24 @@ recovers it after the lease expires.
   `Serialize + DeserializeOwned` payload type together. `enqueue::<T>`,
   `register_task::<T>` and `CreateJob::for_task::<T>` all use it. `enqueue`
   and `CreateJob` parse the JSON text of the arguments back with the claim's
-  parser, so they reject a payload the worker could not parse. `store::task`
-  returns the payload as a `TaskPayload`: `Json`, or
-  `Unreadable { text, error }` for a stored value that does not parse (one
-  written by direct SQL), so its dead letter can still be read.
+  parser, so they reject a payload the worker could not parse. The typed
+  `enqueue::<T>`, and `jobs::create` and `jobs::ensure_job` for a
+  `CreateJob::for_task::<T>` spec, also decode the payload as PostgreSQL stores
+  it as `T::Args`, and reject arguments that come back as different values
+  (`PayloadNotPreserved`). `store::task` returns the payload as a
+  `TaskPayload`: `Json`, or `Unreadable { text, error }` for a stored value that
+  does not parse (one written by direct SQL), and the key as a `StoredTaskKey`:
+  `Valid`, or `Invalid { text, error }` for a stored key that breaks the
+  identifier rule. Either way its dead letter can still be read.
 - Text identifiers are validated newtypes: `TaskKey`, `TaskName`, `QueueName`,
   `WorkerId`, `ScheduleName` (`cron`), `EffectName` and `Topic` (1 to 255
   characters, no leading or trailing whitespace, no NUL), and `CommandKey`
   (non-empty, no NUL, at most 2048 bytes). They are validated when constructed
   and again when decoded from the database, so a row written by direct SQL with
-  an invalid value is a decode error. `TaskId`, `LockToken` and `JobId` carry no
-  rule. `enqueue` also rejects a `TaskKey` with the reserved `schedule:` prefix.
+  an invalid value is a decode error. The claim and `store::task` read
+  `task_key` as text instead, so such a row can still be dead-lettered and
+  opened. `TaskId`, `LockToken` and `JobId` carry no rule. `enqueue` also
+  rejects a `TaskKey` with the reserved `schedule:` prefix.
 - `TaskLease { task_id, worker_id, lock_token, attempt_no }` is the ownership
   proof every guarded transition takes. Handlers receive it as `ctx.lease`.
   `attempt_no` is an `AttemptNo`, which counts from 1; the attempt counts on
@@ -536,6 +551,8 @@ recovers it after the lease expires.
   running.
 - Heartbeat is a two-statement transaction: the row lock, then the guarded
   `UPDATE`. The worker's heartbeat sets its timeouts first, so it is three.
+- A typed `enqueue`, and a typed schedule's `create` or `ensure_job`, run one
+  more query first, to check the arguments' stored form.
   Completion, retry, failure and release add the attempt close, so they are
   three.
 - The reaper and cleanup loop over bounded batches on a separate task, so a large

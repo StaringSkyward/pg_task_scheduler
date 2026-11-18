@@ -1,6 +1,6 @@
 # Review Decisions and Expected Behaviour
 
-This records what was decided about each finding of the three
+This records what was decided about each finding of the four
 whole-repository reviews made before the first release, and what each decision
 looks like from outside. The reviews themselves are kept out of the repository,
 so each entry restates its finding.
@@ -11,17 +11,19 @@ so each entry restates its finding.
   its findings 1–12 in order; entry 33 cuts across them.
 - **Review 03** was run at `1390560`, the head of PR #9. Entries 34–42 follow
   its findings 1–9 in order.
+- **Review 04** was run at `a3ab225`, the head of PR #9. Entries 43–46 follow
+  its findings 1–4 in order.
 
 It describes the code as shipped. Each entry has a source: **(user)** means the
 user decided it; **(call)** means it was a judgement call, open to change.
 **Ruling** marks a call made during implementation, recorded in the entry it
 affects. Where a later review changed an entry, that entry ends with a
-**Changed by review 02** or **Changed by review 03** line that says what is
-different now and links to the later entry.
+**Changed by review 02**, **Changed by review 03** or **Changed by review 04**
+line that says what is different now and links to the later entry.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
-02 (entries 17 and 33); review 03 changed none. A database built by an earlier
-version of this repository must be dropped and recreated.
+02 (entries 17 and 33); reviews 03 and 04 changed none. A database built by an
+earlier version of this repository must be dropped and recreated.
 
 ## Review 01: findings
 
@@ -132,6 +134,14 @@ version of this repository must be dropped and recreated.
   of through `fail_permanently`, and logs and skips a row it cannot dead-letter
   instead of failing the call
   ([entry 22](#22-claim-dead-letters-any-row-that-fails-conversion)).
+- **Changed by review 04:** the claim returns a row with an invalid key in
+  `ClaimBatch::poisoned` instead of dead-lettering it, and the worker
+  dead-letters it after dispatching the rest; the test is now
+  `claim::claim_poisons_a_row_with_an_invalid_task_key_and_returns_the_rest`
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
+  `store::task` reads `task_key` as text too, so such a row can be opened, with
+  `TaskView.task_key` as `StoredTaskKey::Invalid`
+  ([entry 44](#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
 
 ### 5. The schema puts optional and multi-valued facts in their own relations
 
@@ -326,6 +336,9 @@ version of this repository must be dropped and recreated.
   ([entry 29](#29-store-inputs-have-checked-types)). A claimed row whose
   `max_attempts` is below 1 is dead-lettered, not `Invariant`
   ([entry 22](#22-claim-dead-letters-any-row-that-fails-conversion)).
+- **Changed by review 04:** the claim returns such a row as poisoned, and the
+  worker dead-letters it
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
 
 ### 9. Intervals must be at least one microsecond
 
@@ -547,6 +560,10 @@ version of this repository must be dropped and recreated.
 - **Changed by review 03:** `GET /api/tasks/:id` gains `payload`, tagged
   `json` or `unreadable`
   ([entry 36](#36-producers-reject-payloads-the-worker-cannot-parse)).
+- **Changed by review 04:** `task_key` in `GET /api/tasks/:id` is no longer a
+  string. It is tagged like `payload`: `{"valid": "<key>"}`, or
+  `{"invalid": {"text", "error"}}` for a stored key that breaks the identifier
+  rule ([entry 44](#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
 
 ### 19. Left out of scope
 
@@ -687,6 +704,17 @@ version of this repository must be dropped and recreated.
   holds ([entry 36](#36-producers-reject-payloads-the-worker-cannot-parse)).
   The dead letter's error text has each NUL escaped
   ([entry 37](#37-task-diagnostics-escape-nul)).
+- **Changed by review 04:** `claim` no longer dead-letters. It returns a
+  `ClaimBatch`: the typed claims in `ready`, and each row that fails conversion
+  in `poisoned`, still leased and untouched, with the same reason text.
+  `store::dead_letter` fails a poisoned row by the same ownership key and
+  lock-then-check path. The worker dispatches the ready rows first, then logs
+  and dead-letters the poisoned ones on a task of its own, with the same log
+  messages, so a slow dead-letter cannot spend a healthy row's lease
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
+  The payload test is now
+  `claim::claim_poisons_a_row_whose_payload_does_not_parse_and_returns_the_rest`,
+  and dead-letters each poisoned row itself.
 
 ### 23. The materializer decodes nothing a stored value can break
 
@@ -923,6 +951,9 @@ version of this repository must be dropped and recreated.
 - **Changed by review 03:** `build()` checks retention second, also before the
   empty registry
   ([entry 39](#39-cleanup-checks-retention-before-its-first-delete)).
+- **Changed by review 04:** the claim returns a row with an out-of-range stored
+  value as poisoned, and the worker dead-letters it
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
 
 ### 30. `ensure_job` survives a concurrent delete
 
@@ -1133,6 +1164,12 @@ version of this repository must be dropped and recreated.
     row lock and the update.
   - A custom `SchedulerPool` whose `Conn` borrows from the pool no longer
     compiles.
+- **Changed by review 04:** each timeout is the time left, or the session's own
+  value when that is non-zero and smaller, so the heartbeat never raises a
+  stricter timeout the host set, instead of overriding it
+  ([entry 46](#46-the-heartbeat-never-raises-the-hosts-timeouts)). The helper is
+  now `timeout_budget`, and its test
+  `transitions::tests::timeout_budget_is_whole_ms_at_least_one_at_most_i32_max`.
 
 ### 36. Producers reject payloads the worker cannot parse
 
@@ -1195,6 +1232,15 @@ version of this repository must be dropped and recreated.
     (`api::task_route_payload_is_json_or_unreadable`).
   - Code that read `TaskView.payload` as a `serde_json::Value` matches on
     `TaskPayload` instead.
+- **Changed by review 04:** the typed producers decode the payload as PostgreSQL
+  stores it, not the value before storage, and reject arguments that decode to
+  different values with `SchedulerError::PayloadNotPreserved`. `enqueue::<T>`
+  checks before its insert, and `jobs::create` and `jobs::ensure_job` check a
+  `for_task` spec before writing. `for_task` still rejects a NaN when built
+  ([entry 43](#43-typed-producers-check-their-arguments-as-jsonb-stores-them)).
+  The claim returns a row it cannot parse as poisoned, and the worker
+  dead-letters it
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
 
 ### 37. Task diagnostics escape NUL
 
@@ -1225,6 +1271,9 @@ version of this repository must be dropped and recreated.
     (`worker::permanent_failure_with_a_nul_in_its_message_is_recorded`).
   - Text that already contains a backslash followed by `0` reads the same as an
     escaped NUL.
+- **Changed by review 04:** the claim's dead-letter is now `store::dead_letter`,
+  which the worker calls after the claim; it binds its reason the same way
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
 
 ### 38. Enqueue retries when cleanup deletes the incumbent
 
@@ -1309,6 +1358,9 @@ version of this repository must be dropped and recreated.
     (`api::list_jobs_survives_unreadable_args`).
   - Its occurrences are still created, and the claim dead-letters each of them
     (entries 22 and 23).
+- **Changed by review 04:** the claim returns each such occurrence as poisoned,
+  and the worker dead-letters it
+  ([entry 45](#45-claim-returns-poisoned-rows-for-the-caller-to-dead-letter)).
 
 ### 41. `max_poll_interval` is a wake cadence, not a latency bound
 
@@ -1345,3 +1397,216 @@ version of this repository must be dropped and recreated.
 - **Why:** A downstream role is configured from the design, so the design must
   say which statements the table takes.
 - **Expected behaviour:** No code or schema change.
+
+## Review 04: findings
+
+### 43. Typed producers check their arguments as JSONB stores them
+
+- **Finding:** The typed `enqueue::<T>` and `CreateJob::for_task::<T>` decoded
+  the arguments as `T::Args` from the `serde_json::Value` before PostgreSQL
+  stored it as JSONB, but the worker decodes the stored text, and JSONB
+  normalizes numbers. An untagged enum of `Count(u64)` and `Ratio(f64)` passed
+  the check as `Ratio(1e18)`, PostgreSQL stored the number as
+  `1000000000000000000`, and the worker decoded `Count(1000000000000000000)`, a
+  different effect. A type that accepts only a JSON float passed with `1e18`,
+  then failed to decode in the worker, a permanent failure after a successful
+  enqueue.
+- **Source:** user (approach a: keep JSONB, and check the stored form before
+  writing).
+- **Decision:**
+  - **The check:** before writing, a typed producer asks PostgreSQL for the
+    stored form of the payload (`SELECT $1::jsonb::text`), parses that text and
+    decodes it as `T::Args`, as the worker does. A decode failure is
+    `SchedulerError::Serde`. If the stored form differs from the payload, the
+    decoded value is serialized again, and if that differs from the payload
+    too, the call returns the new `SchedulerError::PayloadNotPreserved`
+    (`task arguments change meaning when stored as JSONB`). `Value` equality
+    tells a `u64` number from an `f64` one. Nothing is written either way.
+  - **Where it runs:** `enqueue::<T>` runs it once, before its insert.
+    `CreateJob::for_task::<T>` records it for `T::Args` as a function pointer,
+    and `jobs::create` and `jobs::ensure_job` run it before their transaction.
+    `CreateJob::new` has no argument type, so it records none. `for_task` still
+    decodes the serialized value when it is built, so a NaN fails there, as in
+    entry 36.
+  - **Idempotency** stays JSONB equality: two accepted payloads that JSONB
+    stores equally decode to equal values.
+  - **Cost:** one more query per typed `enqueue`, and per `create` or
+    `ensure_job` of a `for_task` spec.
+  - Ruling: when the stored form parses to a `Value` equal to the payload, the
+    check accepts without serializing the decoded value again; otherwise it
+    compares as specified. The spec compared the re-serialized value always,
+    which rejected a `HashSet<String>` of 20 entries, because a new `HashSet`
+    serializes in another order. When storage changed nothing, the worker
+    decodes exactly what the producer serialized, so this accepts only cases
+    where meaning cannot have changed. The remaining gap, arguments with both
+    an unordered collection and a whole float of at least 1e16 (a `HashSet`
+    beside an `f64` of `1e18`), is marked `ponytail:` in `check_stored`:
+    accepting them would need `PartialEq` on `Task::Args`. If wrong, those
+    arguments are still wrongly rejected, which is safe.
+- **Why:** A producer's success should mean the handler decodes the arguments
+  the producer sent. Checking the stored form covers every codec, not just
+  untagged enums, and keeps the JSONB column and the equality idempotency
+  uses.
+- **Expected behaviour:**
+  - `enqueue` of `Amount::Ratio(1e18)` is `PayloadNotPreserved` and inserts
+    nothing (`enqueue::enqueue_rejects_args_whose_meaning_changes_in_jsonb`).
+    `jobs::create` and `jobs::ensure_job` reject the same `for_task` schedule
+    and write no row
+    (`jobs::for_task_rejects_args_whose_meaning_changes_in_jsonb`).
+  - A struct with an `f64` of `1e18`, and `Amount::Count(5)`, are accepted, and
+    their claimed payloads decode to equal values
+    (`enqueue::accepted_args_decode_equal_after_storage`). A `HashSet<String>`
+    of 20 entries is accepted
+    (`enqueue::enqueue_accepts_args_that_reserialize_in_another_order`).
+  - A task with `Args = serde_json::Value` holding an `f64` of magnitude 1e16
+    or more in the 64-bit integer range, such as `json!({"x": 1e18})`, is now
+    `PayloadNotPreserved`. `serde_json` writes such a float in exponent form,
+    JSONB stores it as an integer, and the handler would receive an integer
+    `Value`. Smaller floats, and floats beyond the 64-bit range, which read
+    back as floats, are accepted as before. The `enqueue` rustdoc and the
+    README's Enqueue section say so.
+  - `enqueue` of an `f64` NaN is still `Serde`, now because the stored `null`
+    does not decode.
+  - `SchedulerError` has a new variant.
+
+### 44. A dead letter with an invalid task key can be opened
+
+- **Finding:** The claim reads `task_key` as text, so it can dead-letter a row
+  whose key breaks the identifier rule (entry 4), but `store::task` decoded the
+  column as a `TaskKey` and failed on that row. The admin task page and
+  `GET /api/tasks/:id` both read through it, so an operator could not open the
+  dead letter, the failure that entry 36 removed for an unparseable payload.
+  The review stored an empty key by SQL: the claim marked the row `dead` with
+  `invalid task_key`, and `store::task` returned an error for its id.
+- **Source:** call.
+- **Decision:**
+  - `TaskView.task_key` is a `StoredTaskKey`, exported from the crate root:
+    `Valid(TaskKey)`, or `Invalid { text, error }` with the stored text and the
+    `IdentifierError`. `StoredTaskKey::as_str` gives the key or the raw text.
+    `TaskKey` keeps its rule.
+  - `store::task` reads `task_key::text` and returns every other field even
+    when the key is invalid; `store::task_detail` reads through it.
+  - **Admin:** `GET /api/tasks/:id` tags `task_key` like `payload`:
+    `{"valid": "<key>"}`, or `{"invalid": {"text": "...", "error": "..."}}`.
+    It was a string. The task page shows the stored text followed by
+    `(invalid: <error>)`.
+- **Why:** The record that explains a dead letter must stay readable, whatever
+  made the row unusable.
+- **Expected behaviour:**
+  - After the claim poisons a row with a 300-character key and it is
+    dead-lettered, `store::task` returns it with `StoredTaskKey::Invalid`, the
+    300-character text and `IdentifierError::TooLong`
+    (`claim::claim_poisons_a_row_with_an_invalid_task_key_and_returns_the_rest`).
+  - `GET /api/tasks/:id` returns `{"valid": ...}` for an enqueued task, and
+    `{"invalid": {...}}` with the text and a non-empty error for one with a
+    300-character key (`api::task_route_task_key_is_valid_or_invalid`).
+  - The page of a dead task with a 300-character key shows the key and
+    `(invalid: identifier must be at most 255 characters)`
+    (`pages::task_page_shows_why_a_task_key_is_invalid`).
+  - Code that read `TaskView.task_key` as a `TaskKey` matches on
+    `StoredTaskKey` or calls `as_str()`. A JSON client reads `task_key.valid`.
+
+### 45. Claim returns poisoned rows for the caller to dead-letter
+
+- **Finding:** Claim leases its whole batch in one statement, then awaited a
+  dead-letter transition for each row that failed conversion before returning
+  the healthy rows. A slow dead-letter therefore spent the healthy rows' lease.
+  The review delayed the dead-letter update by 220 ms under a 90 ms lease:
+  claim returned the healthy row with its lease already expired, so entry 34's
+  deadline check rightly started no handler, but the row lost an attempt, and
+  repeated delays could exhaust its attempts.
+- **Source:** call.
+- **Decision:**
+  - **Return type:** `store::claim` returns a
+    `ClaimBatch { ready, poisoned }` and runs no dead-letter statement.
+    `ready` holds the `ClaimedTask`s. Each row whose attempt number,
+    `task_key`, payload or `max_attempts` fails to convert is a
+    `PoisonedClaim { task_id, worker_id, lock_token, reason }`, still
+    `running` under its lease, with the reason text entry 22 records (for
+    example `invalid payload: …`).
+  - **Dead-lettering:** `store::dead_letter(conn, &PoisonedClaim)` fails the
+    row permanently by its ownership key, through the same lock-then-check
+    path as `fail_permanently`, with `reason` as its error. It returns
+    `LostOwnership` once the lease has expired or moved on.
+  - **Direct callers:** `claim`'s doc tells them to dead-letter each poisoned
+    row after dispatching the ready ones. A row left alone stays `running`
+    until the reaper requeues it, and a later claim poisons it again until its
+    attempts run out. `Scheduler` does this itself.
+  - **Worker:** it dispatches every ready claim first, then, if the batch has
+    poisoned rows, spawns one task for them, which the claim cycle never
+    awaits. The task logs each row (`claimed task is unusable; marking it
+    dead`), takes a connection of its own and dead-letters the rows in turn. A
+    failure is logged (`could not dead-letter the task; skipping it`, or
+    `could not dead-letter the tasks; skipping them` when it cannot get a
+    connection), and the reaper recovers the row. The task runs in the same
+    set as the dispatches, so shutdown drains it like one.
+  - Ruling: `ClaimBatch` and `PoisonedClaim` stay in `store`, with the other
+    store results, reached as `store::ClaimBatch`; the crate root does not
+    re-export them. If wrong, it is a one-line re-export.
+  - Ruling: a full batch, and whether the cycle claimed anything, count only
+    ready rows. Counting poisoned rows too, as first implemented, removed the
+    back-pressure: a poisoned row takes no permit, so a full batch of them made
+    the loop claim again at once and spawn a connection-holding dead-letter
+    task per batch of a poisoned backlog. Counting ready rows restores the
+    wait, which a finished task ends, and that paces dead-letter work to about
+    one task per queue at a time. If wrong, a one-permit semaphore is the
+    alternative.
+- **Why:** The claim has already committed every row's lease, so quarantine
+  work for one row must not spend another's. The reaper is already the
+  recovery path for a lease nobody finishes.
+- **Expected behaviour:**
+  - Right after `claim`, a row with an unparseable payload is in `poisoned`,
+    with its id, worker, `LockToken(1)` and an `invalid payload: …` reason, and
+    the task is still `running` with its attempt open
+    (`claim::claim_returns_poisoned_rows_without_touching_them`).
+  - With a 90 ms lease and a trigger that delays every dead-letter update by
+    250 ms, a healthy task claimed beside a `{"x":1e500}` row still reaches
+    `done` (`worker::slow_dead_letter_does_not_delay_a_healthy_claim`).
+  - Six poisoned rows with `claim_batch_size = 1` are all dead-lettered, and no
+    more than one of them is ever `running` at once
+    (`claim_loop::poisoned_backlog_is_dead_lettered_one_batch_at_a_time`).
+  - `store::dead_letter` leaves a poisoned row `dead`, with the same
+    `last_error` and closed attempt as before
+    (`claim::claim_poisons_a_row_with_an_invalid_task_key_and_returns_the_rest`,
+    `claim::claim_poisons_a_row_whose_payload_does_not_parse_and_returns_the_rest`).
+  - In a running worker the bad row of a batch now becomes `dead` shortly
+    after the claim, not within it
+    (`worker::healthy_task_in_a_batch_with_a_bad_payload_runs`).
+  - While poisoned rows keep arriving, dead-lettering takes about one more pool
+    connection per queue at a time; the README's Connections note says so.
+  - Code calling `store::claim` reads `.ready`, and dead-letters `.poisoned`
+    itself or leaves those rows to the reaper.
+
+### 46. The heartbeat never raises the host's timeouts
+
+- **Finding:** The worker's bounded heartbeat (entry 35) set `lock_timeout`
+  and `statement_timeout` for its transaction to the time left on the lease,
+  replacing the session's values. A host that set short timeouts on its pool
+  could have a heartbeat hold a connection far longer: with both at 30 ms and
+  a 2 s budget, the review's heartbeat was still waiting on a row lock after
+  120 ms, and succeeded when the blocker committed. Review 03 documented the
+  override; this reverses that call.
+- **Source:** call.
+- **Decision:** In the heartbeat's `set_config` statement, each of
+  `lock_timeout` and `statement_timeout` keeps the session's current value
+  when that is non-zero and smaller than the lease budget, and takes the
+  budget otherwise. A session value of `0` means no limit, so the budget
+  applies. Both stay local to the transaction, and the budget is computed as
+  before (milliseconds rounded up, 1 to `i32::MAX`). The post-lock
+  cancellation check and the ownership checks are unchanged. The README's
+  Timeouts note says the heartbeat never raises a stricter `lock_timeout` or
+  `statement_timeout` the host set.
+- **Why:** The host's timeouts are its caps on a pool it owns. The heartbeat
+  only needs a bound no later than its lease, and a stricter host bound
+  already meets that.
+- **Expected behaviour:**
+  - With both session timeouts at 30 ms and a 2 s budget, a bounded heartbeat
+    blocked on a row lock returns a database error within 500 ms, and the
+    session's values are still 30 ms afterwards
+    (`transitions::bounded_heartbeat_respects_a_stricter_session_timeout`).
+  - With PostgreSQL's default of `0`, the budget applies as before
+    (`transitions::bounded_heartbeat_gives_up_when_its_lock_wait_exceeds_the_bound`).
+  - A heartbeat that hits a host timeout counts as a failed heartbeat
+    (`pg_task_scheduler_heartbeat_failures_total`), and the lease keeper tries
+    again at the next interval until the local deadline, as for any other
+    heartbeat error.

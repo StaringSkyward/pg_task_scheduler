@@ -224,6 +224,9 @@ async fn insert_pause(conn: &mut AsyncPgConnection, id: JobId) -> Result<(), Sch
 
 /// Strict insert: errors if a job with this name already exists. The initial
 /// cursor is computed from the DB clock; a `Paused` spec also gets its pause row.
+/// A spec from [`CreateJob::for_task`] first has its arguments checked as `enqueue` checks
+/// them, at one extra round trip: arguments that decode as different values once stored as
+/// JSONB are [`SchedulerError::PayloadNotPreserved`], and nothing is written.
 pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job, SchedulerError> {
     if let Some(check) = spec.stored_check {
         check(conn, &spec.args).await?;
@@ -251,6 +254,8 @@ pub async fn create(conn: &mut AsyncPgConnection, spec: CreateJob) -> Result<Job
 /// can never resurrect a job an operator paused (or pause one they resumed). Use
 /// [`reschedule`] to move the cursor explicitly. If concurrent deletes of the job keep
 /// invalidating the operation, three passes later it returns [`SchedulerError::Contention`].
+/// A spec from [`CreateJob::for_task`] first has its arguments checked as [`create`] does, at
+/// one extra round trip; on [`SchedulerError::PayloadNotPreserved`] nothing is written.
 pub async fn ensure_job(
     conn: &mut AsyncPgConnection,
     spec: CreateJob,

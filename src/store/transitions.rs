@@ -278,9 +278,10 @@ pub async fn heartbeat(
 
 /// [`heartbeat`] for the worker's lease keeper, which spawns it. It bounds `lock_timeout` and
 /// `statement_timeout` by `lock_wait` for its transaction, so its row lock statement cannot
-/// wait past the lease, but never raises a stricter non-zero value the host set on the session, and once it has the lock it renews nothing if `stop` is cancelled:
-/// its dispatch has ended. Either way it rolls back; a timeout is the database error, a
-/// cancelled `stop` is `LostOwnership`.
+/// wait past the lease, but never raises a stricter non-zero value the host set on the session.
+/// Once it has the lock, it renews nothing if `stop` is cancelled: its dispatch has ended.
+/// Either way it rolls back; a timeout is the database error, a cancelled `stop` is
+/// `LostOwnership`.
 #[doc(hidden)]
 pub async fn heartbeat_bounded(
     conn: &mut AsyncPgConnection,
@@ -304,10 +305,10 @@ pub async fn heartbeat_bounded(
     .await
 }
 
-/// `lock_wait` as a timeout budget for `lock_timeout` and `statement_timeout`: milliseconds rounded up, at
-/// least 1 because 0 means no timeout, and at most `i32::MAX` (about 24.8 days), the largest
-/// PostgreSQL accepts. A lease longer than that still ends its keeper at the local deadline;
-/// only the spawned heartbeat's waits are capped there.
+/// `lock_wait` as a timeout budget for `lock_timeout` and `statement_timeout`: milliseconds
+/// rounded up, at least 1 because 0 means no timeout, and at most `i32::MAX` (about 24.8 days),
+/// the largest PostgreSQL accepts. A lease longer than that still ends its keeper at the local
+/// deadline; only the spawned heartbeat's waits are capped there.
 fn timeout_budget(lock_wait: Duration) -> String {
     let ms = i32::try_from(lock_wait.as_micros().div_ceil(1000))
         .unwrap_or(i32::MAX)

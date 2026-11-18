@@ -110,6 +110,19 @@ a lock wait, `ensure_job`'s recreate-on-delete and claim rely on it, and under
 `REPEATABLE READ` they fail with a `40001` serialization error rather than their
 documented outcome. The materializer enforces it itself.
 
+**Arguments:** `enqueue` checks that the handler will decode the arguments it
+was given, and writes nothing if not. Arguments the worker cannot parse back or
+decode as `T::Args` (nested deeper than 128, or an `f64` NaN, which serializes
+as `null`) are `SchedulerError::Serde`. Arguments that decode as different
+values once PostgreSQL stores them as JSONB are
+`SchedulerError::PayloadNotPreserved`. JSONB normalizes numbers, so an `f64` of
+`1e18` comes back as the integer `1000000000000000000`, which an untagged enum
+may decode as another variant. With `Args = serde_json::Value`, any `f64` of
+magnitude 1e16 or more in the 64-bit integer range, such as
+`json!({"x": 1e18})`, is rejected: `serde_json` writes it in exponent form, and
+the handler would receive an integer. This check costs one extra round trip per
+`enqueue`.
+
 **Idempotency horizon:** a `task_key` stays reserved while its row exists, which
 is `Retention::done` after completion for done tasks and `Retention::dead` for
 dead and cancelled ones (30 days by default). Producers must not reuse a key
@@ -534,7 +547,10 @@ scanning retained rows (see
   handlers take. A smaller pool starves heartbeats until local deadlines drop
   handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4 on a
   2-vCPU host), well below the 16 + 2 = 18 that the default queue's limit of 16
-  needs.
+  needs. Claimed rows that cannot run (a key, payload or count written by direct
+  SQL that the types reject) are dead-lettered on a connection of their own,
+  about one per queue at a time while such rows keep arriving, so leave that
+  much room if direct SQL writes tasks.
 
 ### Observability
 
@@ -614,7 +630,10 @@ Build the schedule with `CreateJob::for_task::<T>(name, cron, max_attempts,
 lifecycle, args)`: the task name, queue and argument type come from `T`.
 `CreateJob::new(name, task_name, ...)` is the untyped alternative, for a task
 whose type is not at hand; it takes any serializable `args` and the `default`
-queue. `CreateJob::queue(..)` overrides the queue for either.
+queue. `CreateJob::queue(..)` overrides the queue for either. `jobs::create` and
+`jobs::ensure_job` check a `for_task` schedule's arguments as `enqueue` does
+(see [Enqueue](#enqueue)), and return `PayloadNotPreserved` without writing if
+storage would change them.
 
 Each due occurrence becomes an ordinary queue task with
 `task_key = "schedule:{id}:{scheduled_for}"`, so a re-materialized occurrence

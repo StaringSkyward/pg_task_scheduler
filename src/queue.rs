@@ -178,7 +178,10 @@ const EXISTING: &str = r#"
 /// different values once PostgreSQL stores them as JSONB are
 /// [`SchedulerError::PayloadNotPreserved`], and nothing is written: JSONB normalizes numbers, so
 /// an `f64` of `1e18` reads back as the integer `1000000000000000000`, which an untagged enum
-/// may decode as another variant. That check costs one extra round trip.
+/// may decode as another variant. With `Args = serde_json::Value` this rejects any `f64` of
+/// magnitude 1e16 or more in the 64-bit integer range, such as `json!({"x": 1e18})`:
+/// `serde_json` writes it in exponent form, and the handler would receive an integer. That
+/// check costs one extra round trip.
 /// A key starting with `schedule:` is reserved for the scheduler and returns
 /// [`SchedulerError::ReservedTaskKey`]. If concurrent cleanup keeps deleting the conflicting
 /// task before it can be read, three passes later it returns [`SchedulerError::Contention`].

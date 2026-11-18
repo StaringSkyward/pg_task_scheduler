@@ -63,6 +63,15 @@ The statement is atomic, so a claim and its attempt row commit together or not a
 all. Concurrent claimers skip each other's locked rows, so a queued task gets one
 owner.
 
+Rust then converts each claimed row on its own. A row that fails (a key,
+payload or count written by direct SQL that the types reject) comes back in
+`ClaimBatch::poisoned`, still leased, instead of failing the call. The worker
+dispatches the ready rows first, then dead-letters the poisoned ones with
+`store::dead_letter` on a task and connection of their own, so a slow
+dead-letter cannot spend a healthy row's lease. A poisoned row it misses stays
+`running` until the reaper requeues it, and a later claim poisons it again
+until its attempts run out.
+
 A scheduler serves the queues configured with `.queue(name, limit)` (by default
 `default` at 16), each with its own permits. Each cycle, it claims from every
 queue with a free permit, in configuration order, at most
@@ -146,17 +155,18 @@ on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
 handler finished, or the local deadline passed) the heartbeat still commits or
 rolls back, and never leaves an open transaction holding the row lock. The
 spawned heartbeat is bounded by the lease: its `lock_timeout` and
-`statement_timeout` are both the time left until the local deadline.
-PostgreSQL applies `lock_timeout` to each lock wait, and a statement can wait
-more than once, so `statement_timeout` bounds each statement as a whole. Both
-accept at most `i32::MAX` milliseconds (about 24.8 days), so for a longer
-lease the wait is capped there instead. Once its dispatch has ended (finished,
-lease lost, released, or dropped with the scheduler future), it renews nothing:
-after taking the row lock it sees the dispatch's token cancelled and rolls back.
-The token is checked once, between the lock and the update, so a dispatch that
-ends in that window still gets one last renewal, which delays the reaper by at
-most one lease. Graceful shutdown does not cancel that token, so handlers keep
-their leases while they drain.
+`statement_timeout` are both the time left until the local deadline, except
+that each keeps the session's value when the host set a smaller non-zero one,
+so it never raises the host's timeouts. PostgreSQL applies `lock_timeout` to
+each lock wait, and a statement can wait more than once, so `statement_timeout`
+bounds each statement as a whole. Both accept at most `i32::MAX` milliseconds
+(about 24.8 days), so for a longer lease the wait is capped there instead. Once
+its dispatch has ended (finished, lease lost, released, or dropped with the
+scheduler future), it renews nothing: after taking the row lock it sees the
+dispatch's token cancelled and rolls back. The token is checked once, between
+the lock and the update, so a dispatch that ends in that window still gets one
+last renewal, which delays the reaper by at most one lease. Graceful shutdown
+does not cancel that token, so handlers keep their leases while they drain.
 
 ## Admin Actions
 
@@ -333,6 +343,8 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   heartbeats wait for connections until local deadlines drop the handlers.
   Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
   host), well below the 16 + 2 = 18 that the default queue's limit of 16 needs.
+  While poisoned rows keep arriving, dead-lettering them takes about one more
+  connection per queue at a time.
 - **Sizing:** the handlers needed across all instances are about arrival rate ×
   average handler duration (Little's law). Each instance's limit is that number
   divided by the instance count, times 1.5 to 2 for bursts and retries. Keep
@@ -343,7 +355,9 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   above the longest DB-contained transaction. A database outage longer than the
   lease lets another worker start the task.
 - **Timeouts:** configure `statement_timeout` and `lock_timeout` on pool
-  connections. Queue statements are short.
+  connections. Queue statements are short. The worker's heartbeat bounds its
+  own transaction by the time left on its lease, but never raises a stricter
+  value the host set.
 - **Retry storms:** exponential backoff with jitter spreads correlated failures.
   `crash_retry_delay` does the same for crash loops.
 - **Table health:** every claim, heartbeat, retry, and finalization updates the
@@ -363,6 +377,7 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 | Worker crashes before claim commit | The claim rolls back; the task stays `queued`. |
 | Worker crashes after claim | The lease expires; the reaper requeues the task or marks it `dead`. |
 | Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
+| Dead-lettering a poisoned row fails, or shutdown aborts it | The row stays `running`; the reaper requeues it after expiry, and a later claim poisons it again until its attempts run out. |
 | Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
 | PostgreSQL unavailable | No transition happens; claim errors (and, with `cron`, materialize errors) set `Degraded`; heartbeat and maintenance failures do not affect health, and a worker with no free handler slot in any queue runs no claim cycle so it keeps its last status. Workers retry without inventing local state. |
 | Graceful shutdown with handlers still running | Shutdown cancels every `ctx.cancellation` and drains for up to `shutdown_timeout`. A handler that returns `TaskError::interrupted()`, or is still running at the timeout and is dropped, has its task released: back to `queued`, due at once, the attempt not counted. A release not finished within 5 s more (the database is unreachable, or a dropped DB-contained transaction still holds the row lock) is aborted; the reaper recovers that task after the lease, and the attempt counts. A kept-alive pool can leave a dropped transaction's connection holding that lock, so exit the process after shutdown. |
