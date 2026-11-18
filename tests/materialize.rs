@@ -257,6 +257,32 @@ async fn materializer_transaction_ends_itself_when_left_idle() {
     db.cleanup().await;
 }
 
+/// Nested in a caller's transaction, materialization must not leave its idle-in-transaction
+/// guard on the caller's transaction.
+#[tokio::test]
+async fn nested_materialization_leaves_the_callers_idle_timeout_alone() {
+    use diesel_async::AsyncConnection;
+    use diesel_async::RunQueryDsl;
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(5))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let after = conn
+        .transaction::<_, SchedulerError, _>(async |c| {
+            assert_eq!(store::materialize_due_jobs(c).await?, 1);
+            Ok(diesel::sql_query(
+                "SELECT current_setting('idle_in_transaction_session_timeout') AS v",
+            )
+            .get_result::<Setting>(c)
+            .await?
+            .v)
+        })
+        .await
+        .unwrap();
+    assert_eq!(after, "0");
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn unsatisfiable_cron_pauses_its_job_and_later_jobs_still_materialize() {
     let db = TestDb::new().await;

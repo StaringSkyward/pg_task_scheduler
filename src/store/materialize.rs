@@ -113,7 +113,8 @@ pub(crate) fn schedule_task_key(
 /// It requires, and enforces, READ COMMITTED, which its pause recheck relies on. Each job's
 /// transaction begins at READ COMMITTED whatever the session default. On a connection already
 /// in a transaction each job runs in a savepoint of it, so that transaction must be READ
-/// COMMITTED: at any other level this returns [`SchedulerError::Config`] and materializes
+/// COMMITTED (READ UNCOMMITTED also passes, as PostgreSQL runs it as READ COMMITTED) and its
+/// settings are left alone: at any other level this returns [`SchedulerError::Config`] and materializes
 /// nothing. (diesel-async cannot see a transaction opened with raw SQL; don't call this in one.)
 pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize, SchedulerError> {
     // diesel-async cannot begin a READ COMMITTED transaction inside another one.
@@ -125,7 +126,7 @@ pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize,
             .get_result::<Isolation>(conn)
             .await?
             .isolation;
-        if isolation != "read committed" {
+        if isolation != "read committed" && isolation != "read uncommitted" {
             return Err(SchedulerError::Config(format!(
                 "materialize_due_jobs needs READ COMMITTED; the caller's transaction is {isolation}"
             )));
@@ -134,11 +135,12 @@ pub async fn materialize_due_jobs(conn: &mut AsyncPgConnection) -> Result<usize,
     let mut inserted = 0;
     for _ in 0..100 {
         let one = if nested {
-            conn.transaction(async |c| materialize_one(c).await).await?
+            conn.transaction(async |c| materialize_one(c, true).await)
+                .await?
         } else {
             conn.build_transaction()
                 .read_committed()
-                .run(async |c| materialize_one(c).await)
+                .run(async |c| materialize_one(c, false).await)
                 .await?
         };
         match one {
@@ -174,8 +176,16 @@ fn parse_due(job: &DueJob) -> Result<Occurrence, String> {
 
 /// Process the earliest due job, inside its transaction: `None` when none is due, else the tasks
 /// inserted (0 or 1).
-async fn materialize_one(c: &mut AsyncPgConnection) -> Result<Option<usize>, SchedulerError> {
-    diesel::sql_query(IDLE_GUARD).execute(c).await?;
+///
+/// `nested` skips `IDLE_GUARD`: its transaction-local setting survives `RELEASE SAVEPOINT` and
+/// would apply to the caller's transaction.
+async fn materialize_one(
+    c: &mut AsyncPgConnection,
+    nested: bool,
+) -> Result<Option<usize>, SchedulerError> {
+    if !nested {
+        diesel::sql_query(IDLE_GUARD).execute(c).await?;
+    }
     let Some(job) = diesel::sql_query(SELECT_DUE)
         .get_results::<DueJob>(c)
         .await?

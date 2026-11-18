@@ -130,8 +130,12 @@ pub async fn cleanup(
     retention: &Retention,
 ) -> Result<CleanupSummary, SchedulerError> {
     let batch = retention.batch_size;
+    // Convert every interval first so invalid input is rejected before any delete.
+    let done_age = pg_interval(retention.done)?;
+    let dead_age = pg_interval(retention.dead)?;
+    let outbox_age = pg_interval(retention.outbox_published)?;
     let done = diesel::sql_query(CLEANUP_DONE)
-        .bind::<sql_types::Interval, _>(pg_interval(retention.done)?)
+        .bind::<sql_types::Interval, _>(done_age)
         .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
         .execute(conn)
         .await?;
@@ -139,7 +143,7 @@ pub async fn cleanup(
     let dead = match left(batch, done) {
         Some(left) => {
             diesel::sql_query(CLEANUP_DEAD)
-                .bind::<sql_types::Interval, _>(pg_interval(retention.dead)?)
+                .bind::<sql_types::Interval, _>(dead_age)
                 .bind::<sql_types::BigInt, _>(i64::from(left.get()))
                 .execute(conn)
                 .await?
@@ -149,7 +153,7 @@ pub async fn cleanup(
     let cancelled = match left(batch, done + dead) {
         Some(left) => {
             diesel::sql_query(CLEANUP_CANCELLED)
-                .bind::<sql_types::Interval, _>(pg_interval(retention.dead)?)
+                .bind::<sql_types::Interval, _>(dead_age)
                 .bind::<sql_types::BigInt, _>(i64::from(left.get()))
                 .execute(conn)
                 .await?
@@ -157,7 +161,7 @@ pub async fn cleanup(
         None => 0,
     };
     let outbox = diesel::sql_query(CLEANUP_OUTBOX)
-        .bind::<sql_types::Interval, _>(pg_interval(retention.outbox_published)?)
+        .bind::<sql_types::Interval, _>(outbox_age)
         .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
         .execute(conn)
         .await?;
