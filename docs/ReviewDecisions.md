@@ -544,8 +544,8 @@ version of this repository must be dropped and recreated.
   `cron_expression` and `is_paused` (`api::list_jobs_returns_view`). Ruling: the
   names `is_paused` in `admin/src/api.rs` and `admin/tests/api.rs` are this
   wire field, kept on purpose.
-- **Changed by review 03:** `GET /api/tasks/:id` gains `payload` and
-  `payload_error`
+- **Changed by review 03:** `GET /api/tasks/:id` gains `payload`, tagged
+  `json` or `unreadable`
   ([entry 36](#36-producers-reject-payloads-the-worker-cannot-parse)).
 
 ### 19. Left out of scope
@@ -1147,26 +1147,36 @@ version of this repository must be dropped and recreated.
 - **Decision:**
   - **Producer boundary:** `enqueue` and `CreateJob::{new, for_task}` serialize
     the arguments to JSON text and parse it back with the claim's parser, in
-    one shared crate-private helper. A failure is `SchedulerError::Serde`, and
-    nothing is written. The claim still dead-letters a row written outside
-    this boundary, by direct SQL (entry 22).
+    one shared crate-private helper. The typed `enqueue::<T>` and
+    `CreateJob::for_task::<T>` also decode the parsed value as `T::Args`, as
+    the worker does, so an `f64` NaN, which serializes as `null`, is rejected;
+    the untyped `CreateJob::new` has no type to decode into. A failure is
+    `SchedulerError::Serde`, and nothing is written. The claim still
+    dead-letters a row written outside this boundary, by direct SQL (entry 22).
   - **Reading back:** `TaskView.payload` is a `TaskPayload`, exported from the
     crate root: `Json(serde_json::Value)`, or `Unreadable { text, error }`,
     with the stored text as PostgreSQL prints it and `serde_json`'s error.
     `store::task` reads `payload::text`, and returns every other field even
     when the payload does not parse.
   - **Admin:** the task page shows an unreadable payload as its text, then
-    `Unreadable payload:` and the error. `GET /api/tasks/:id` gains `payload`
-    (the JSON value, or the raw text as a JSON string when it does not parse)
-    and `payload_error` (`null` when it parses). The spec said the JSON kept
-    `payload`, but it had no such field, so both are new.
+    `Unreadable payload:` and the error. `GET /api/tasks/:id` gains `payload`,
+    a tagged sum like `TaskPayload`: `{"json": <value>}`, or `{"unreadable":
+    {"text": "...", "error": "..."}}`. The spec said the JSON kept `payload`,
+    but it had no such field, so it is new.
+  - Ruling (controller, final review): the admin JSON tags the two cases.
+    Before, `payload` held either the value or the raw text as a JSON string,
+    and only a separate `payload_error` told them apart, so a client reading
+    `payload` alone could take an unreadable payload's text for a string
+    argument.
   - Ruling: the test checks the `Unreadable` text by its `{"x": 1000` prefix,
     not by containing `1e500`, because PostgreSQL prints the JSONB number
     `1e500` as a 1 followed by 500 zeros. The plan's expected text was wrong
     about PostgreSQL's output; the intent, that the raw text is preserved,
     holds. If wrong, it is a test string.
-- **Why:** A producer's success should mean the worker can run the task, and
-  the record that explains a dead letter must stay readable.
+- **Why:** A producer's success should mean the worker can parse the payload
+  and, for a typed producer, decode it as the handler's arguments, and the
+  record that explains a dead letter must stay readable. Nothing checks what
+  the handler then does with the arguments.
 - **Expected behaviour:**
   - `enqueue` of a value 140 arrays deep is `Serde` and inserts nothing
     (`enqueue::enqueue_rejects_a_payload_the_worker_cannot_parse`);
@@ -1175,6 +1185,14 @@ version of this repository must be dropped and recreated.
   - A task stored by SQL with the payload `{"x":1e500}` is dead-lettered by the
     claim, and `store::task` then returns it, `dead`, with an `Unreadable`
     payload (`claim::task_with_an_unparseable_payload_is_still_readable`).
+  - `enqueue` of a `T::Args` with an `f64` field set to NaN is `Serde` and
+    inserts nothing (`enqueue::enqueue_rejects_args_that_do_not_round_trip`),
+    and `CreateJob::for_task` rejects the same value
+    (`jobs::for_task_rejects_args_that_do_not_round_trip`).
+  - `GET /api/tasks/:id` returns `"payload": {"json": {}}` for a task enqueued
+    with `{}`, and `{"unreadable": {...}}` with the text and error for the
+    dead-lettered `{"x":1e500}`
+    (`api::task_route_payload_is_json_or_unreadable`).
   - Code that read `TaskView.payload` as a `serde_json::Value` matches on
     `TaskPayload` instead.
 

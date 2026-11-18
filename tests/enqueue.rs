@@ -347,6 +347,32 @@ async fn enqueue_rejects_a_payload_the_worker_cannot_parse() {
     db.cleanup().await;
 }
 
+/// NaN serializes as `null`, which an `f64` cannot decode: the worker would dead-letter it.
+#[tokio::test]
+async fn enqueue_rejects_args_that_do_not_round_trip() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Reading {
+        value: f64,
+    }
+    struct Measure;
+    impl Task for Measure {
+        const NAME: &'static str = "measure";
+        type Args = Reading;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let r = enqueue::<Measure>(
+        &mut conn,
+        key("nan"),
+        Reading { value: f64::NAN },
+        EnqueueOptions::default(),
+    )
+    .await;
+    assert!(matches!(r, Err(SchedulerError::Serde(_))), "{r:?}");
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn enqueue_survives_cleanup_deleting_the_incumbent() {
     use std::num::NonZeroU32;

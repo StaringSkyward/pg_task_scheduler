@@ -114,8 +114,9 @@ changed and why.
 - **Changed by review 01:** `GET /api/jobs` rows gain `task_name`. Their
   `is_paused` field stays, derived from the new pause relation
   ([Review decisions, entry 18](ReviewDecisions.md#18-the-admin-json-api-keeps-its-wire-fields)).
-- **Changed by review 03:** `GET /api/tasks/:id` gains `payload`, and
-  `payload_error` for a stored payload that does not parse. `GET /api/jobs`
+- **Changed by review 03:** `GET /api/tasks/:id` gains `payload`, either
+  `{"json": ...}` or, for a stored payload that does not parse,
+  `{"unreadable": {"text", "error"}}`. `GET /api/jobs`
   lists a schedule whose arguments do not parse
   ([Review decisions, entries 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)
   and [40](ReviewDecisions.md#40-schedule-reads-do-not-decode-arguments)).

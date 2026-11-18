@@ -135,16 +135,22 @@ struct TaskJson {
     task_name: String,
     queue: String,
     status: &'static str,
-    /// The JSON value, or the raw text as a string when unreadable.
-    payload: serde_json::Value,
-    /// `None` when the payload parses.
-    payload_error: Option<String>,
+    payload: PayloadJson,
     attempts: u32,
     max_attempts: u32,
     due_at: chrono::DateTime<chrono::Utc>,
     locked_by: Option<String>,
     last_error: Option<String>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `{"json": <value>}`, or `{"unreadable": {"text": ..., "error": ...}}` when the stored
+/// payload does not parse.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PayloadJson {
+    Json(serde_json::Value),
+    Unreadable { text: String, error: String },
 }
 
 impl From<TaskView> for TaskJson {
@@ -154,15 +160,12 @@ impl From<TaskView> for TaskJson {
             TaskState::Running { locked_by, .. } => (Some(locked_by.as_str().to_owned()), None),
             TaskState::Finished { completed_at, .. } => (None, Some(*completed_at)),
         };
-        let (payload, payload_error) = match t.payload {
-            TaskPayload::Json(v) => (v, None),
-            TaskPayload::Unreadable { text, error } => {
-                (serde_json::Value::String(text), Some(error))
-            }
+        let payload = match t.payload {
+            TaskPayload::Json(v) => PayloadJson::Json(v),
+            TaskPayload::Unreadable { text, error } => PayloadJson::Unreadable { text, error },
         };
         TaskJson {
             payload,
-            payload_error,
             id: t.id.0,
             task_key: t.task_key.as_str().to_owned(),
             task_name: t.task_name.as_str().to_owned(),

@@ -241,6 +241,52 @@ async fn task_route_returns_view_and_404() {
     db.cleanup().await;
 }
 
+/// `payload` is `{"json": ...}`, or `{"unreadable": {"text", "error"}}` for a stored payload
+/// `serde_json` cannot parse, which the claim dead-letters.
+#[tokio::test]
+async fn task_route_payload_is_json_or_unreadable() {
+    let db = TestDb::new().await;
+    let readable = enqueue_one(&db).await;
+    let unreadable = db
+        .scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'admin-task', '{\"x\":1e500}'::jsonb) RETURNING id) \
+             SELECT id AS n FROM t",
+        )
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    pg_task_scheduler::store::claim(
+        &mut conn,
+        &pg_task_scheduler::WorkerId::generate(),
+        &pg_task_scheduler::QueueName::default(),
+        &[pg_task_scheduler::TaskName::try_from("admin-task").unwrap()],
+        std::num::NonZeroU32::new(2).unwrap(),
+        common::lease(std::time::Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    let get = |id: i64| send(app(&db), Method::GET, format!("/api/tasks/{id}"), None);
+
+    let (status, body) = get(readable.0).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["payload"], serde_json::json!({"json": {}}));
+    assert!(v.get("payload_error").is_none());
+
+    let (status, body) = get(unreadable).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "dead");
+    let p = v["payload"].as_object().unwrap();
+    assert_eq!(p.keys().collect::<Vec<_>>(), ["unreadable"]);
+    // PostgreSQL prints the numeric expanded, not as `1e500`.
+    let text = p["unreadable"]["text"].as_str().unwrap();
+    assert!(text.starts_with(r#"{"x": 1000"#), "{text}");
+    assert!(!p["unreadable"]["error"].as_str().unwrap().is_empty());
+    assert!(v.get("payload_error").is_none());
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn replay_route_requeues_dead_task_and_409s_otherwise() {
     let db = TestDb::new().await;

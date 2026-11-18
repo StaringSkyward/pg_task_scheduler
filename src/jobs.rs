@@ -54,7 +54,8 @@ impl CreateJob {
     /// A schedule `name` that runs task `T` with `args` at each `cron` occurrence, in
     /// `T::QUEUE`. The preferred constructor: the task name, queue and argument type
     /// all come from `T`. Fails if `T::NAME` or `T::QUEUE` is not a valid identifier,
-    /// or `args` does not serialize to JSON the worker can parse back.
+    /// or `args` does not serialize to JSON the worker can parse back and decode as
+    /// `T::Args`.
     pub fn for_task<T: Task>(
         name: ScheduleName,
         cron: CronExpression,
@@ -62,9 +63,15 @@ impl CreateJob {
         lifecycle: JobLifecycle,
         args: T::Args,
     ) -> Result<Self, SchedulerError> {
-        let task_name = TaskName::try_from(T::NAME)?;
-        let queue = QueueName::try_from(T::QUEUE)?;
-        Ok(Self::new(name, task_name, cron, max_attempts, lifecycle, args)?.queue(queue))
+        Ok(CreateJob {
+            name,
+            task_name: TaskName::try_from(T::NAME)?,
+            cron,
+            max_attempts,
+            lifecycle,
+            queue: QueueName::try_from(T::QUEUE)?,
+            args: crate::queue::task_payload::<T>(&args)?,
+        })
     }
 
     /// A schedule `name` that runs task `task_name` with `args` at each `cron`

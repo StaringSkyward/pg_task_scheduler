@@ -172,8 +172,9 @@ const EXISTING: &str = r#"
 /// caller's data. Re-enqueueing the same `key` with the same task name and payload
 /// returns the existing task; different content is an `IdempotencyConflict`. The queue
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
-/// Arguments that do not serialize to JSON the worker can parse back (for example,
-/// nested deeper than 128) are [`SchedulerError::Serde`], and nothing is written.
+/// Arguments that do not serialize to JSON the worker can parse back and decode as
+/// `T::Args` (for example, nested deeper than 128, or an `f64` NaN, which serializes as
+/// `null`) are [`SchedulerError::Serde`], and nothing is written.
 /// A key starting with `schedule:` is reserved for the scheduler and returns
 /// [`SchedulerError::ReservedTaskKey`]. If concurrent cleanup keeps deleting the conflicting
 /// task before it can be read, three passes later it returns [`SchedulerError::Contention`].
@@ -191,7 +192,7 @@ pub async fn enqueue<T: Task>(
         Some(q) => q,
         None => QueueName::try_from(T::QUEUE)?,
     };
-    let payload = to_payload(&args)?;
+    let payload = task_payload::<T>(&args)?;
 
     // The incumbent can be deleted (retention cleanup) between the conflicting insert and
     // the read-back; the next pass then simply inserts.
@@ -292,4 +293,12 @@ pub(crate) fn to_payload<T: serde::Serialize>(
 ) -> Result<serde_json::Value, SchedulerError> {
     let text = serde_json::to_string(args)?;
     Ok(serde_json::from_str(&text)?)
+}
+
+/// [`to_payload`] for task `T`, which also checks that the payload decodes as `T::Args`, as
+/// the worker will decode it.
+pub(crate) fn task_payload<T: Task>(args: &T::Args) -> Result<serde_json::Value, SchedulerError> {
+    let payload = to_payload(args)?;
+    serde_json::from_value::<T::Args>(payload.clone())?;
+    Ok(payload)
 }

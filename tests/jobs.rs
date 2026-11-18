@@ -461,3 +461,24 @@ fn create_job_rejects_a_payload_the_worker_cannot_parse() {
     );
     assert!(matches!(r, Err(SchedulerError::Serde(_))));
 }
+
+#[test]
+fn for_task_rejects_args_that_do_not_round_trip() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Reading {
+        value: f64,
+    }
+    struct Measure;
+    impl pg_task_scheduler::Task for Measure {
+        const NAME: &'static str = "measure";
+        type Args = Reading;
+    }
+    let r = CreateJob::for_task::<Measure>(
+        ScheduleName::try_from("nan").unwrap(),
+        CronExpression::parse("* * * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        Reading { value: f64::NAN },
+    );
+    assert!(matches!(r, Err(SchedulerError::Serde(_))));
+}
