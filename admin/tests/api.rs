@@ -69,6 +69,25 @@ async fn list_jobs_returns_view() {
 
 #[cfg(feature = "cron")]
 #[tokio::test]
+async fn list_jobs_survives_unreadable_args() {
+    let db = TestDb::new().await;
+    let id = db
+        .insert_job(
+            "j",
+            "*/5 * * * *",
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+    db.make_job_args_unreadable(id).await;
+    let (status, body) = send(app(&db), Method::GET, "/api/jobs".into(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    db.cleanup().await;
+}
+
+#[cfg(feature = "cron")]
+#[tokio::test]
 async fn pause_existing_204_missing_404() {
     let db = TestDb::new().await;
     let id = db

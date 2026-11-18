@@ -914,7 +914,7 @@ impl Job {
 }
 
 #[cfg(feature = "cron")]
-/// Faithful `scheduler_jobs` row.
+/// `scheduler_jobs` row as read: `job_args` is omitted so an unreadable value cannot break reads.
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
 #[diesel(table_name = scheduler_jobs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -923,7 +923,6 @@ pub struct SchedulerJob {
     pub name: ScheduleName,
     pub task_name: TaskName,
     pub cron_expression: String,
-    pub job_args: serde_json::Value,
     pub next_run_at: DateTime<Utc>,
     pub max_attempts: i32,
     pub queue: QueueName,

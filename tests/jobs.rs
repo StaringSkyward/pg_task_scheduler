@@ -54,6 +54,24 @@ async fn create_sets_future_next_run() {
 }
 
 #[tokio::test]
+async fn schedules_list_even_when_their_args_are_unreadable() {
+    let db = TestDb::new().await;
+    let id = db
+        .insert_job(
+            "odd",
+            "*/5 * * * *",
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+    db.make_job_args_unreadable(id).await;
+    let mut conn = db.pool.get().await.unwrap();
+    let all = jobs::list(&mut conn).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(jobs::get(&mut conn, all[0].id).await.unwrap().is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn ensure_job_inserts_then_reconciles_config() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();

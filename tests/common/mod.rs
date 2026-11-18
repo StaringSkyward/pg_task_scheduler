@@ -185,6 +185,18 @@ impl TestDb {
         id
     }
 
+    /// Overwrite a job's `job_args` with JSONB text serde cannot read (`{"x":1e500}`).
+    pub async fn make_job_args_unreadable(&self, job_id: Uuid) {
+        let mut conn = self.pool.get().await.unwrap();
+        diesel::sql_query(
+            "UPDATE scheduler_jobs SET job_args = '{\"x\":1e500}'::jsonb WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job_id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
     pub async fn job_next_run_at(&self, job_id: Uuid) -> DateTime<Utc> {
         let mut conn = self.pool.get().await.unwrap();
         diesel::sql_query("SELECT next_run_at FROM scheduler_jobs WHERE id = $1")
