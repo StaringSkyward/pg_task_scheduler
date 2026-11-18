@@ -244,8 +244,11 @@ earlier version of this repository must be dropped and recreated.
 - **Expected behaviour:**
   - The same effect with the same content is `AlreadyPresent`
     (`transitions::same_effect_and_content_is_already_present`); payloads are
-    compared as JSONB, so key order and whitespace do not matter
-    (`transitions::outbox_payload_key_order_is_not_a_conflict`).
+    compared as canonical JSONB text, so key order and whitespace do not matter
+    (`transitions::outbox_payload_key_order_is_not_a_conflict`) but numeric
+    scale does: `{"n":1}` against `{"n":1.0}` is `OutboxConflict`, because a
+    receiver decodes them apart
+    (`transitions::outbox_payload_scale_difference_is_a_conflict`).
   - Different content is `OutboxConflict`, and the task stays `running` with
     its attempt open
     (`transitions::same_effect_with_different_content_conflicts_and_rolls_back`).
@@ -1428,8 +1431,8 @@ earlier version of this repository must be dropped and recreated.
     `CreateJob::new` has no argument type, so it records none. `for_task` still
     decodes the serialized value when it is built, so a NaN fails there, as in
     entry 36.
-  - **Idempotency** stays JSONB equality: two accepted payloads that JSONB
-    stores equally decode to equal values.
+  - **Idempotency** compares the canonical JSONB text (see the ruling
+    below), not JSONB equality.
   - **Cost:** one more query per typed `enqueue`, and per `create` or
     `ensure_job` of a `for_task` spec.
   - Ruling: when the stored form parses to a `Value` equal to the payload, the
@@ -1443,6 +1446,18 @@ earlier version of this repository must be dropped and recreated.
     beside an `f64` of `1e18`), is marked `ponytail:` in `check_stored`:
     accepting them would need `PartialEq` on `Task::Args`. If wrong, those
     arguments are still wrongly rejected, which is safe.
+  - Ruling: idempotency must not merge payloads the handler decodes
+    differently. JSONB equality says `1 = 1.0`, so `Count(1)` then `Ratio(1.0)`
+    on one key returned `inserted: false` and the worker decoded `Count(1)`.
+    `enqueue` now compares `payload::text = $3::jsonb::text`: JSONB text sorts
+    keys and normalizes whitespace but keeps numeric scale, so identical
+    arguments and reordered keys still match, and a scale difference is
+    `IdempotencyConflict`
+    (`enqueue::idempotency_distinguishes_payloads_that_decode_differently`,
+    `enqueue::idempotency_ignores_payload_key_order`). The same rule applies
+    to the outbox (entry on `complete_with_outbox`): receivers decode payloads.
+  - Caveat: `Value` equality treats `-0.0` and `0.0` as equal and JSONB stores
+    `0.0`, so a negative zero is accepted and the worker decodes `+0.0`.
 - **Why:** A producer's success should mean the handler decodes the arguments
   the producer sent. Checking the stored form covers every codec, not just
   untagged enums, and keeps the JSONB column and the equality idempotency
@@ -1572,8 +1587,10 @@ earlier version of this repository must be dropped and recreated.
   - In a running worker the bad row of a batch now becomes `dead` shortly
     after the claim, not within it
     (`worker::healthy_task_in_a_batch_with_a_bad_payload_runs`).
-  - While poisoned rows keep arriving, dead-lettering takes about one more pool
-    connection per queue at a time; the README's Connections note says so.
+  - While poisoned rows keep arriving, each claim cycle may start one dead-letter task
+    per queue, and wakes from a NOTIFY or a finished dispatch can start another
+    while one is still running, so budget about one more pool connection per
+    queue, possibly more; the README's Connections note says so.
   - Code calling `store::claim` reads `.ready`, and dead-letters `.poisoned`
     itself or leaves those rows to the reaper.
 

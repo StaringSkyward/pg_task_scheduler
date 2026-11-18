@@ -549,8 +549,9 @@ scanning retained rows (see
   2-vCPU host), well below the 16 + 2 = 18 that the default queue's limit of 16
   needs. Claimed rows that cannot run (a key, payload or count written by direct
   SQL that the types reject) are dead-lettered on a connection of their own,
-  about one per queue at a time while such rows keep arriving, so leave that
-  much room if direct SQL writes tasks.
+  where each claim cycle may start one per queue, and wakes from a NOTIFY or a
+  finished dispatch can start another while one is still running, so leave that
+  much room, possibly more, if direct SQL writes tasks.
 
 ### Observability
 

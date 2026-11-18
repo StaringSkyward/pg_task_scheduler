@@ -127,7 +127,8 @@ impl<P: SchedulerPool> Scheduler<P> {
         while !cancel.is_cancelled() {
             // The wait below collects at most one finished task per wake, and a full batch
             // skips it entirely; collect them all here. Dispatches are bounded by the permits.
-            // Dead-letter tasks are paced by the wait: a cycle starts at most one per queue, and
+            // Dead-letter tasks are paced by the wait: each claim cycle may start one per queue (a wake
+            // from a NOTIFY or a finished dispatch can start another while one still runs), and
             // poisoned rows never make a batch full, so they never skip the wait on their own.
             while let Some(joined) = in_flight.try_join_next() {
                 log_join(joined);

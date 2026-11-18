@@ -343,8 +343,10 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   heartbeats wait for connections until local deadlines drop the handlers.
   Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
   host), well below the 16 + 2 = 18 that the default queue's limit of 16 needs.
-  While poisoned rows keep arriving, dead-lettering them takes about one more
-  connection per queue at a time.
+  While poisoned rows keep arriving, each claim cycle may start one dead-letter
+  task per queue, and wakes from a NOTIFY or a finished dispatch can start
+  another while one is still running, so budget about one more connection per
+  queue, possibly more.
 - **Sizing:** the handlers needed across all instances are about arrival rate ×
   average handler duration (Little's law). Each instance's limit is that number
   divided by the instance count, times 1.5 to 2 for bursts and retries. Keep
