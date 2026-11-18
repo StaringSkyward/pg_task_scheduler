@@ -172,6 +172,8 @@ const EXISTING: &str = r#"
 /// caller's data. Re-enqueueing the same `key` with the same task name and payload
 /// returns the existing task; different content is an `IdempotencyConflict`. The queue
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
+/// A key starting with `schedule:` is reserved for the scheduler and returns
+/// [`SchedulerError::ReservedTaskKey`].
 pub async fn enqueue<T: Task>(
     conn: &mut AsyncPgConnection,
     key: TaskKey,

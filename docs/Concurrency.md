@@ -130,12 +130,16 @@ Cancellation is cooperative. Async code stops when its future is dropped or when
 it observes the token. Blocking code, independently spawned work, and remote
 requests already in flight cannot be recalled.
 
-A DB-contained handler holds its row lock while a heartbeat may be waiting on it.
-Because the lease keeper is a separate future, the handler keeps being polled and
-commits, and the heartbeat then sees a `done` row. The lease is checked when the
-transition runs, after it has locked the row. A caller that commits after
-`locked_until` still holds exclusive ownership, because its row lock kept the
-reaper and every other worker away; it does not roll back. Each heartbeat runs
+A DB-contained handler that called `lock_owned` holds its row lock for its whole
+transaction, so every heartbeat's lock statement waits on it and the lease
+cannot be extended meanwhile. The lease keeper returns at the local deadline
+(`sent + lease`, never after the database's `locked_until`), and the worker then
+drops the handler future, abandoning its transaction. In the runtime the whole
+transaction, including its commit, must therefore finish within the lease. The
+lease is checked when a transition runs, after it has locked the row. A direct
+store caller that commits after `locked_until` still holds exclusive ownership,
+because its row lock kept the reaper and every other worker away; it does not
+roll back. Each heartbeat runs
 on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
 handler finished, or the local deadline passed) the heartbeat still commits or
 rolls back, and never leaves an open transaction holding the row lock.
@@ -251,6 +255,12 @@ Producers can enqueue concurrently. `task_key` uniqueness gives one logical task
 per key, and a duplicate returns the existing task. Enqueue inside the producer's
 own transaction to make the domain change and the task atomic. Use
 `READ COMMITTED`: the duplicate path re-reads the committed winner.
+
+`READ COMMITTED` is a host requirement for every direct store caller. The
+transitions' recheck after a lock wait, `ensure_job`'s recreate-on-delete and
+claim all rely on it; under `REPEATABLE READ` they fail safely with a `40001`
+serialization error rather than their documented outcome. The materializer
+enforces `READ COMMITTED` itself.
 
 A key stays reserved while its row exists, so retention is the idempotency
 horizon: `Retention::done` for `done` tasks, and `Retention::dead` for `dead` and

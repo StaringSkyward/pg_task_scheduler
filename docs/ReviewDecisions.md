@@ -604,9 +604,13 @@ must be dropped and recreated.
     heartbeat.
   - The README and [Concurrency Model](Concurrency.md#ownership) say that the
     lease is checked when the transition runs, and that the row lock it takes
-    keeps the reaper away until the caller's transaction ends. A caller that
-    commits after `locked_until` still held exclusive ownership; the docs no
-    longer say the late commit rolls back.
+    keeps the reaper away until the caller's transaction ends. A direct store
+    caller that commits after `locked_until` still holds exclusive ownership;
+    the docs no longer say the late commit rolls back. For runtime handlers the
+    whole transaction, including its commit, must finish within the lease: a
+    handler holding the row lock (`lock_owned`) blocks every heartbeat, and the
+    worker drops a handler whose lease deadline passes, abandoning its
+    transaction.
 - **Why:** The hard-lease promise must hold when the check runs, after any
   wait. Exclusive ownership was never at risk, because the reaper skips locked
   rows; the expiry promise was.
@@ -739,7 +743,10 @@ must be dropped and recreated.
     first. At any other level it returns `SchedulerError::Config`
     (`materialize_due_jobs needs READ COMMITTED; the caller's transaction is
     <level>`) and materializes nothing; at READ COMMITTED it runs each job in a
-    savepoint.
+    savepoint. `read uncommitted` is accepted, since PostgreSQL runs it as READ
+    COMMITTED. Nested, it skips the 30 s `idle_in_transaction_session_timeout`
+    guard, which would outlive the savepoint and apply to the caller's
+    transaction.
   - Its doc says that diesel-async cannot see a transaction opened with raw SQL
     (a `BEGIN` sent through `batch_execute`), so it must not be called inside
     one. PostgreSQL then either switches that block to READ COMMITTED, if it

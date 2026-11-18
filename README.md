@@ -105,6 +105,10 @@ queue is not part of idempotency equality: re-enqueueing a key with another queu
 returns the existing task. When the
 connection is inside a transaction, the task and its `queue_available`
 notification commit with the caller's data. Run producers at `READ COMMITTED`.
+Every direct store caller needs `READ COMMITTED`: the transitions' recheck after
+a lock wait, `ensure_job`'s recreate-on-delete and claim rely on it, and under
+`REPEATABLE READ` they fail with a `40001` serialization error rather than their
+documented outcome. The materializer enforces it itself.
 
 **Idempotency horizon:** a `task_key` stays reserved while its row exists, which
 is `Retention::done` after completion for done tasks and `Retention::dead` for
@@ -308,10 +312,12 @@ async fn ship_order(
 }
 ```
 
-The lease must outlast the work before `complete` runs: the lease is checked
-when `complete` runs. Its row lock then keeps the reaper and every other worker
-away until the caller's transaction ends, so a commit after `locked_until` still
-holds exclusive ownership; it does not roll back.
+In the runtime, the whole transaction, including its commit, must finish within
+the lease: a handler holding the row lock (`lock_owned`) makes every heartbeat
+wait on it, so the lease cannot be extended meanwhile, and the worker drops a
+handler whose lease deadline passes, abandoning its transaction. A direct store
+caller that commits after `locked_until` still holds exclusive ownership, because
+the row lock keeps the reaper and every other worker away; it does not roll back.
 
 ### Transactional outbox
 
@@ -452,7 +458,7 @@ scanning retained rows (see
   database that requires TLS, build the pool with a TLS-capable connection
   through `diesel_async::pooled_connection::ManagerConfig::custom_setup`; this
   crate's pools accept it unchanged. See the
-  [`AsyncPgConnection` documentation](https://docs.rs/diesel-async/latest/diesel_async/struct.AsyncPgConnection.html)
+  [`AsyncPgConnection` documentation](https://docs.rs/diesel-async/0.9/diesel_async/struct.AsyncPgConnection.html)
   for a TLS example.
 - **Reaper:** every worker runs it every `reaper_interval`. Expired leases go
   back to `queued` after `crash_retry_delay`, or to `dead` when no attempts

@@ -234,6 +234,10 @@ async fn close_attempt_by(
 }
 
 /// Extend the lease to `duration` from now; returns the new `locked_until`.
+///
+/// It runs in a transaction, so don't cancel it mid-flight (`select!`, `timeout`): a cancelled
+/// heartbeat can leave its connection idle in a transaction holding the row lock. Spawn it, as
+/// the worker does.
 pub async fn heartbeat(
     conn: &mut AsyncPgConnection,
     lease: &TaskLease,
