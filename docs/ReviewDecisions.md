@@ -1864,9 +1864,14 @@ and recreated.
     and returns `PayloadNotPreserved` if they differ. It no longer compares
     `Value`s or re-serializes.
   - The error reads `task arguments change meaning when stored as JSON`.
-- **Why:** comparing decoded values checks what the handler receives, whatever
-  the type. It also accepts a `HashSet` beside a large `f64`, which the `Value`
-  comparison rejected.
+- **Why:**
+  - A `Serialize + DeserializeOwned` bound cannot show that encoding preserved
+    the caller's value, and checking `Value`s starts after the loss.
+  - So the user chose `PartialEq`, over documenting the gap or a serializer
+    that rejects non-finite floats.
+  - Comparing decoded values checks what the handler receives, whatever the
+    type. It also accepts a `HashSet` beside a large `f64`, which the `Value`
+    comparison rejected.
 - **Expected behaviour:**
   - `Some(f64::INFINITY)` and `Some(f64::NAN)` with `Args = Option<f64>` are
     `PayloadNotPreserved`, and nothing is written
@@ -1874,4 +1879,8 @@ and recreated.
     `jobs::for_task_rejects_non_finite_floats_inside_an_option`).
   - `Mixed { tags: HashSet<String>, x: 1e18 }` is accepted and claimed equal
     (`enqueue::enqueue_accepts_a_set_beside_a_large_float`).
-  - The typed-check tests of entry 43 still pass.
+  - Entry 43's typed-check tests still pass
+    (`enqueue::enqueue_rejects_args_that_do_not_round_trip`,
+    `enqueue::enqueue_rejects_args_whose_meaning_changes_in_jsonb`,
+    `jobs::for_task_rejects_args_that_do_not_round_trip`,
+    `jobs::for_task_rejects_args_whose_meaning_changes_in_jsonb`).

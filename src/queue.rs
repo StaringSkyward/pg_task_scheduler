@@ -181,8 +181,9 @@ const EXISTING: &str = r#"
 /// the caller's value, both from the JSON sent and from what PostgreSQL stores. JSON cannot
 /// represent every value (`Some(f64::INFINITY)` is written as `null` and decodes as `None`), and
 /// JSONB normalizes numbers (an `f64` of `1e18` reads back as the integer
-/// `1000000000000000000`, which an untagged enum may decode as another variant); both are
-/// [`SchedulerError::PayloadNotPreserved`], and nothing is written. Arguments that do not
+/// `1000000000000000000`); each is [`SchedulerError::PayloadNotPreserved`] when the arguments
+/// then decode as a different value (an untagged enum picks another variant; a plain `f64`
+/// field decodes equal and is accepted), and nothing is written. Arguments that do not
 /// serialize to JSON the worker can parse back and decode as `T::Args` at all (nested deeper than
 /// 128, or a bare `f64` NaN, which serializes as `null`) are [`SchedulerError::Serde`]. With
 /// `Args = serde_json::Value` this rejects any `f64` of magnitude 1e16 or more in the 64-bit

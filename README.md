@@ -119,8 +119,10 @@ arguments only if they decode back equal to the caller's value, both from the
 JSON it sends and from what PostgreSQL stores, and writes nothing if not.
 JSON cannot represent every value: `Some(f64::INFINITY)` is written as `null`
 and decodes as `None`, so it is `SchedulerError::PayloadNotPreserved`. So is
-an `f64` of `1e18`, which JSONB normalizes to the integer
-`1000000000000000000`, which an untagged enum may decode as another variant.
+an `f64` of `1e18` when the type decodes the integer JSONB normalizes it to
+(`1000000000000000000`) as a different value, such as an untagged enum picking
+another variant. A plain `f64` field is accepted, because the integer decodes
+back as an equal `f64`.
 Arguments the worker cannot parse back or decode as `T::Args` at all (nested
 deeper than 128, or a bare `f64` NaN) are `SchedulerError::Serde`. With
 `Args = serde_json::Value`, any `f64` of magnitude 1e16 or more in the 64-bit

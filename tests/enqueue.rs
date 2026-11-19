@@ -712,7 +712,7 @@ async fn enqueue_accepts_a_set_beside_a_large_float() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     let make = || Mixed {
-        tags: ["a", "b", "c"].map(String::from).into(),
+        tags: (0..8).map(|i| format!("t{i}")).collect(),
         x: 1e18,
     };
     enqueue::<MixedTask>(&mut conn, key("mixed"), make(), EnqueueOptions::default())
