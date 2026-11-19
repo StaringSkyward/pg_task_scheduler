@@ -421,7 +421,7 @@ no tasks, only a valid name. `store::paused_queues` lists the pauses.
   and retries.
 - Run separate deployments for queues that scale differently. Each process
   configures only its own queues.
-- Size the pool at the sum of the queue limits + 2 per scheduler, plus whatever
+- Size the pool at the sum of the queue limits + 3 per scheduler, plus whatever
   handlers take (see Connections under [Operations](#operations)). Keep
   (instances × pool size) under PostgreSQL's `max_connections`, with room to
   spare.
@@ -545,17 +545,14 @@ scanning retained rows (see
   `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
   finalization, and maintenance. Handlers hold no connection unless they take
   one. Per scheduler sharing a pool, that is 1 for `LISTEN`, 1 for claims and
-  maintenance, and up to the sum of queue limits for heartbeats and
-  finalization, plus one per handler that takes its own. So set the pool's
-  `max_size` to at least the sum of queue limits + 2 per scheduler, plus whatever
-  handlers take. A smaller pool starves heartbeats until local deadlines drop
-  handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4 on a
-  2-vCPU host), well below the 16 + 2 = 18 that the default queue's limit of 16
-  needs. Claimed rows that cannot run (a payload or count written by direct SQL
-  that the types reject) are dead-lettered on a connection of their own, where
-  each claim cycle may start one per queue, and wakes from a NOTIFY or a
-  finished dispatch can start another while one is still running, so leave that
-  much room, possibly more, if direct SQL writes tasks.
+  maintenance, 1 for dead-lettering claimed rows that direct SQL made unusable
+  (a payload or count the types reject), and up to the sum of queue limits for
+  heartbeats and finalization, plus one per handler that takes its own. So set
+  the pool's `max_size` to at least the sum of queue limits + 3 per scheduler,
+  plus whatever handlers take. A smaller pool starves heartbeats until local
+  deadlines drop handlers. Deadpool's default `max_size` is 2 × the logical CPU
+  count (4 on a 2-vCPU host), well below the 16 + 3 = 19 that the default
+  queue's limit of 16 needs.
 
 ### Observability
 

@@ -1055,3 +1055,72 @@ async fn slow_dead_letter_does_not_delay_a_healthy_claim() {
     run.stop().await;
     db.cleanup().await;
 }
+
+/// Dead-lettering has a fixed one-connection budget: dead-letters stalled in the database
+/// must not fill a pool sized at queue limits + 3 and starve the healthy task's claim.
+#[tokio::test]
+async fn stalled_dead_letters_leave_room_for_healthy_work() {
+    let db = TestDb::new().await;
+    // The scheduler's own pool, at the stated budget (queue limit 1 + 3); the test reads
+    // through `db.pool`, so it never waits behind the scheduler.
+    let pool = db.sized_pool(4);
+    // Every move to `dead` waits on this lock, held outside the pool.
+    let mut lock = AsyncPgConnection::establish(&common::database_url())
+        .await
+        .unwrap();
+    lock.batch_execute("SELECT pg_advisory_lock(4949)")
+        .await
+        .unwrap();
+    // Poisoned rows due first, so the claims reach them before the healthy task.
+    db.install(
+        "CREATE FUNCTION stall_dead() RETURNS trigger AS $$ BEGIN PERFORM pg_advisory_lock(4949); PERFORM pg_advisory_unlock(4949); RETURN NEW; END $$ LANGUAGE plpgsql;
+         CREATE TRIGGER stall_dead BEFORE UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'dead') EXECUTE FUNCTION stall_dead();
+         INSERT INTO queue_tasks (task_key, task_name, payload, max_attempts, due_at)
+         SELECT 'bad' || i, 'job', '{\"x\":1e500}'::jsonb, 1, now() - interval '1 minute' FROM generate_series(1, 5) AS i;",
+    )
+    .await;
+    let good = enqueue_job(&db, "good", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(pool.clone())
+        .queue("default", n(1))
+        .unwrap()
+        .max_poll_interval(ms(35))
+        .lease_duration(ms(600))
+        .heartbeat_interval(ms(150))
+        .reaper_interval(ms(200))
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
+    // Before the skipped rows' leases expire (600 ms): the reaper's move to `dead` waits too.
+    let waiting = diesel::sql_query(
+        "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 4949 AND NOT granted",
+    )
+    .get_result::<Count>(&mut lock)
+    .await
+    .unwrap()
+    .n;
+    assert!(waiting <= 1, "{waiting} sessions waiting to dead-letter");
+
+    lock.batch_execute("SELECT pg_advisory_unlock(4949)")
+        .await
+        .unwrap();
+    let started = Instant::now();
+    while db
+        .scalar("SELECT count(*) AS n FROM queue_tasks WHERE status = 'dead'")
+        .await
+        < 5
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "poisoned rows not dead after the lock was released"
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+
+    run.stop().await;
+    pool.close();
+    db.cleanup().await;
+}

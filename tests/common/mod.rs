@@ -23,6 +23,7 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::ManagerConfig;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::pooled_connection::deadpool::PoolBuilder;
 use uuid::Uuid;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -48,6 +49,35 @@ pub fn database_url() -> String {
 fn unique_schema() -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("pgts_test_{}_{n}", std::process::id())
+}
+
+/// A pool builder whose every connection pins `search_path` to `schema`.
+///
+/// diesel-async 0.5.2 `SetupCallback<C>`:
+///   Box<dyn Fn(&str) -> future::BoxFuture<diesel::ConnectionResult<C>> + Send + Sync>
+/// i.e. an `Fn` (callable repeatedly, once per established connection),
+/// `Send + Sync`, taking the URL by `&str` and returning a `Send` boxed
+/// future of `Result<AsyncPgConnection, diesel::result::ConnectionError>`.
+fn schema_pool(url: &str, schema: &str) -> PoolBuilder<AsyncPgConnection> {
+    let setup_schema = schema.to_owned();
+    let mut config = ManagerConfig::default();
+    config.custom_setup = Box::new(move |url| {
+        let schema = setup_schema.clone();
+        Box::pin(async move {
+            use diesel::ConnectionError;
+            let mut conn = AsyncPgConnection::establish(url).await?;
+            diesel::sql_query(format!("SET search_path TO \"{schema}\""))
+                .execute(&mut conn)
+                .await
+                // Map the search_path failure into the connection error type
+                // (a `diesel::result::Error` -> `ConnectionError`), so a
+                // broken setup surfaces as a pool/connection error rather
+                // than being silently swallowed.
+                .map_err(ConnectionError::CouldntSetupConfiguration)?;
+            Ok(conn)
+        })
+    });
+    Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config))
 }
 
 pub struct TestDb {
@@ -84,36 +114,17 @@ impl TestDb {
             .await
             .expect("create schema");
 
-        // Build a pool whose every connection pins `search_path` to this schema.
-        //
-        // diesel-async 0.5.2 `SetupCallback<C>`:
-        //   Box<dyn Fn(&str) -> future::BoxFuture<diesel::ConnectionResult<C>> + Send + Sync>
-        // i.e. an `Fn` (callable repeatedly, once per established connection),
-        // `Send + Sync`, taking the URL by `&str` and returning a `Send` boxed
-        // future of `Result<AsyncPgConnection, diesel::result::ConnectionError>`.
-        let setup_schema = schema.clone();
-        let mut config = ManagerConfig::default();
-        config.custom_setup = Box::new(move |url| {
-            let schema = setup_schema.clone();
-            Box::pin(async move {
-                use diesel::ConnectionError;
-                let mut conn = AsyncPgConnection::establish(url).await?;
-                diesel::sql_query(format!("SET search_path TO \"{schema}\""))
-                    .execute(&mut conn)
-                    .await
-                    // Map the search_path failure into the connection error type
-                    // (a `diesel::result::Error` -> `ConnectionError`), so a
-                    // broken setup surfaces as a pool/connection error rather
-                    // than being silently swallowed.
-                    .map_err(ConnectionError::CouldntSetupConfiguration)?;
-                Ok(conn)
-            })
-        });
-        let manager =
-            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
-        let pool = Pool::builder(manager).build().expect("pool");
-
+        let pool = schema_pool(&url, &schema).build().expect("pool");
         TestDb { pool, schema }
+    }
+
+    /// Another pool on this schema, of at most `max_size` connections. `self.pool.resize`
+    /// cannot do this: deadpool 0.13 keeps the old permits until that many connections exist.
+    pub fn sized_pool(&self, max_size: usize) -> Pool<AsyncPgConnection> {
+        schema_pool(&database_url(), &self.schema)
+            .max_size(max_size)
+            .build()
+            .expect("pool")
     }
 
     /// Run one migration's SQL in the test schema.

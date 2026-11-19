@@ -69,7 +69,8 @@ identifier CHECK was dropped by hand) comes back in `ClaimBatch::poisoned`,
 still leased, instead of failing the call. The worker dispatches the ready rows
 first, then dead-letters the poisoned ones with `store::dead_letter` on a task
 and connection of their own, so a slow dead-letter cannot spend a healthy row's
-lease. A poisoned row it misses stays `running` until the reaper requeues it,
+lease. Only one such task runs at a time per scheduler. A poisoned row it
+misses, or claimed while it runs, stays `running` until the reaper requeues it,
 and a later claim poisons it again until its attempts run out.
 
 A scheduler serves the queues configured with `.queue(name, limit)` (by default
@@ -336,17 +337,16 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 - **Connection pool:** each scheduler permanently holds one connection for
   `LISTEN`. Claims, heartbeats, finalization, maintenance, and DB-contained
   handlers take short-lived connections. Each scheduler needs 1 connection for
-  `LISTEN`, plus 1 for claims and maintenance, plus up to the sum of queue limits
-  for heartbeats and finalization, plus one per handler that takes its own. So
-  size `max_size ≥ sum of queue limits + 2` per scheduler sharing the pool, plus
+  `LISTEN`, plus 1 for claims and maintenance, plus 1 for dead-lettering
+  poisoned rows, plus up to the sum of queue limits for heartbeats and
+  finalization, plus one per handler that takes its own. So size
+  `max_size ≥ sum of queue limits + 3` per scheduler sharing the pool, plus
   whatever handlers take. If DB-contained handlers share an undersized pool,
   heartbeats wait for connections until local deadlines drop the handlers.
   Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
-  host), well below the 16 + 2 = 18 that the default queue's limit of 16 needs.
-  While poisoned rows keep arriving, each claim cycle may start one dead-letter
-  task per queue, and wakes from a NOTIFY or a finished dispatch can start
-  another while one is still running, so budget about one more connection per
-  queue, possibly more.
+  host), well below the 16 + 3 = 19 that the default queue's limit of 16 needs.
+  At most one dead-letter task runs at a time; rows poisoned while it runs stay
+  `running`, and the reaper recovers them after their lease.
 - **Sizing:** the handlers needed across all instances are about arrival rate ×
   average handler duration (Little's law). Each instance's limit is that number
   divided by the instance count, times 1.5 to 2 for bursts and retries. Keep
@@ -379,7 +379,7 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 | Worker crashes before claim commit | The claim rolls back; the task stays `queued`. |
 | Worker crashes after claim | The lease expires; the reaper requeues the task or marks it `dead`. |
 | Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
-| Dead-lettering a poisoned row fails, or shutdown aborts it | The row stays `running`; the reaper requeues it after expiry, and a later claim poisons it again until its attempts run out. |
+| Dead-lettering a poisoned row fails, is busy with another batch, or shutdown aborts it | The row stays `running`; the reaper requeues it after expiry, and a later claim poisons it again until its attempts run out. |
 | Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
 | PostgreSQL unavailable | No transition happens; claim errors (and, with `cron`, materialize errors) set `Degraded`; heartbeat and maintenance failures do not affect health, and a worker with no free handler slot in any queue runs no claim cycle so it keeps its last status. Workers retry without inventing local state. |
 | Graceful shutdown with handlers still running | Shutdown cancels every `ctx.cancellation` and drains for up to `shutdown_timeout`. A handler that returns `TaskError::interrupted()`, or is still running at the timeout and is dropped, has its task released: back to `queued`, due at once, the attempt not counted. A release not finished within 5 s more (the database is unreachable, or a dropped DB-contained transaction still holds the row lock) is aborted; the reaper recovers that task after the lease, and the attempt counts. A kept-alive pool can leave a dropped transaction's connection holding that lock, so exit the process after shutdown. |

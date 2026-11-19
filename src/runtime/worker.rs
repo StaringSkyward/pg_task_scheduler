@@ -44,6 +44,10 @@ use crate::store::PoisonedClaim;
 /// `max_poll_interval` instead: another transaction holds it).
 const MIN_WAIT: Duration = Duration::from_millis(10);
 
+/// Pool connections dead-lettering may hold at once, per scheduler. Rows a claim poisons
+/// while all are in use stay `running`, and the reaper recovers them after the lease.
+const QUARANTINE_CONNECTIONS: usize = 1;
+
 /// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -97,6 +101,7 @@ impl<P: SchedulerPool> Scheduler<P> {
             })
             .collect();
         let mut in_flight = JoinSet::new();
+        let quarantine = Arc::new(Semaphore::new(QUARANTINE_CONNECTIONS));
         let shutdown = Shutdown {
             begun: cancel.clone(),
             expired: CancellationToken::new(),
@@ -127,9 +132,9 @@ impl<P: SchedulerPool> Scheduler<P> {
         while !cancel.is_cancelled() {
             // The wait below collects at most one finished task per wake, and a full batch
             // skips it entirely; collect them all here. Dispatches are bounded by the permits.
-            // Dead-letter tasks are paced by the wait: each claim cycle may start one per queue (a wake
-            // from a NOTIFY or a finished dispatch can start another while one still runs), and
-            // poisoned rows never make a batch full, so they never skip the wait on their own.
+            // At most QUARANTINE_CONNECTIONS dead-letter tasks run at once; rows poisoned while
+            // they all run are left to the reaper. Poisoned rows never make a batch full, so
+            // they never skip the wait on their own.
             while let Some(joined) = in_flight.try_join_next() {
                 log_join(joined);
             }
@@ -159,6 +164,7 @@ impl<P: SchedulerPool> Scheduler<P> {
                     &config,
                     &queues,
                     &mut in_flight,
+                    &quarantine,
                     &shutdown,
                 )
                 .await;
@@ -341,6 +347,10 @@ async fn notified<C: DerefMut<Target = AsyncPgConnection>>(listener: &mut Option
 /// `min(its free permits, claim_batch_size)` of its due tasks and spawn a dispatch for each.
 /// `None` when any batch was full, else how long to wait: until the next due task in a queue
 /// that still has a free permit, within `MIN_WAIT..=max_poll_interval`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run loop's state, borrowed for one cycle"
+)]
 async fn claim_cycle<P: SchedulerPool>(
     pool: &P,
     registry: &Registry,
@@ -348,6 +358,7 @@ async fn claim_cycle<P: SchedulerPool>(
     config: &Arc<Config>,
     queues: &[WorkerQueue],
     in_flight: &mut JoinSet<()>,
+    quarantine: &Arc<Semaphore>,
     shutdown: &Shutdown,
 ) -> Result<Option<Duration>, SchedulerError> {
     let mut conn = acquire(pool).await?;
@@ -413,9 +424,19 @@ async fn claim_cycle<P: SchedulerPool>(
             });
         }
         // After the dispatches, and never awaited here: a slow dead-letter must not use up the
-        // healthy rows' leases. In `in_flight`, so shutdown drains it like a dispatch.
+        // healthy rows' leases. In `in_flight`, so shutdown drains it like a dispatch. Never
+        // waits for the permit either: that would hold these leases, unbounded.
         if !batch.poisoned.is_empty() {
-            in_flight.spawn(dead_letter(pool.clone(), batch.poisoned));
+            match quarantine.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    in_flight.spawn(dead_letter(pool.clone(), batch.poisoned, permit));
+                }
+                Err(_) => {
+                    for claim in &batch.poisoned {
+                        tracing::warn!(task_id = claim.task_id.0, reason = %claim.reason, "dead-lettering is busy; the reaper recovers the task after its lease");
+                    }
+                }
+            }
         }
         // A full batch only means "loop now" if this queue can still take more.
         full |= full_batch && queue.permits.available_permits() > 0;
@@ -442,9 +463,14 @@ async fn claim_cycle<P: SchedulerPool>(
     }))
 }
 
-/// Dead-letter rows the claim could not convert, on a connection of their own. A row this
-/// misses stays `running` until the reaper requeues it, and the next claim poisons it again.
-async fn dead_letter<P: SchedulerPool>(pool: P, poisoned: Vec<PoisonedClaim>) {
+/// Dead-letter rows the claim could not convert, on a connection of their own, holding
+/// `_permit` until done. A row this misses stays `running` until the reaper requeues it, and
+/// the next claim poisons it again.
+async fn dead_letter<P: SchedulerPool>(
+    pool: P,
+    poisoned: Vec<PoisonedClaim>,
+    _permit: OwnedSemaphorePermit,
+) {
     for claim in &poisoned {
         tracing::error!(task_id = claim.task_id.0, reason = %claim.reason, "claimed task is unusable; marking it dead");
     }

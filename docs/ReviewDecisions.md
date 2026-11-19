@@ -1590,7 +1590,10 @@ and recreated.
     task per batch of a poisoned backlog. Counting ready rows restores the
     wait, which a finished task ends, and that paces dead-letter work to about
     one task per queue at a time. If wrong, a one-permit semaphore is the
-    alternative.
+    alternative. **Changed by entry 49:** that semaphore is now in place too,
+    so at most one dead-letter task runs per scheduler, and rows poisoned
+    while it runs are left to the reaper
+    ([entry 49](#49-dead-lettering-has-a-fixed-one-connection-budget)).
 - **Why:** The claim has already committed every row's lease, so quarantine
   work for one row must not spend another's. The reaper is already the
   recovery path for a lease nobody finishes.
@@ -1612,10 +1615,13 @@ and recreated.
   - In a running worker the bad row of a batch now becomes `dead` shortly
     after the claim, not within it
     (`worker::healthy_task_in_a_batch_with_a_bad_payload_runs`).
-  - While poisoned rows keep arriving, each claim cycle may start one dead-letter task
-    per queue, and wakes from a NOTIFY or a finished dispatch can start another
-    while one is still running, so budget about one more pool connection per
-    queue, possibly more; the README's Connections note says so.
+  - Dead-lettering takes one pool connection per scheduler, so size the pool
+    at the sum of queue limits + 3 per scheduler; the README's Connections
+    note says so. **Changed by entry 49:** before the one-permit semaphore,
+    each claim cycle could start another dead-letter task while earlier ones
+    still ran, and this said to budget about one more connection per queue,
+    possibly more
+    ([entry 49](#49-dead-lettering-has-a-fixed-one-connection-budget)).
   - Code calling `store::claim` reads `.ready`, and dead-letters `.poisoned`
     itself or leaves those rows to the reaper.
 
@@ -1781,3 +1787,46 @@ and recreated.
     and enqueueing the adjacent value under the same key is an
     `IdempotencyConflict`
     (`enqueue::enqueue_preserves_f64_bits_and_rejects_the_adjacent_value`).
+
+### 49. Dead-lettering has a fixed one-connection budget
+
+- **Finding:** (review 05 #2) Every claim batch with poisoned rows spawned a
+  dead-letter task holding a pool connection, and nothing bounded how many ran
+  at once. Entry 45's pacing kept the loop from spinning, but each poll could
+  still start another task while earlier ones ran, so dead-letter writes
+  stalled in the database could fill the pool and starve claims, heartbeats
+  and finalization.
+- **Source:** call (the reviewer's fix, and entry 45's named fallback).
+- **Decision:**
+  - **The budget:** `QUARANTINE_CONNECTIONS = 1`, a constant in
+    `src/runtime/worker.rs`, not a setting. `run_until_shutdown` makes one
+    `Semaphore` with that many permits and passes it to every claim cycle.
+  - **The permit:** a cycle with poisoned rows takes it with
+    `try_acquire_owned` and spawns `dead_letter` with it. The task holds it
+    until it returns, so the wake its end causes finds it free.
+  - **Skip and log:** when the permit is taken, the cycle spawns nothing and
+    carries on with its other queues. It logs each row at warn level, with
+    `task_id` and `reason`: `dead-lettering is busy; the reaper recovers the
+    task after its lease`. The row stays `running`.
+- **Why:**
+  - An unbounded number of tasks gives no allowance to size the pool for.
+  - Waiting for the permit instead would hold the batch's leases, and its
+    rows in memory, unbounded, while the stall lasts.
+  - The reaper is already the recovery path for a failed dead-letter write
+    (entry 45). After the lease it requeues a skipped row, and a later claim
+    poisons it again.
+- **Note:** a skipped row with no attempts left ends `dead` with `worker lease
+  expired`, not its poison reason, the same as after a failed write.
+- **Expected behaviour:**
+  - With the scheduler's pool at 4 connections (queue limit 1 + 3), every
+    move to `dead` stalled on an advisory lock, and five poisoned rows due
+    before a healthy task: the healthy task reaches `done` while the lock is
+    held, at most one session waits on the lock, and all five rows end `dead`
+    once it is released
+    (`worker::stalled_dead_letters_leave_room_for_healthy_work`).
+  - Six poisoned rows with `claim_batch_size = 1` are all dead-lettered, and
+    no more than one is ever `running` at once
+    (`claim_loop::poisoned_backlog_is_dead_lettered_one_batch_at_a_time`).
+  - The README and `docs/Concurrency.md` size the pool at the sum of queue
+    limits + 3 per scheduler: 1 for `LISTEN`, 1 for claims and maintenance,
+    and 1 for dead-lettering. The default queue needs 16 + 3 = 19.
