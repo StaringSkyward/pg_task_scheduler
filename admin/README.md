@@ -239,6 +239,8 @@ write audit rows, and add or remove pauses:
 ```sql
 CREATE ROLE pg_task_admin LOGIN PASSWORD '...';
 GRANT USAGE ON SCHEMA public TO pg_task_admin;   -- the schema holding the queue tables
+-- every write's identifier CHECKs call this; PUBLIC has it by default
+GRANT EXECUTE ON FUNCTION queue_is_identifier(text) TO pg_task_admin;
 -- pages
 GRANT SELECT ON queue_tasks, queue_task_attempts, queue_admin_actions,
                 queue_workers, queue_worker_queues, queue_worker_task_names,

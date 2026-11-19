@@ -69,6 +69,9 @@ version:
 Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
 the worker registry are part of the core crate and always on.
 
+Roles that write the queue tables need EXECUTE on `queue_is_identifier(text)`,
+which PUBLIC has by default.
+
 ## Enqueue
 
 Define a task once so producers and handlers share the name and payload type:

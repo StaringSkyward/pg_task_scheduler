@@ -4,7 +4,7 @@ This document is the design of the crate's queue: its invariants, data model,
 state machine, transitions, worker runtime and configuration, and the reason for
 each choice. It is self-contained. [Concurrency Model](Concurrency.md) explains
 the races, fencing and failure behaviour in detail, and
-[Review decisions](ReviewDecisions.md) records what changed after the two
+[Review decisions](ReviewDecisions.md) records what changed after the
 pre-release reviews.
 
 ## Scope

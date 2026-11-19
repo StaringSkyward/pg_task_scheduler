@@ -1745,6 +1745,11 @@ and recreated.
   - On a SQL_ASCII database, `0001` fails with `pg_task_scheduler requires a
     UTF8 database; this one is SQL_ASCII` and creates no table (checked by
     hand). The README's requirements line says so.
+  - A role that writes the queue tables needs EXECUTE on
+    `queue_is_identifier(text)`, because every write's CHECKs call it as that
+    role, and inlining does not skip the ACL check. PUBLIC has it by default; a
+    database that revokes it must grant it (the admin README's role recipe
+    does).
   - A `queue_tasks` write costs about 1 µs more for its four CHECKs (measured
     on PostgreSQL 13).
   - A database built before this change lacks the function and the CHECKs and
