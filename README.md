@@ -9,7 +9,8 @@ scheduled tasks, and retries all use the same `due_at` mechanism.
 releases.
 
 Requires PostgreSQL 13 or later, Rust 1.88 or later, Tokio, Diesel 2.3 and
-`diesel-async` 0.9.
+`diesel-async` 0.9. The migrations require a UTF8 database, and fail at once in
+any other encoding.
 
 Try it locally with the example app: `docker compose up` in
 [example-app/](https://github.com/StaringSkyward/pg_task_scheduler/tree/main/example-app) starts a demo with a web page, two
@@ -61,7 +62,7 @@ version:
 
 | File | Contents |
 | --- | --- |
-| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks` (with the `cancelled` status and `admin_action_id`), `queue_task_attempts`, `queue_outbox` |
+| `migrations/0001_create_queue_tables/up.sql` | the UTF8 check; `queue_is_identifier`, the identifier rule that every identifier column's CHECK calls; `queue_tasks` (with the `cancelled` status and `admin_action_id`), `queue_task_attempts`, `queue_outbox` |
 | `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` and `scheduler_job_pauses` (only with the `cron` feature) |
 | `migrations/0003_admin/up.sql` | `queue_admin_actions`; `queue_pauses`; `queue_workers`, `queue_worker_queues`, `queue_worker_task_names`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
 
@@ -547,9 +548,9 @@ scanning retained rows (see
   handlers take. A smaller pool starves heartbeats until local deadlines drop
   handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4 on a
   2-vCPU host), well below the 16 + 2 = 18 that the default queue's limit of 16
-  needs. Claimed rows that cannot run (a key, payload or count written by direct
-  SQL that the types reject) are dead-lettered on a connection of their own,
-  where each claim cycle may start one per queue, and wakes from a NOTIFY or a
+  needs. Claimed rows that cannot run (a payload or count written by direct SQL
+  that the types reject) are dead-lettered on a connection of their own, where
+  each claim cycle may start one per queue, and wakes from a NOTIFY or a
   finished dispatch can start another while one is still running, so leave that
   much room, possibly more, if direct SQL writes tasks.
 
@@ -661,8 +662,9 @@ depends on what is wrong:
   occurrence's task, and the schedule keeps advancing. Such arguments come from
   direct SQL, or from `CreateJob::new` with the wrong type for the handler.
 - **Cron or routing:** a bad cron expression, task name, queue or `max_attempts`
-  (only possible through direct SQL) pauses the schedule, with an error logged,
-  rather than stopping other schedules.
+  (only possible through direct SQL, and for a task name or queue only once its
+  CHECK is dropped) pauses the schedule, with an error logged, rather than
+  stopping other schedules.
 
 ## Feature Flags
 

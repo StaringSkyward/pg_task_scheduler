@@ -12,18 +12,21 @@ so each entry restates its finding.
 - **Review 03** was run at `1390560`, the head of PR #9. Entries 34–42 follow
   its findings 1–9 in order.
 - **Review 04** was run at `a3ab225`, the head of PR #9. Entries 43–46 follow
-  its findings 1–4 in order.
+  its findings 1–4 in order; entry 47, approved after its triage, cuts across
+  them and earlier entries.
 
 It describes the code as shipped. Each entry has a source: **(user)** means the
 user decided it; **(call)** means it was a judgement call, open to change.
 **Ruling** marks a call made during implementation, recorded in the entry it
 affects. Where a later review changed an entry, that entry ends with a
 **Changed by review 02**, **Changed by review 03** or **Changed by review 04**
-line that says what is different now and links to the later entry.
+line that says what is different now and links to the later entry. An entry
+that entry 47 changed has a **Changed by entry 47** line in the same way.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
-02 (entries 17 and 33); reviews 03 and 04 changed none. A database built by an
-earlier version of this repository must be dropped and recreated.
+02 (entries 17 and 33) and for entry 47; reviews 03 and 04's findings changed
+none. A database built by an earlier version of this repository must be dropped
+and recreated.
 
 ## Review 01: findings
 
@@ -55,6 +58,12 @@ earlier version of this repository must be dropped and recreated.
   insert copies them in SQL), and a CHECK keeps `next_run_at` finite, so neither
   can end a pass
   ([entry 23](#23-the-materializer-decodes-nothing-a-stored-value-can-break)).
+- **Changed by entry 47:** `scheduler_jobs.task_name` and `queue` have
+  identifier CHECKs (`queue` had none), so direct SQL can store an invalid one
+  only after dropping its CHECK by hand. The materializer still parses them and
+  pauses such a job; the queue test drops `scheduler_jobs_queue_identifier`
+  first
+  ([entry 47](#47-identifier-columns-carry-the-identifier-rule-as-sql-checks)).
 
 ### 2. The schedule key prefix is reserved
 
@@ -142,6 +151,12 @@ earlier version of this repository must be dropped and recreated.
   `store::task` reads `task_key` as text too, so such a row can be opened, with
   `TaskView.task_key` as `StoredTaskKey::Invalid`
   ([entry 44](#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
+- **Changed by entry 47:** every identifier column, `queue_tasks.task_key`
+  among them, now has an identifier CHECK, so a raw-SQL producer can no longer
+  write an invalid key, name or queue. The decode checks and the claim's
+  key check stay, for a database whose CHECK was dropped by hand; the decode
+  and claim tests drop the named constraint first
+  ([entry 47](#47-identifier-columns-carry-the-identifier-rule-as-sql-checks)).
 
 ### 5. The schema puts optional and multi-valued facts in their own relations
 
@@ -1520,6 +1535,13 @@ earlier version of this repository must be dropped and recreated.
     (`pages::task_page_shows_why_a_task_key_is_invalid`).
   - Code that read `TaskView.task_key` as a `TaskKey` matches on
     `StoredTaskKey` or calls `as_str()`. A JSON client reads `task_key.valid`.
+- **Changed by entry 47:** `queue_tasks.task_key` has an identifier CHECK, so
+  SQL can no longer store the review's empty key or a 300-character one; only a
+  database whose CHECK was dropped by hand can hold an invalid key.
+  `StoredTaskKey`, the tagged JSON and the page's key error stay as defence in
+  depth (user decision), and the three tests above drop
+  `queue_tasks_task_key_identifier` first
+  ([entry 47](#47-identifier-columns-carry-the-identifier-rule-as-sql-checks)).
 
 ### 45. Claim returns poisoned rows for the caller to dead-letter
 
@@ -1627,3 +1649,104 @@ earlier version of this repository must be dropped and recreated.
     (`pg_task_scheduler_heartbeat_failures_total`), and the lease keeper tries
     again at the next interval until the local deadline, as for any other
     heartbeat error.
+
+## Review 04: cross-cutting decisions
+
+### 47. Identifier columns carry the identifier rule as SQL CHECKs
+
+- **Source:** user (add the CHECKs, on every identifier column, and keep
+  `StoredTaskKey`); call (one shared function, the explicit White_Space class,
+  the constraint names).
+- **Decision:**
+  - **The function:** `0001` defines `queue_is_identifier(s TEXT)`, the rule of
+    `validate_identifier` in `src/ids.rs`: `char_length(s) BETWEEN 1 AND 255`,
+    with no leading or trailing Unicode White_Space. NUL needs no test, because
+    PostgreSQL text cannot hold it. Every identifier CHECK calls it, so SQL
+    keeps the rule in one place, as Rust does.
+  - **The columns** (user: every one): a column has the CHECK exactly when the
+    crate reads or writes it as an identifier newtype (`TaskKey`, `TaskName`,
+    `QueueName`, `WorkerId`, `EffectName`, `Topic`, `ScheduleName`):
+    - `queue_tasks`: `task_key`, `task_name`, `queue`, `locked_by`;
+    - `queue_task_attempts`: `worker_id`;
+    - `queue_outbox`: `task_key`, `effect_name`, `topic`;
+    - `scheduler_jobs` (`cron`): `name`, `task_name`, `queue`;
+    - `queue_admin_actions`: `task_name`, `queue`;
+    - `queue_pauses`: `queue`;
+    - `queue_workers`: `worker_id`;
+    - `queue_worker_queues`: `worker_id`, `queue`;
+    - `queue_worker_task_names`: `worker_id`, `task_name`.
+
+    Plain-text columns have none: `operator`, `reason`, `label`, `last_error`,
+    `last_error_filter`, `error` and `cron_expression`. `locked_by` and the two
+    audit columns stay nullable: the function returns NULL for NULL, which a
+    CHECK accepts.
+  - **The names** (call): each CHECK is `<table>_<column>_identifier` (for
+    example `queue_tasks_task_key_identifier`), so tests and operators can name
+    it. `queue_outbox.command_key` gets `queue_outbox_command_key_length`,
+    `CHECK (octet_length(command_key) BETWEEN 1 AND 2048)`, which is
+    `CommandKey`'s rule (entry 28). That makes 20 constraints with `cron`, and
+    17 without.
+  - **The whitespace class** (call): U+0009–U+000D, U+0020, U+0085, U+00A0,
+    U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and U+3000, which is
+    what Rust's `str::trim` strips, written as `\uXXXX` regex escapes so the
+    file stays ASCII. It is not `[[:space:]]`, which follows the locale:
+    probing PostgreSQL 13 with the project database's locale showed it rejects
+    neither U+00A0 nor U+0085. The old `scheduler_jobs` CHECKs on `name` and
+    `task_name` used it, so they let through names that the Rust decode
+    rejected. They are replaced, and `scheduler_jobs.queue`, which had no
+    CHECK, gets one.
+  - Ruling: the function is `LANGUAGE sql IMMUTABLE PARALLEL SAFE`, not
+    `STRICT` as planned. PostgreSQL does not inline a STRICT SQL function with
+    this body, so each CHECK ran through the function executor. Without
+    `STRICT` the verdicts are the same (NULL in gives NULL out, which a CHECK
+    accepts), and `EXPLAIN VERBOSE` shows the body inlined. On PostgreSQL 13,
+    200,000 rows with four identifier CHECKs each took 1152 ms to insert with
+    `STRICT` and 324 ms inlined (94 ms with no CHECK), and 1211 ms against
+    373 ms (186 ms) to update: about 4× cheaper per write. PostgreSQL checks
+    every CHECK on every update of a row, including claim, heartbeat and
+    completion. If wrong, it is one word back.
+  - Ruling: the migrations require a UTF8 database. `0001` opens with a `DO`
+    block that raises `pg_task_scheduler requires a UTF8 database; this one is
+    <encoding>` unless `server_encoding` is `UTF8`, before it creates anything.
+    The code-point class and `char_length` need UTF8, and so does JSONB's
+    non-ASCII text: in another encoding they see bytes (in SQL_ASCII, `voilà`
+    ends in byte 0xA0 and fails the CHECK). Enforcing it states a requirement
+    the JSONB columns already had. If wrong, it becomes a line in the README.
+  - Ruling: the two regex patterns are escape strings (`E'…\\u0009…'`), so a
+    session with `standard_conforming_strings = off` logs no warning about
+    nonstandard escapes. The verdicts and the inlining are the same with the
+    setting on or off.
+  - **Defence in depth** (user): `StoredTaskKey` stays, with the admin JSON's
+    tagged `task_key`, the task page's key error, the claim's
+    `invalid task_key` quarantine and every identifier newtype's decode check,
+    for a database whose CHECK was dropped by hand. The tests of those paths
+    drop the named constraint first, through `TestDb::drop_constraint`.
+  - The migrations were edited in place, as in entries 17 and 33. There is no
+    `0004`.
+- **Why:** The Rust types enforced the rule only on what the crate itself wrote
+  and read. A raw-SQL producer could store a key, name or queue that a later
+  read rejected, and the crate had to quarantine it there (entries 1, 4 and
+  44). A CHECK rejects the value at the write, where the producer sees the
+  error.
+- **Expected behaviour:**
+  - For every BMP code point except the surrogates and NUL,
+    `queue_is_identifier` gives the same verdict as `TaskName::try_from` on
+    `chr(cp) || 'x'` and on `'x' || chr(cp)`; Unicode has no White_Space above
+    the BMP. 255 `é` or 255 U+1F600 pass on both sides, and 256 fail
+    (`identifier_checks::sql_identifier_rule_matches_rust`).
+  - Each covered column has its named CHECK with the expected definition, and
+    so does `queue_outbox_command_key_length`
+    (`identifier_checks::identifier_constraints_cover_every_identifier_column`).
+  - Inserting the task name `' x'` by SQL fails with a check violation
+    (SQLSTATE 23514) on `queue_tasks_task_name_identifier`
+    (`identifier_checks::queue_tasks_rejects_an_invalid_task_name`).
+  - A NULL `locked_by`, and a NULL `queue` or `task_name` on an audit row, are
+    accepted (`identifier_checks::nullable_identifier_columns_accept_null`).
+  - On a SQL_ASCII database, `0001` fails with `pg_task_scheduler requires a
+    UTF8 database; this one is SQL_ASCII` and creates no table (checked by
+    hand). The README's requirements line says so.
+  - A `queue_tasks` write costs about 1 µs more for its four CHECKs (measured
+    on PostgreSQL 13).
+  - A database built before this change lacks the function and the CHECKs and
+    must be dropped and recreated, as must the example's
+    (`docker compose down -v`). No Rust API changed.

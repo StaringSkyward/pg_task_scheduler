@@ -63,14 +63,14 @@ The statement is atomic, so a claim and its attempt row commit together or not a
 all. Concurrent claimers skip each other's locked rows, so a queued task gets one
 owner.
 
-Rust then converts each claimed row on its own. A row that fails (a key,
-payload or count written by direct SQL that the types reject) comes back in
-`ClaimBatch::poisoned`, still leased, instead of failing the call. The worker
-dispatches the ready rows first, then dead-letters the poisoned ones with
-`store::dead_letter` on a task and connection of their own, so a slow
-dead-letter cannot spend a healthy row's lease. A poisoned row it misses stays
-`running` until the reaper requeues it, and a later claim poisons it again
-until its attempts run out.
+Rust then converts each claimed row on its own. A row that fails (a payload or
+count written by direct SQL that the types reject, or a key in a database whose
+identifier CHECK was dropped by hand) comes back in `ClaimBatch::poisoned`,
+still leased, instead of failing the call. The worker dispatches the ready rows
+first, then dead-letters the poisoned ones with `store::dead_letter` on a task
+and connection of their own, so a slow dead-letter cannot spend a healthy row's
+lease. A poisoned row it misses stays `running` until the reaper requeues it,
+and a later claim poisons it again until its attempts run out.
 
 A scheduler serves the queues configured with `.queue(name, limit)` (by default
 `default` at 16), each with its own permits. Each cycle, it claims from every

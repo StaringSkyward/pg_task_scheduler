@@ -57,6 +57,12 @@ not from `SERIALIZABLE`.
 
 ## Data Model
 
+`0001` first checks that the database is UTF8, and fails otherwise. It then
+creates `queue_is_identifier(text)`, the identifier rule of
+[Rust Boundaries](#rust-boundaries) in SQL. Every identifier column has a CHECK
+that calls it, named `<table>_<column>_identifier`. Plain-text columns such as
+`operator`, `reason`, `label` and `last_error` have none.
+
 ### `queue_tasks`
 
 There is one row per logical task. It holds the identity (`id`, `task_key`), the
@@ -75,7 +81,9 @@ done | dead | cancelled  ⇔ completed_at is set
 ```
 
 `due_at` has `CHECK (isfinite(due_at))`, so PostgreSQL's `infinity` and
-`-infinity`, which chrono cannot represent, never reach a claim.
+`-infinity`, which chrono cannot represent, never reach a claim. `task_key`,
+`task_name`, `queue` and `locked_by` have identifier CHECKs
+(`queue_tasks_task_key_identifier` and so on); `locked_by` may still be NULL.
 
 `admin_action_id` (nullable, not indexed) points at the `queue_admin_actions` row
 that last cancelled or replayed the task, single or bulk. No worker statement
@@ -114,7 +122,8 @@ cancelled`), and `error`. Rows cascade when their task is deleted by retention.
 The primary key is `(task_id, lock_token)`, with an index on
 `(task_id, attempt_no)`. Two CHECKs hold the row's shape: `attempt_no >= 1`, and
 `(finished_at IS NULL) = (outcome IS NULL)`, so an attempt is open with neither
-or closed with both.
+or closed with both. `worker_id` has the identifier CHECK
+`queue_task_attempts_worker_id_identifier`.
 
 ### `queue_outbox`
 
@@ -122,7 +131,9 @@ Commands emitted by a successful completion. `(task_key, effect_name)` is unique
 so a retry cannot emit the same effect twice. `command_key` is globally unique, so
 a cross-task key collision fails instead of silently deduplicating. `CommandKey`
 allows at most 2048 bytes, a margin below PostgreSQL's B-tree entry limit of
-about 2704 bytes, so the unique index can hold every key the type accepts.
+about 2704 bytes, so the unique index can hold every key the type accepts, and
+`queue_outbox_command_key_length` holds the column to 1 to 2048 bytes too.
+`task_key`, `effect_name` and `topic` have identifier CHECKs.
 `queue_outbox_unpublished_idx (id) WHERE published_at IS NULL` serves a relay, and
 `queue_outbox_published_idx (published_at, id) WHERE published_at IS NOT NULL`
 serves retention cleanup, so a backlog of unpublished rows never slows it.
@@ -144,10 +155,13 @@ A CHECK fixes the shape of each action:
 | single replay or cancel | `task_id`, `task_name` and `queue` |
 | bulk replay or cancel | `task_name` and `max_task_id`, optionally `queue`; `last_error_filter` only on a bulk replay |
 
+`task_name` and `queue` have identifier CHECKs, which a NULL passes.
+
 ### `queue_pauses`
 
 One row per paused queue: `queue` (primary key), `operator`, `reason`,
-`paused_at`. Claims and the next-due wakeup skip a queue with a row.
+`paused_at`. Claims and the next-due wakeup skip a queue with a row. `queue` has
+the identifier CHECK `queue_pauses_queue_identifier`.
 
 ### `queue_workers`
 
@@ -166,6 +180,9 @@ serves:
 - `queue_worker_task_names (worker_id, task_name)`: one row per task name the
   worker has a handler for.
 
+Every `worker_id`, `queue` and `task_name` in the three tables has an identifier
+CHECK.
+
 Each write replaces the worker's rows in both. Whether a queue is paused is not
 stored here: `store::workers` reads it from `queue_pauses` when it lists the
 workers, so it is always current. `store::workers` is one statement: subqueries
@@ -178,8 +195,8 @@ caller's transaction too.
 Recurring definitions: a unique schedule `name` (`ScheduleName`), the
 `task_name` each occurrence runs (several schedules may share one), the cron
 expression, the payload template (`job_args`), `max_attempts ≥ 1`, the queue,
-the `next_run_at` cursor, and timestamps. `name` and `task_name` have the
-identifier CHECK: 1 to 255 characters, with no leading or trailing whitespace.
+the `next_run_at` cursor, and timestamps. `name`, `task_name` and `queue` have
+identifier CHECKs (`scheduler_jobs_name_identifier` and so on).
 `next_run_at` has `CHECK (isfinite(next_run_at))`.
 `scheduler_jobs_due_idx (next_run_at)` finds due schedules.
 
@@ -352,14 +369,15 @@ READ COMMITTED, sets `idle_in_transaction_session_timeout` to 30 s, takes the
 oldest due unpaused schedule `FOR UPDATE SKIP LOCKED`, re-checks its pause in a
 new statement, and parses its cron expression, the next occurrence after the
 database's `now()`, its task name, queue and `max_attempts`. If any of them is
-invalid, which only direct SQL can cause, the schedule is paused and the error
-logged, and the pass goes on. Otherwise the occurrence for the current
-`next_run_at` is inserted with `task_key = "schedule:{id}:{next_run_at}"`
-(microsecond RFC 3339) and `ON CONFLICT DO NOTHING`, and `next_run_at` moves to
-the next future occurrence, in the same transaction. The insert copies
-`job_args` from the schedule row in SQL (`INSERT … SELECT`), so the materializer
-never decodes them, and its CHECK keeps `next_run_at` finite. After downtime,
-one occurrence is created for the missed slot.
+invalid, which only direct SQL can cause (for the task name or queue, only once
+its CHECK is dropped), the schedule is paused and the error logged, and the
+pass goes on. Otherwise the occurrence for the current `next_run_at` is
+inserted with `task_key = "schedule:{id}:{next_run_at}"` (microsecond RFC 3339)
+and `ON CONFLICT DO NOTHING`, and `next_run_at` moves to the next future
+occurrence, in the same transaction. The insert copies `job_args` from the
+schedule row in SQL (`INSERT … SELECT`), so the materializer never decodes them,
+and its CHECK keeps `next_run_at` finite. After downtime, one occurrence is
+created for the missed slot.
 
 The pause re-check needs READ COMMITTED. A pause does not change the job row, so
 locking the row raises no serialization error, and under REPEATABLE READ the
@@ -506,16 +524,21 @@ recovers it after the lease expires.
   `TaskPayload`: `Json`, or `Unreadable { text, error }` for a stored value that
   does not parse (one written by direct SQL), and the key as a `StoredTaskKey`:
   `Valid`, or `Invalid { text, error }` for a stored key that breaks the
-  identifier rule. Either way its dead letter can still be read.
+  identifier rule (possible only once its CHECK is dropped by hand). Either way
+  its dead letter can still be read.
 - Text identifiers are validated newtypes: `TaskKey`, `TaskName`, `QueueName`,
   `WorkerId`, `ScheduleName` (`cron`), `EffectName` and `Topic` (1 to 255
   characters, no leading or trailing whitespace, no NUL), and `CommandKey`
-  (non-empty, no NUL, at most 2048 bytes). They are validated when constructed
-  and again when decoded from the database, so a row written by direct SQL with
-  an invalid value is a decode error. The claim and `store::task` read
-  `task_key` as text instead, so such a row can still be dead-lettered and
-  opened. `TaskId`, `LockToken` and `JobId` carry no rule. `enqueue` also
-  rejects a `TaskKey` with the reserved `schedule:` prefix.
+  (non-empty, no NUL, at most 2048 bytes). They are validated when constructed,
+  by the CHECKs when stored, and again when decoded from the database. The
+  identifier CHECKs call `queue_is_identifier`, whose whitespace class spells
+  out what `str::trim` strips, because `[[:space:]]` follows the locale and
+  misses U+0085 and U+00A0; it counts code points, so the migrations require a
+  UTF8 database and fail otherwise. In a database whose CHECK was dropped by
+  hand, a row with an invalid value is a decode error. The claim and
+  `store::task` read `task_key` as text instead, so such a row can still be
+  dead-lettered and opened. `TaskId`, `LockToken` and `JobId` carry no rule.
+  `enqueue` also rejects a `TaskKey` with the reserved `schedule:` prefix.
 - `TaskLease { task_id, worker_id, lock_token, attempt_no }` is the ownership
   proof every guarded transition takes. Handlers receive it as `ctx.lease`.
   `attempt_no` is an `AttemptNo`, which counts from 1; the attempt counts on

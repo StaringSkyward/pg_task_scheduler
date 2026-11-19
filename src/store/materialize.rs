@@ -108,9 +108,9 @@ pub(crate) fn schedule_task_key(
 ///
 /// A job-local defect pauses its job and logs the error: a stored cron that fails to
 /// parse or has no next occurrence, or an invalid task name, queue or `max_attempts`
-/// (all validated on create, so only direct SQL stores one). Such a job is never
-/// silently advanced. Its `job_args` are copied in SQL, never decoded, and only database
-/// errors end the pass.
+/// (all validated on create, so only direct SQL stores one, and a task name or queue only
+/// once its identifier CHECK is dropped by hand). Such a job is never silently advanced.
+/// Its `job_args` are copied in SQL, never decoded, and only database errors end the pass.
 ///
 /// It requires, and enforces, READ COMMITTED, which its pause recheck relies on. Each job's
 /// transaction begins at READ COMMITTED whatever the session default. On a connection already
