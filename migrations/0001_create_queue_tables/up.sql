@@ -1,3 +1,15 @@
+-- The identifier CHECK's code-point class and char_length, and JSONB's non-ASCII text, need
+-- UTF8: in another encoding they see bytes (in SQL_ASCII, 'voila' with a grave accent ends in
+-- byte 0xA0 and fails the CHECK).
+DO $$
+BEGIN
+    IF current_setting('server_encoding') <> 'UTF8' THEN
+        RAISE EXCEPTION 'pg_task_scheduler requires a UTF8 database; this one is %',
+            current_setting('server_encoding');
+    END IF;
+END
+$$;
+
 -- The crate's identifier rule, mirroring `validate_identifier` in src/ids.rs: 1 to 255
 -- characters, with no leading or trailing Unicode White_Space (what Rust's `str::trim`
 -- strips). Every identifier column's CHECK calls it. The class is spelled out because
@@ -8,8 +20,8 @@ CREATE FUNCTION queue_is_identifier(s TEXT) RETURNS BOOLEAN
     LANGUAGE sql IMMUTABLE PARALLEL SAFE
 AS $$
     SELECT char_length(s) BETWEEN 1 AND 255
-       AND s !~ '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
-       AND s !~ '[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]$'
+       AND s !~ E'^[\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]'
+       AND s !~ E'[\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]$'
 $$;
 
 CREATE TABLE queue_tasks (

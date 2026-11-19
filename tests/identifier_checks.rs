@@ -33,6 +33,8 @@ struct Def {
 
 /// `queue_is_identifier` must give the verdict `validate_identifier` (`src/ids.rs`) gives:
 /// every BMP code point but NUL (text cannot hold it) and the surrogates, leading and trailing.
+/// Unicode has no White_Space above the BMP, so the sweep covers the whole class; the length
+/// cases check that both sides count code points, not bytes or UTF-16 units.
 #[tokio::test]
 async fn sql_identifier_rule_matches_rust() {
     let db = TestDb::new().await;
@@ -66,6 +68,8 @@ async fn sql_identifier_rule_matches_rust() {
         (String::new(), false),
         ("é".repeat(255), true),
         ("é".repeat(256), false),
+        ("\u{1F600}".repeat(255), true),
+        ("\u{1F600}".repeat(256), false),
     ] {
         let sql = diesel::sql_query("SELECT queue_is_identifier($1) AS ok")
             .bind::<diesel::sql_types::Text, _>(&s)
