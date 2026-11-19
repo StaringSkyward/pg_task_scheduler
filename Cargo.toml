@@ -50,3 +50,13 @@ cron = ["dep:croner"]
 [dev-dependencies]
 dotenvy = "0.15.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# SCRAM authentication (PostgreSQL 14+'s default) runs 4096 rounds of HMAC-SHA-256 per
+# connection. Unoptimized, that took long enough under the parallel test suite to expire
+# short test leases while a pool opened a connection. Dev builds only; dependents ignore this.
+[profile.dev.package.postgres-protocol]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
