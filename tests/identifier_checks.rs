@@ -138,6 +138,61 @@ async fn identifier_constraints_cover_every_identifier_column() {
     );
     expected.sort();
     assert_eq!(actual, expected);
+
+    // Every TEXT column is classified: identifier (above) or deliberately plain text.
+    // A new TEXT column must be added to one list, or this fails.
+    #[cfg_attr(not(feature = "cron"), allow(unused_mut))]
+    let mut plain = vec![
+        "queue_tasks.status",
+        "queue_tasks.last_error",
+        "queue_task_attempts.outcome",
+        "queue_task_attempts.error",
+        "queue_outbox.command_key",
+        "queue_admin_actions.action",
+        "queue_admin_actions.operator",
+        "queue_admin_actions.reason",
+        "queue_admin_actions.last_error_filter",
+        "queue_pauses.operator",
+        "queue_pauses.reason",
+        "queue_workers.label",
+        "queue_workers.status",
+        "queue_workers.last_error",
+    ];
+    #[cfg(feature = "cron")]
+    plain.push("scheduler_jobs.cron_expression");
+    let classified: std::collections::BTreeSet<String> = columns
+        .iter()
+        .map(|(t, c)| format!("{t}.{c}"))
+        .chain(plain.iter().map(|s| (*s).to_owned()))
+        .collect();
+    let text_columns: Vec<String> = diesel::sql_query(
+        "SELECT table_name || '.' || column_name AS def FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND data_type = 'text' \
+           AND (table_name LIKE 'queue\\_%' OR table_name LIKE 'scheduler\\_%') \
+         ORDER BY 1",
+    )
+    .get_results::<Def>(&mut conn)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| r.def)
+    .collect();
+    let unclassified: Vec<&String> = text_columns
+        .iter()
+        .filter(|c| !classified.contains(*c))
+        .collect();
+    let missing: Vec<&String> = classified
+        .iter()
+        .filter(|c| !text_columns.contains(c))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "unclassified TEXT columns: {unclassified:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "classified but not TEXT columns: {missing:?}"
+    );
     db.cleanup().await;
 }
 
