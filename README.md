@@ -424,7 +424,7 @@ no tasks, only a valid name. `store::paused_queues` lists the pauses.
   and retries.
 - Run separate deployments for queues that scale differently. Each process
   configures only its own queues.
-- Size the pool at the sum of the queue limits + 3 per scheduler, plus whatever
+- Size the pool at the sum of the queue limits + 5 per scheduler, plus whatever
   handlers take (see Connections under [Operations](#operations)). Keep
   (instances × pool size) under PostgreSQL's `max_connections`, with room to
   spare.
@@ -545,16 +545,22 @@ scanning retained rows (see
   transaction by the time left on its lease, but never raises a stricter
   `lock_timeout` or `statement_timeout` the host set.
 - **Connections:** each running scheduler holds one pool connection for
-  `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
-  finalization, maintenance, and dead-lettering. Handlers hold no connection unless they take
-  one. Per scheduler sharing a pool, that is 1 for `LISTEN`, 1 for claims and
-  maintenance, 1 for dead-lettering claimed rows that direct SQL made unusable
-  (a payload or count the types reject), and up to the sum of queue limits for
-  heartbeats and finalization, plus one per handler that takes its own. So set
-  the pool's `max_size` to at least the sum of queue limits + 3 per scheduler,
-  plus whatever handlers take. A smaller pool starves heartbeats until local
-  deadlines drop handlers. Deadpool's default `max_size` is 2 × the logical CPU
-  count (4 on a 2-vCPU host), well below the 16 + 3 = 19 that the default
+  `LISTEN queue_available`, and takes others for claims, heartbeats,
+  finalization, maintenance, the worker registry, and dead-lettering. Handlers
+  hold no connection unless they take one. Maintenance, the registry and
+  dead-lettering each run on a task of their own, so a stalled database can
+  hold all three connections at once. Per scheduler sharing a pool, that is
+  one connection each for `LISTEN`, the claim loop (claims and cron
+  materialization), maintenance, the worker registry, and dead-lettering
+  claimed rows that direct SQL made unusable (a payload or count the types
+  reject), and up to the sum of queue limits for heartbeats and finalization.
+  So set the pool's `max_size` to at least the sum of queue limits + 5 per
+  scheduler. On top of that, a handler that finishes while its heartbeat
+  transaction is still in flight briefly holds a second connection, and its
+  finishing update waits on that transaction's row lock anyway. Add whatever
+  handlers and the host take. A smaller pool starves heartbeats until local
+  deadlines drop handlers. Deadpool's default `max_size` is 2 × the logical
+  CPU count (4 on a 2-vCPU host), well below the 16 + 5 = 21 that the default
   queue's limit of 16 needs.
 
 ### Observability

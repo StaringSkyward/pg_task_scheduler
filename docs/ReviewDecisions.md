@@ -26,7 +26,7 @@ affects. Where a later review changed an entry, that entry ends with a
 **Changed by review 02**, **Changed by review 03** or **Changed by review 04**
 line that says what is different now and links to the later entry. An entry
 that entry 47 changed has a **Changed by entry 47** line in the same way. A
-**Changed by entry N** pointer (47, 48, 49 or 50) says what that entry changed; when
+**Changed by entry N** pointer (47, 48, 49, 50 or 51) says what that entry changed; when
 it changes one bullet only, it may sit inside that bullet instead of ending the
 entry.
 
@@ -1627,12 +1627,15 @@ and recreated.
     after the claim, not within it
     (`worker::healthy_task_in_a_batch_with_a_bad_payload_runs`).
   - Dead-lettering takes one pool connection per scheduler, so size the pool
-    at the sum of queue limits + 3 per scheduler; the README's Connections
+    at the sum of queue limits + 5 per scheduler; the README's Connections
     note says so. **Changed by entry 49:** before the one-permit semaphore,
     each claim cycle could start another dead-letter task while earlier ones
     still ran, and this said to budget about one more connection per queue,
     possibly more
     ([entry 49](#49-dead-lettering-has-a-fixed-one-connection-budget)).
+    **Changed by entry 51:** this said + 3, counting maintenance with claims
+    and leaving out the worker registry
+    ([entry 51](#51-the-pool-minimum-counts-every-background-connection)).
   - Code calling `store::claim` reads `.ready`, and dead-letters `.poisoned`
     itself or leaves those rows to the reaper.
 
@@ -1831,18 +1834,26 @@ and recreated.
 - **Note:** a skipped row with no attempts left ends `dead` with `worker lease
   expired`, not its poison reason, the same as after a failed write.
 - **Expected behaviour:**
-  - With the scheduler's pool at 4 connections (queue limit 1 + 3), every
+  - With the scheduler's pool at 6 connections (queue limit 1 + 5), every
     move to `dead` stalled on an advisory lock, and five poisoned rows due
     before a healthy task: the healthy task reaches `done` while the lock is
-    held, at most one session waits on the lock, and all five rows end `dead`
+    held, exactly one session waits on the lock, and all five rows end `dead`
     once it is released
-    (`worker::stalled_dead_letters_leave_room_for_healthy_work`).
+    (`worker::stalled_background_work_leaves_room_for_healthy_work`).
+    **Changed by entry 51:** the test ran on 4 connections (1 + 3), with only
+    dead-lettering stalled, as
+    `worker::stalled_dead_letters_leave_room_for_healthy_work`; it now stalls
+    maintenance and the registry refresh too
+    ([entry 51](#51-the-pool-minimum-counts-every-background-connection)).
   - Six poisoned rows with `claim_batch_size = 1` are all dead-lettered, and
     no more than one is ever `running` at once
     (`claim_loop::poisoned_backlog_is_dead_lettered_one_batch_at_a_time`).
   - The README and `docs/Concurrency.md` size the pool at the sum of queue
-    limits + 3 per scheduler: 1 for `LISTEN`, 1 for claims and maintenance,
-    and 1 for dead-lettering. The default queue needs 16 + 3 = 19.
+    limits + 5 per scheduler, 1 of them for dead-lettering. The default queue
+    needs 16 + 5 = 21. **Changed by entry 51:** this said + 3: 1 for
+    `LISTEN`, 1 for claims and maintenance, and 1 for dead-lettering, so the
+    default queue needed 16 + 3 = 19
+    ([entry 51](#51-the-pool-minimum-counts-every-background-connection)).
 
 ## Review 06: findings
 
@@ -1884,3 +1895,41 @@ and recreated.
     `enqueue::enqueue_rejects_args_whose_meaning_changes_in_jsonb`,
     `jobs::for_task_rejects_args_that_do_not_round_trip`,
     `jobs::for_task_rejects_args_whose_meaning_changes_in_jsonb`).
+
+### 51. The pool minimum counts every background connection
+
+- **Finding:** (review 06 #2) The documented minimum, the sum of queue
+  limits + 3 per scheduler, counted maintenance together with claims and left
+  out the worker registry. Maintenance and the registry run on tasks of their
+  own, each taking its own connection, so they can stall alongside the one
+  dead-letter task. The review stalled all three on a pool of 4 with a queue
+  limit of 1: `LISTEN` held the fourth connection, the next claim waited for
+  the pool, and a healthy task stayed queued.
+- **Source:** call: document the real minimum. Admission control for the
+  background paths, to keep a smaller minimum, was rejected as more machinery
+  than one constant.
+- **Decision:**
+  - **The minimum:** the sum of queue limits + 5 per scheduler, one connection
+    each for `LISTEN`, the claim loop (claims and cron materialization),
+    maintenance, the worker registry, and dead-lettering.
+  - **On top of it:** a handler that finishes while its heartbeat transaction
+    is still in flight briefly holds a second connection, and its finishing
+    update waits on that transaction's row lock anyway. Handlers and the host
+    add whatever they take.
+  - **Where:** the README's Sizing workers and Connections notes, and the
+    Connection pool note in `docs/Concurrency.md`. The Deadpool example is
+    16 + 5 = 21.
+  - **Example app:** the worker pool is 14: 5 handler slots + 5 + 4 for
+    `place_order` handlers taking their own connection.
+- **Why:** maintenance and the registry run on their own spawned tasks, each
+  acquiring its own connection, and they can stall alongside dead-lettering.
+  All five users can hold a connection at once, so the minimum counts five.
+- **Expected behaviour:**
+  - With the scheduler's pool at 6 connections (queue limit 1 + 5), five
+    poisoned rows due before a healthy task, and three stalls held outside the
+    pool (the move to `dead` on an advisory lock, maintenance on
+    `queue_outbox`, the registry refresh on `queue_worker_task_names`): all
+    three are seen waiting on their locks before anything else is checked,
+    the healthy task reaches `done` while they hold, exactly one session waits
+    on the advisory lock, and all five rows end `dead` once the locks are
+    released (`worker::stalled_background_work_leaves_room_for_healthy_work`).

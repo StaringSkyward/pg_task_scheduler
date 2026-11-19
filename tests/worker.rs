@@ -1056,21 +1056,27 @@ async fn slow_dead_letter_does_not_delay_a_healthy_claim() {
     db.cleanup().await;
 }
 
-/// Dead-lettering has a fixed one-connection budget: dead-letters stalled in the database
-/// must not fill a pool sized at queue limits + 3 and starve the healthy task's claim.
+/// Maintenance, the registry and dead-lettering each hold a connection of their own: all three
+/// stalled in the database must not fill a pool sized at queue limits + 5 and starve the
+/// healthy task's claim.
 #[tokio::test]
-async fn stalled_dead_letters_leave_room_for_healthy_work() {
+async fn stalled_background_work_leaves_room_for_healthy_work() {
     let db = TestDb::new().await;
-    // The scheduler's own pool, at the stated budget (queue limit 1 + 3); the test reads
+    // The scheduler's own pool, at the stated budget (queue limit 1 + 5); the test reads
     // through `db.pool`, so it never waits behind the scheduler.
-    let pool = db.sized_pool(4);
-    // Every move to `dead` waits on this lock, held outside the pool.
+    let pool = db.sized_pool(6);
+    // Held outside the pool: every move to `dead` waits on the advisory lock, maintenance's
+    // outbox cleanup on `queue_outbox`, and the registry refresh on `queue_worker_task_names`.
     let mut lock = AsyncPgConnection::establish(&common::database_url())
         .await
         .unwrap();
-    lock.batch_execute("SELECT pg_advisory_lock(4949)")
-        .await
-        .unwrap();
+    lock.batch_execute(&format!(
+        "SELECT pg_advisory_lock(4949); BEGIN; \
+         LOCK TABLE \"{s}\".queue_outbox, \"{s}\".queue_worker_task_names IN ACCESS EXCLUSIVE MODE",
+        s = db.schema
+    ))
+    .await
+    .unwrap();
     // Poisoned rows due first, so the claims reach them before the healthy task.
     db.install(
         "CREATE FUNCTION stall_dead() RETURNS trigger AS $$ BEGIN PERFORM pg_advisory_lock(4949); PERFORM pg_advisory_unlock(4949); RETURN NEW; END $$ LANGUAGE plpgsql;
@@ -1087,24 +1093,45 @@ async fn stalled_dead_letters_leave_room_for_healthy_work() {
         .lease_duration(Duration::from_secs(2))
         .heartbeat_interval(ms(150))
         .reaper_interval(ms(200))
+        .registry_interval(ms(200))
         .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
         .unwrap()
         .build()
         .unwrap();
     let run = start(scheduler);
 
+    // Each stall is real before anything is checked: its statement waits on its lock. The
+    // relations resolve in this test's schema through `db.pool`'s search_path.
+    let advisory_waiters = "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 4949 AND NOT granted";
+    for (what, waiters) in [
+        ("dead-lettering", advisory_waiters),
+        (
+            "maintenance",
+            "SELECT count(*) AS n FROM pg_locks WHERE relation = 'queue_outbox'::regclass AND NOT granted",
+        ),
+        (
+            "the registry refresh",
+            "SELECT count(*) AS n FROM pg_locks WHERE relation = 'queue_worker_task_names'::regclass AND NOT granted",
+        ),
+    ] {
+        let started = Instant::now();
+        while db.scalar(waiters).await == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{what} never stalled"
+            );
+            tokio::time::sleep(ms(20)).await;
+        }
+    }
     wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
-    // Before the skipped rows' leases expire (2 s): the reaper's move to `dead` waits too, and would be a second waiter.
-    let waiting = diesel::sql_query(
-        "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 4949 AND NOT granted",
-    )
-    .get_result::<Count>(&mut lock)
-    .await
-    .unwrap()
-    .n;
-    assert_eq!(waiting, 1, "sessions waiting to dead-letter");
+    // The reaper's move to `dead` would be a second waiter, but it is stalled with maintenance.
+    assert_eq!(
+        db.scalar(advisory_waiters).await,
+        1,
+        "sessions waiting to dead-letter"
+    );
 
-    lock.batch_execute("SELECT pg_advisory_unlock(4949)")
+    lock.batch_execute("COMMIT; SELECT pg_advisory_unlock(4949)")
         .await
         .unwrap();
     let started = Instant::now();
@@ -1115,7 +1142,7 @@ async fn stalled_dead_letters_leave_room_for_healthy_work() {
     {
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "poisoned rows not dead after the lock was released"
+            "poisoned rows not dead after the locks were released"
         );
         tokio::time::sleep(ms(20)).await;
     }

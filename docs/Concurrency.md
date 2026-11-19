@@ -335,16 +335,22 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 ## Capacity and Operations
 
 - **Connection pool:** each scheduler permanently holds one connection for
-  `LISTEN`. Claims, heartbeats, finalization, maintenance, and DB-contained
-  handlers take short-lived connections. Each scheduler needs 1 connection for
-  `LISTEN`, plus 1 for claims and maintenance, plus 1 for dead-lettering
+  `LISTEN`. Claims, heartbeats, finalization, maintenance, the worker registry,
+  dead-lettering and DB-contained handlers take short-lived connections.
+  Maintenance, the registry and dead-lettering each run on a task of their own,
+  so a stalled database can hold all three at once. Each scheduler needs a
+  connection for each of `LISTEN`, the claim loop (claims and cron
+  materialization), maintenance, the worker registry, and dead-lettering
   poisoned rows, plus up to the sum of queue limits for heartbeats and
-  finalization, plus one per handler that takes its own. So size
-  `max_size ≥ sum of queue limits + 3` per scheduler sharing the pool, plus
-  whatever handlers take. If DB-contained handlers share an undersized pool,
-  heartbeats wait for connections until local deadlines drop the handlers.
-  Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
-  host), well below the 16 + 3 = 19 that the default queue's limit of 16 needs.
+  finalization. So size `max_size ≥ sum of queue limits + 5` per scheduler
+  sharing the pool. On top of that, a handler that finishes while its
+  heartbeat transaction is still in flight briefly holds a second connection,
+  and its finishing update waits on that transaction's row lock anyway. Add
+  whatever handlers and the host take. If DB-contained handlers share an
+  undersized pool, heartbeats wait for connections until local deadlines drop
+  the handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4
+  on a 2-vCPU host), well below the 16 + 5 = 21 that the default queue's limit
+  of 16 needs.
   At most one dead-letter task runs at a time; rows poisoned while it runs stay
   `running`, and the reaper recovers them after their lease.
 - **Sizing:** the handlers needed across all instances are about arrival rate ×
@@ -406,8 +412,8 @@ Not yet automated:
 - process-kill fault injection at random points around claim, effect,
   completion, and heartbeat;
 - database outages longer than a lease;
-- pool exhaustion (the dead-letter case is covered by
-  `worker::stalled_dead_letters_leave_room_for_healthy_work`);
+- pool exhaustion (stalled maintenance, registry and dead-letter writes are
+  covered by `worker::stalled_background_work_leaves_room_for_healthy_work`);
 - throughput and latency at production scale.
 
 Run these with the host's PostgreSQL version, pool sizing, payload sizes, and
