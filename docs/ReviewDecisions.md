@@ -1,6 +1,6 @@
 # Review Decisions and Expected Behaviour
 
-This records what was decided about each finding of the five
+This records what was decided about each finding of the six
 whole-repository reviews made before the first release, and what each decision
 looks like from outside. The reviews themselves are kept out of the repository,
 so each entry restates its finding.
@@ -16,6 +16,8 @@ so each entry restates its finding.
   them and earlier entries.
 - **Review 05** was run at `6cd99f4`, the head of PR #9. Entries 48–49 follow
   its findings 1–2 in order.
+- **Review 06** was run at `21da0b6`, the head of PR #9. Entries 50–52 follow
+  its findings 1–3 in order.
 
 It describes the code as shipped. Each entry has a source: **(user)** means the
 user decided it; **(call)** means it was a judgement call, open to change.
@@ -24,12 +26,12 @@ affects. Where a later review changed an entry, that entry ends with a
 **Changed by review 02**, **Changed by review 03** or **Changed by review 04**
 line that says what is different now and links to the later entry. An entry
 that entry 47 changed has a **Changed by entry 47** line in the same way. A
-**Changed by entry N** pointer (47, 48 or 49) says what that entry changed; when
+**Changed by entry N** pointer (47, 48, 49 or 50) says what that entry changed; when
 it changes one bullet only, it may sit inside that bullet instead of ending the
 entry.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
-02 (entries 17 and 33) and for entry 47; reviews 03, 04 and 05's findings
+02 (entries 17 and 33) and for entry 47; reviews 03, 04, 05 and 06's findings
 changed none. A database built by an earlier version of this repository must be dropped
 and recreated.
 
@@ -1506,6 +1508,10 @@ and recreated.
 - **Changed by entry 48:** the stored-form check now starts from the caller's
   exact value, because `serde_json` parses floats exactly
   ([entry 48](#48-serde_json-parses-floats-exactly)).
+- **Changed by entry 50:** the check compares decoded `T::Args` values, which
+  now need `PartialEq`, not `Value`s, and the error reads `task arguments change
+  meaning when stored as JSON`
+  ([entry 50](#50-typed-producers-require-arguments-to-decode-back-equal)).
 
 ### 44. A dead letter with an invalid task key can be opened
 
@@ -1837,3 +1843,35 @@ and recreated.
   - The README and `docs/Concurrency.md` size the pool at the sum of queue
     limits + 3 per scheduler: 1 for `LISTEN`, 1 for claims and maintenance,
     and 1 for dead-lettering. The default queue needs 16 + 3 = 19.
+
+## Review 06: findings
+
+### 50. Typed producers require arguments to decode back equal
+
+- **Finding:** (review 06 #1) `serde_json` writes a non-finite `f64` as
+  `null`, so `Some(f64::INFINITY)` with `Args = Option<f64>` was stored, and
+  claimed as `None`. The check compared `Value`s after the loss, and
+  `Serialize + DeserializeOwned` cannot show that encoding preserved the
+  caller's value.
+- **Source:** user (require `PartialEq`, rather than documenting the gap or
+  using a serializer that rejects non-finite floats).
+- **Decision:**
+  - `Task::Args` is `Serialize + DeserializeOwned + PartialEq + Send + 'static`.
+  - `typed_payload` serializes the arguments, decodes the payload as `T::Args`,
+    and returns `PayloadNotPreserved` if the result differs from the caller's
+    value. `enqueue::<T>` and `CreateJob::for_task::<T>` use it.
+  - `check_stored` decodes the payload and the stored JSONB text as `T::Args`
+    and returns `PayloadNotPreserved` if they differ. It no longer compares
+    `Value`s or re-serializes.
+  - The error reads `task arguments change meaning when stored as JSON`.
+- **Why:** comparing decoded values checks what the handler receives, whatever
+  the type. It also accepts a `HashSet` beside a large `f64`, which the `Value`
+  comparison rejected.
+- **Expected behaviour:**
+  - `Some(f64::INFINITY)` and `Some(f64::NAN)` with `Args = Option<f64>` are
+    `PayloadNotPreserved`, and nothing is written
+    (`enqueue::enqueue_rejects_non_finite_floats_inside_an_option`,
+    `jobs::for_task_rejects_non_finite_floats_inside_an_option`).
+  - `Mixed { tags: HashSet<String>, x: 1e18 }` is accepted and claimed equal
+    (`enqueue::enqueue_accepts_a_set_beside_a_large_float`).
+  - The typed-check tests of entry 43 still pass.

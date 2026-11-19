@@ -86,7 +86,7 @@ impl Task for SendEmail {
     type Args = SendEmailArgs;
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
 struct SendEmailArgs {
     user_id: uuid::Uuid,
 }
@@ -114,18 +114,19 @@ a lock wait, `ensure_job`'s recreate-on-delete and claim rely on it, and under
 `REPEATABLE READ` they fail with a `40001` serialization error rather than their
 documented outcome. The materializer enforces it itself.
 
-**Arguments:** `enqueue` checks that the handler will decode the arguments it
-was given, and writes nothing if not. Arguments the worker cannot parse back or
-decode as `T::Args` (nested deeper than 128, or an `f64` NaN, which serializes
-as `null`) are `SchedulerError::Serde`. Arguments that decode as different
-values once PostgreSQL stores them as JSONB are
-`SchedulerError::PayloadNotPreserved`. JSONB normalizes numbers, so an `f64` of
-`1e18` comes back as the integer `1000000000000000000`, which an untagged enum
-may decode as another variant. With `Args = serde_json::Value`, any `f64` of
-magnitude 1e16 or more in the 64-bit integer range, such as
-`json!({"x": 1e18})`, is rejected: `serde_json` writes it in exponent form, and
-the handler would receive an integer. This check costs one extra round trip per
-`enqueue`.
+**Arguments:** `Task::Args` must be `PartialEq`. A typed producer stores
+arguments only if they decode back equal to the caller's value, both from the
+JSON it sends and from what PostgreSQL stores, and writes nothing if not.
+JSON cannot represent every value: `Some(f64::INFINITY)` is written as `null`
+and decodes as `None`, so it is `SchedulerError::PayloadNotPreserved`. So is
+an `f64` of `1e18`, which JSONB normalizes to the integer
+`1000000000000000000`, which an untagged enum may decode as another variant.
+Arguments the worker cannot parse back or decode as `T::Args` at all (nested
+deeper than 128, or a bare `f64` NaN) are `SchedulerError::Serde`. With
+`Args = serde_json::Value`, any `f64` of magnitude 1e16 or more in the 64-bit
+integer range, such as `json!({"x": 1e18})`, is rejected: `serde_json` writes
+it in exponent form, and the handler would receive an integer. This check costs
+one extra round trip per `enqueue`.
 
 **Idempotency horizon:** a `task_key` stays reserved while its row exists, which
 is `Retention::done` after completion for done tasks and `Retention::dead` for

@@ -26,8 +26,12 @@ pub trait Task: Send + Sync + 'static {
     /// Queue this task type is enqueued to unless [`EnqueueOptions::queue`] overrides it.
     /// Workers serve it only if they run that queue.
     const QUEUE: &'static str = "default";
-    /// The task's arguments, stored as JSON.
-    type Args: serde::Serialize + DeserializeOwned + Send + 'static;
+    /// The task's arguments, stored as JSON. `PartialEq` lets producers check that the
+    /// arguments decode back equal to the caller's value, since JSON cannot represent every
+    /// value (serde_json writes a non-finite `f64` as `null`, which an `Option<f64>` decodes as
+    /// `None`); [`enqueue`] and `CreateJob::for_task` reject those with
+    /// [`SchedulerError::PayloadNotPreserved`].
+    type Args: serde::Serialize + DeserializeOwned + PartialEq + Send + 'static;
 }
 
 /// Higher value is claimed first.
@@ -173,16 +177,17 @@ const EXISTING: &str = r#"
 /// caller's data. Re-enqueueing the same `key` with the same task name and payload
 /// returns the existing task; different content is an `IdempotencyConflict`. The queue
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
-/// Arguments that do not serialize to JSON the worker can parse back and decode as
-/// `T::Args` (for example, nested deeper than 128, or an `f64` NaN, which serializes as
-/// `null`) are [`SchedulerError::Serde`], and nothing is written. Arguments that decode as
-/// different values once PostgreSQL stores them as JSONB are
-/// [`SchedulerError::PayloadNotPreserved`], and nothing is written: JSONB normalizes numbers, so
-/// an `f64` of `1e18` reads back as the integer `1000000000000000000`, which an untagged enum
-/// may decode as another variant. With `Args = serde_json::Value` this rejects any `f64` of
-/// magnitude 1e16 or more in the 64-bit integer range, such as `json!({"x": 1e18})`:
-/// `serde_json` writes it in exponent form, and the handler would receive an integer. That
-/// check costs one extra round trip.
+/// `T::Args` must be `PartialEq`: the arguments are stored only if they decode back equal to
+/// the caller's value, both from the JSON sent and from what PostgreSQL stores. JSON cannot
+/// represent every value (`Some(f64::INFINITY)` is written as `null` and decodes as `None`), and
+/// JSONB normalizes numbers (an `f64` of `1e18` reads back as the integer
+/// `1000000000000000000`, which an untagged enum may decode as another variant); both are
+/// [`SchedulerError::PayloadNotPreserved`], and nothing is written. Arguments that do not
+/// serialize to JSON the worker can parse back and decode as `T::Args` at all (nested deeper than
+/// 128, or a bare `f64` NaN, which serializes as `null`) are [`SchedulerError::Serde`]. With
+/// `Args = serde_json::Value` this rejects any `f64` of magnitude 1e16 or more in the 64-bit
+/// integer range, such as `json!({"x": 1e18})`: `serde_json` writes it in exponent form, and
+/// the handler would receive an integer. That check costs one extra round trip.
 /// A key starting with `schedule:` is reserved for the scheduler and returns
 /// [`SchedulerError::ReservedTaskKey`]. If concurrent cleanup keeps deleting the conflicting
 /// task before it can be read, three passes later it returns [`SchedulerError::Contention`].
@@ -200,7 +205,7 @@ pub async fn enqueue<T: Task>(
         Some(q) => q,
         None => QueueName::try_from(T::QUEUE)?,
     };
-    let payload = to_payload(&args)?;
+    let payload = typed_payload(&args)?;
     check_stored::<T::Args>(conn, &payload).await?;
 
     // The incumbent can be deleted (retention cleanup) between the conflicting insert and
@@ -304,6 +309,19 @@ pub(crate) fn to_payload<T: serde::Serialize>(
     Ok(serde_json::from_str(&text)?)
 }
 
+/// [`to_payload`] for a typed producer: the payload is accepted only if it decodes back as
+/// `A` equal to `args`, which catches values JSON cannot represent (a non-finite `f64` is
+/// written as `null`). A payload that does not decode at all is [`SchedulerError::Serde`].
+pub(crate) fn typed_payload<A: serde::Serialize + DeserializeOwned + PartialEq>(
+    args: &A,
+) -> Result<serde_json::Value, SchedulerError> {
+    let payload = to_payload(args)?;
+    if serde_json::from_value::<A>(payload.clone())? != *args {
+        return Err(SchedulerError::PayloadNotPreserved);
+    }
+    Ok(payload)
+}
+
 #[derive(diesel::QueryableByName)]
 struct StoredRow {
     #[diesel(sql_type = sql_types::Text)]
@@ -314,7 +332,7 @@ struct StoredRow {
 /// decode it. JSONB normalizes numbers, so a value can decode differently (`1e18` reads back
 /// as an integer). A decode failure is [`SchedulerError::Serde`]; a different value is
 /// [`SchedulerError::PayloadNotPreserved`].
-pub(crate) async fn check_stored<A: serde::Serialize + DeserializeOwned>(
+pub(crate) async fn check_stored<A: DeserializeOwned + PartialEq>(
     conn: &mut AsyncPgConnection,
     payload: &serde_json::Value,
 ) -> Result<(), SchedulerError> {
@@ -325,15 +343,9 @@ pub(crate) async fn check_stored<A: serde::Serialize + DeserializeOwned>(
         .stored;
     // Decoded as the worker does: the text parsed as a `Value`, then as `A`.
     let stored: serde_json::Value = serde_json::from_str(&text)?;
-    let decoded = serde_json::from_value::<A>(stored.clone())?;
-    // Identical JSON decodes identically, so re-serialize only when JSONB changed a number's
-    // form, since a `HashSet` re-serializes in another order. `Value` equality tells a `u64`
-    // from an `f64`.
-    // `Value` equality treats `-0.0` and `0.0` as equal and JSONB stores `0.0`, so a negative
-    // zero is accepted and the worker decodes `+0.0`.
-    // ponytail: args with both, such as a `HashSet` beside an `f64` of 1e18, are still
-    // rejected; comparing decoded values would need `PartialEq` on `Task::Args`.
-    if stored != *payload && serde_json::to_value(&decoded)? != *payload {
+    let decoded = serde_json::from_value::<A>(stored)?;
+    // JSONB stores `-0.0` as `0.0`, and `-0.0 == 0.0`, so a negative zero is accepted.
+    if decoded != serde_json::from_value::<A>(payload.clone())? {
         return Err(SchedulerError::PayloadNotPreserved);
     }
     Ok(())

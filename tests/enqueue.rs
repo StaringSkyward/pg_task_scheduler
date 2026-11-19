@@ -350,7 +350,7 @@ async fn enqueue_rejects_a_payload_the_worker_cannot_parse() {
 /// NaN serializes as `null`, which an `f64` cannot decode: the worker would dead-letter it.
 #[tokio::test]
 async fn enqueue_rejects_args_that_do_not_round_trip() {
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
     struct Reading {
         value: f64,
     }
@@ -665,5 +665,71 @@ async fn enqueue_survives_cleanup_deleting_the_incumbent() {
         .await,
         1
     );
+    db.cleanup().await;
+}
+
+/// serde_json writes a non-finite `f64` as `null`, which decodes as `None`.
+#[tokio::test]
+async fn enqueue_rejects_non_finite_floats_inside_an_option() {
+    struct Reading;
+    impl Task for Reading {
+        const NAME: &'static str = "reading";
+        type Args = Option<f64>;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    for (k, v) in [("inf", f64::INFINITY), ("nan", f64::NAN)] {
+        let r = enqueue::<Reading>(&mut conn, key(k), Some(v), EnqueueOptions::default()).await;
+        assert!(
+            matches!(r, Err(SchedulerError::PayloadNotPreserved)),
+            "{r:?}"
+        );
+    }
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 0);
+    db.cleanup().await;
+}
+
+/// A `HashSet` re-serializes in another order and `1e18` changes form in JSONB; comparing
+/// decoded values accepts both together.
+#[tokio::test]
+async fn enqueue_accepts_a_set_beside_a_large_float() {
+    use std::collections::HashSet;
+    use std::num::NonZeroU32;
+
+    use pg_task_scheduler::TaskName;
+    use pg_task_scheduler::WorkerId;
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Mixed {
+        tags: HashSet<String>,
+        x: f64,
+    }
+    struct MixedTask;
+    impl Task for MixedTask {
+        const NAME: &'static str = "mixed";
+        type Args = Mixed;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let make = || Mixed {
+        tags: ["a", "b", "c"].map(String::from).into(),
+        x: 1e18,
+    };
+    enqueue::<MixedTask>(&mut conn, key("mixed"), make(), EnqueueOptions::default())
+        .await
+        .unwrap();
+    let claimed = store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &QueueName::default(),
+        &[TaskName::try_from("mixed").unwrap()],
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap()
+    .ready;
+    let got: Mixed = serde_json::from_value(claimed[0].payload.clone()).unwrap();
+    assert_eq!(got, make());
     db.cleanup().await;
 }

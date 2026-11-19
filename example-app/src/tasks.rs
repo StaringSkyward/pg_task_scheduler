@@ -27,7 +27,7 @@ use crate::Pool;
 
 pub struct SendEmail;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct EmailArgs {
     pub to: String,
     pub subject: String,
@@ -40,7 +40,7 @@ impl Task for SendEmail {
 
 pub struct BulkImport;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct BulkImportArgs {
     pub rows: u32,
 }
@@ -55,7 +55,7 @@ impl Task for BulkImport {
 /// leaves one dead.
 pub struct FlakyDemo;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct FlakyArgs {}
 
 impl Task for FlakyDemo {
@@ -65,7 +65,7 @@ impl Task for FlakyDemo {
 
 pub struct Digest;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct DigestArgs {}
 
 impl Task for Digest {
@@ -75,7 +75,7 @@ impl Task for Digest {
 
 pub struct PlaceOrder;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct OrderArgs {
     pub amount_cents: i32,
 }

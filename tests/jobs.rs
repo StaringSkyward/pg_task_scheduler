@@ -464,7 +464,7 @@ fn create_job_rejects_a_payload_the_worker_cannot_parse() {
 
 #[test]
 fn for_task_rejects_args_that_do_not_round_trip() {
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
     struct Reading {
         value: f64,
     }
@@ -485,7 +485,7 @@ fn for_task_rejects_args_that_do_not_round_trip() {
 
 #[tokio::test]
 async fn for_task_rejects_args_whose_meaning_changes_in_jsonb() {
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
     #[serde(untagged)]
     enum Amount {
         Count(u64),
@@ -523,4 +523,24 @@ async fn for_task_rejects_args_whose_meaning_changes_in_jsonb() {
         0
     );
     db.cleanup().await;
+}
+
+#[test]
+fn for_task_rejects_non_finite_floats_inside_an_option() {
+    struct Reading;
+    impl Task for Reading {
+        const NAME: &'static str = "reading";
+        type Args = Option<f64>;
+    }
+    let r = CreateJob::for_task::<Reading>(
+        ScheduleName::try_from("inf").unwrap(),
+        CronExpression::parse("* * * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        Some(f64::INFINITY),
+    );
+    assert!(
+        matches!(r, Err(SchedulerError::PayloadNotPreserved)),
+        "{r:?}"
+    );
 }

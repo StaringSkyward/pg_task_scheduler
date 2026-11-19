@@ -60,7 +60,7 @@ type StoredCheck = for<'a> fn(
     &'a serde_json::Value,
 ) -> BoxFuture<'a, Result<(), SchedulerError>>;
 
-fn stored_check<'a, A: serde::Serialize + DeserializeOwned + 'static>(
+fn stored_check<'a, A: DeserializeOwned + PartialEq + 'static>(
     conn: &'a mut AsyncPgConnection,
     payload: &'a serde_json::Value,
 ) -> BoxFuture<'a, Result<(), SchedulerError>> {
@@ -72,7 +72,9 @@ impl CreateJob {
     /// `T::QUEUE`. The preferred constructor: the task name, queue and argument type
     /// all come from `T`. Fails if `T::NAME` or `T::QUEUE` is not a valid identifier,
     /// or `args` does not serialize to JSON the worker can parse back and decode as
-    /// `T::Args`. [`create`] and [`ensure_job`] also return
+    /// `T::Args` equal to `args` ([`SchedulerError::Serde`] if it does not decode,
+    /// [`SchedulerError::PayloadNotPreserved`] if it decodes as another value, such as
+    /// `Some(f64::INFINITY)`, which JSON writes as `null`). [`create`] and [`ensure_job`] also return
     /// [`SchedulerError::PayloadNotPreserved`], writing nothing, if `args` decode as different
     /// values once stored as JSONB, as `enqueue` does.
     pub fn for_task<T: Task>(
@@ -82,9 +84,7 @@ impl CreateJob {
         lifecycle: JobLifecycle,
         args: T::Args,
     ) -> Result<Self, SchedulerError> {
-        let payload = crate::queue::to_payload(&args)?;
-        // Fails here on what never decodes (an `f64` NaN serializes as `null`).
-        serde_json::from_value::<T::Args>(payload.clone())?;
+        let payload = crate::queue::typed_payload(&args)?;
         Ok(CreateJob {
             name,
             task_name: TaskName::try_from(T::NAME)?,
