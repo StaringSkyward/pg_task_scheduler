@@ -64,13 +64,13 @@ CREATE TABLE queue_tasks (
         CONSTRAINT queue_tasks_locked_by_identifier CHECK (queue_is_identifier(locked_by)),
     lock_token BIGINT NOT NULL DEFAULT 0
         CHECK (lock_token >= 0),
-    locked_until TIMESTAMPTZ,
+    locked_until TIMESTAMPTZ CHECK (isfinite(locked_until)),
 
     last_error TEXT,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ CHECK (isfinite(completed_at)),
 
     -- The admin action (queue_admin_actions) that last replayed or cancelled this task. No FK:
     -- the audit outlives task retention.

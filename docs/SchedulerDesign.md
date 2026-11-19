@@ -232,11 +232,13 @@ is an approved exception:
 | `scheduler_jobs` keeps the `next_run_at` cursor in the row with the definition (`name`, `task_name`, `cron_expression`, `job_args`, `max_attempts`, `queue`) | The cursor is computed from the row's own cron expression, by the materializer and by `jobs::reschedule`, under one row lock that orders it against `ensure_job`, pause and delete. `scheduler_jobs_due_idx (next_run_at)` then finds a due schedule and its definition with one index scan and no join. |
 | The worker registry keeps its observed values in its rows: `queue_workers.label`, `last_error`, `status`, `last_seen_at` and `lost_after`; `queue_worker_queues.in_use` and `last_finished_at` | They are display-only observations. Their one writer, the worker, rewrites them together in one transaction at every registry write, and nothing reads them for correctness. `in_use` also has a CHECK against `slot_limit` in the same row. |
 
-Two CHECKs keep timestamps finite: `CHECK (isfinite(due_at))` on `queue_tasks`
-and `CHECK (isfinite(next_run_at))` on `scheduler_jobs`. PostgreSQL accepts
-`infinity` and `-infinity`, which chrono cannot represent. With the CHECKs,
-every row the claim or the materializer reads is due, so it is finite and at
-most `now()`, and always within chrono's range.
+Four CHECKs keep timestamps finite: `isfinite(due_at)`, `isfinite(locked_until)`
+and `isfinite(completed_at)` on `queue_tasks`, and `isfinite(next_run_at)` on
+`scheduler_jobs`. PostgreSQL accepts `infinity` and `-infinity`, which chrono
+cannot represent. With the CHECKs, every row the claim or the materializer
+reads is due, so it is finite and at most `now()`, and always within chrono's
+range, and the browse pages' `±infinity` first-page bounds never meet a stored
+infinity.
 
 ## Design Choices
 
@@ -288,7 +290,7 @@ transaction (nested transactions become savepoints).
 
 | Operation | Function | Notes |
 | --- | --- | --- |
-| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison of the canonical JSONB text (key order and whitespace do not matter, numeric scale does: `1` and `1.0` conflict). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. If that row is gone (cleanup deleted it in between), the insert runs again, for at most 3 passes, then `SchedulerError::Contention`. A key starting with `schedule:` is `SchedulerError::ReservedTaskKey`, and `args` whose JSON text the claim's parser rejects (nesting deeper than 128, for example) are `SchedulerError::Serde`, both before any SQL. Before the insert, `SELECT $1::jsonb::text` returns the payload as PostgreSQL will store it, and that text is decoded as `T::Args`, as the worker decodes it: a decode failure (a bare `f64` NaN, stored as `null`) is `Serde`, and a value that differs from the arguments (`T::Args: PartialEq`; `Some(f64::INFINITY)` is written as `null` and decodes as `None`, and JSONB normalizes numbers, so `1e18` comes back as an integer) is `SchedulerError::PayloadNotPreserved`. Nothing is written either way. |
+| Enqueue | `queue::enqueue::<T>(conn, key, args, opts)` | `INSERT … ON CONFLICT (task_key) DO NOTHING`, then a SELECT of the existing row with an SQL-side `task_name`/`payload` comparison of the canonical JSONB text (key order and whitespace do not matter, numeric scale does: `1` and `1.0` conflict). `queue` is not compared, like priority. A mismatch returns `SchedulerError::IdempotencyConflict`. If that row is gone (cleanup deleted it in between), the insert runs again, for at most 3 passes, then `SchedulerError::Contention`. A key starting with `schedule:` is `SchedulerError::ReservedTaskKey`, and `args` whose JSON text the claim's parser rejects (nesting deeper than 128, for example) are `SchedulerError::Serde`, both before any SQL. Before the insert, `SELECT $1::jsonb::text` returns the payload as PostgreSQL will store it, and that text is decoded as `T::Args`, as the worker decodes it: a decode failure (a bare `f64` NaN, stored as `null`) is `Serde`, and a value that differs from the arguments (`T::Args: PartialEq`; JSONB normalizes numbers, so `1e18` comes back as an integer) is `SchedulerError::PayloadNotPreserved`. Before that, `queue::typed_payload` decodes the JSON the producer sends and rejects a value that differs the same way, so `Some(f64::INFINITY)` (written as `null`, decoded as `None`) is `PayloadNotPreserved` before any SQL. Nothing is written either way. |
 | Claim | `store::claim(conn, worker, queue, names, limit, lease)` | One writable CTE: `SKIP LOCKED` candidates → `running`, `attempts + 1`, `lock_token + 1`, `locked_until = clock_timestamp() + lease` → attempt rows inserted → rows returned, `payload` as text. Each row is then converted on its own, and the call returns a `ClaimBatch`: `ready` holds the typed claims, and `poisoned` each row whose attempt number, `task_key`, payload or `max_attempts` fails, still leased and untouched. `claim` runs no dead-letter statement. Returns nothing while the queue has a `queue_pauses` row. |
 | Dead-letter | `store::dead_letter(conn, &poisoned)` | Fails a `PoisonedClaim` permanently by its ownership key, through the same lock-then-check path as permanent failure, with its reason (for example `invalid payload: …`) as the error. `LostOwnership` once the lease has expired or moved on. The worker calls it on a task of its own after dispatching the batch's ready rows, one such task at a time per scheduler (rows claimed while it runs are left to the reaper); a row it misses stays `running` until the reaper requeues it, and a later claim poisons it again until its attempts run out. |
 | Heartbeat | `store::heartbeat(conn, lease, duration)` | In one transaction, locks the row, then extends `locked_until` from `clock_timestamp()`. |
@@ -515,13 +517,13 @@ recovers it after the lease expires.
 ## Rust Boundaries
 
 - `Task` ties a stable name, a default queue and one
-  `Serialize + DeserializeOwned` payload type together. `enqueue::<T>`,
+  `Serialize + DeserializeOwned + PartialEq` payload type together. `enqueue::<T>`,
   `register_task::<T>` and `CreateJob::for_task::<T>` all use it. `enqueue`
   and `CreateJob` parse the JSON text of the arguments back with the claim's
   parser, so they reject a payload the worker could not parse. The typed
   `enqueue::<T>`, and `jobs::create` and `jobs::ensure_job` for a
-  `CreateJob::for_task::<T>` spec, also decode the payload as PostgreSQL stores
-  it as `T::Args`, and reject arguments that come back as different values
+  `CreateJob::for_task::<T>` spec, first decode the JSON they send as `T::Args` (`queue::typed_payload`), then
+  decode the payload as PostgreSQL stores it as `T::Args`, and reject arguments that come back as different values
   (`PayloadNotPreserved`). `store::task` returns the payload as a
   `TaskPayload`: `Json`, or `Unreadable { text, error }` for a stored value that
   does not parse (one written by direct SQL), and the key as a `StoredTaskKey`:

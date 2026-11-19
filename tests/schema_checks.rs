@@ -94,6 +94,34 @@ async fn infinite_due_at_is_rejected() {
     db.cleanup().await;
 }
 
+#[tokio::test]
+async fn infinite_completed_at_is_rejected() {
+    let db = TestDb::new().await;
+    let e = exec(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         VALUES ('k', 'n', 'done', 'infinity')",
+    )
+    .await
+    .unwrap_err();
+    assert!(is_check_violation(&e), "{e:?}");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn infinite_locked_until_is_rejected() {
+    let db = TestDb::new().await;
+    let e = exec(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, locked_by, locked_until) \
+         VALUES ('k', 'n', 'running', 'w', '-infinity')",
+    )
+    .await
+    .unwrap_err();
+    assert!(is_check_violation(&e), "{e:?}");
+    db.cleanup().await;
+}
+
 #[cfg(feature = "cron")]
 #[tokio::test]
 async fn infinite_next_run_at_is_rejected() {

@@ -31,7 +31,8 @@ changed; when it changes one bullet only, it may sit inside that bullet instead
 of ending the entry.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
-02 (entries 17 and 33) and for entry 47; reviews 03, 04, 05 and 06's findings
+02 (entries 17 and 33), for entry 47 and in review 06 (entry 52's `isfinite`
+CHECKs on `completed_at` and `locked_until`); reviews 03, 04 and 05's findings
 changed none. A database built by an earlier version of this repository must be dropped
 and recreated.
 
@@ -1954,7 +1955,13 @@ and recreated.
     `RUNNING`, `QUEUED_DUE` and `QUEUED_FUTURE`.
   - **Removed:** `earliest()` and `latest()`, with their `unwrap`s.
   - **Kept:** the id and priority stand-ins (`0`, `i64::MAX`, `i32::MAX + 1`)
-    are bounds of their columns' own types.
+    are in-domain bounds: `i64::MAX` is the top of `bigint`, `0` is below every
+    identity id (they start at 1) and `i32::MAX + 1` is above every `integer`.
+  - **CHECKs:** migration 0001 adds `CHECK (isfinite(completed_at))` and
+    `CHECK (isfinite(locked_until))`, as `due_at` already has. A stored
+    infinity would sort onto the first page, where chrono cannot decode it, so
+    the CHECKs keep the `±infinity` bounds from ever meeting one. NULL passes
+    them, and every writer sets finite values.
   - **Ruling:** one query per page is enough. The `COALESCE` bound is part of
     the index condition in both custom and generic plans, so the fallback of
     two query variants per page was not needed.
@@ -1976,4 +1983,10 @@ and recreated.
     (`performance::failed_page_generic_plan_uses_failed_index`,
     `performance::failed_page_by_name_generic_plan_uses_failed_name_index`).
   - For ordinary data, first pages and continuations return the same rows as
-    before: the other `browse::` tests pass unchanged.
+    before (`browse::queued_page_matches_claim_order_across_segments`,
+    `browse::running_page_orders_by_lease_expiry`,
+    `browse::done_and_failed_pages_newest_first_with_filters`,
+    `browse::done_and_failed_pages_break_completed_at_ties_by_id`).
+  - A row with an infinite `completed_at` or `locked_until` cannot be stored
+    (`schema_checks::infinite_completed_at_is_rejected`,
+    `schema_checks::infinite_locked_until_is_rejected`).

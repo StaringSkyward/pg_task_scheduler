@@ -247,12 +247,6 @@ pub const FAILED_BY_NAME: &str = select!(
     "t.completed_at DESC, t.id DESC"
 );
 
-// No cursor: a page binds NULL for its timestamp, which the SQL reads as `-infinity` or
-// `infinity`, the type's own bounds. The id and priority stand-ins are likewise the bounds of
-// their columns' types: `i64::MAX` for `bigint`, `i32::MAX + 1` above every `integer`, and `0`
-// below every identity id. Every keyset predicate stays a plain index bound; a page's own
-// cursor comes from its last row's state.
-
 /// The `limit + 1` rows fetched so the page can tell whether more follow. Cannot overflow.
 fn lookahead(limit: NonZeroU32) -> i64 {
     i64::from(limit.get()) + 1
@@ -296,6 +290,10 @@ pub async fn queued_page(
     let mut due_len = 0;
     if after.is_none_or(|c| c.due) {
         // No cursor: priority "above everything" makes the second branch the whole segment.
+        // A page binds NULL for its timestamp, which the SQL reads as `-infinity` or `infinity`,
+        // the type's own bounds. The id and priority stand-ins are in-domain bounds: `i64::MAX`
+        // for `bigint`, `i32::MAX + 1` above every `integer` and `0` below every identity id
+        // (they start at 1). Every keyset predicate stays a plain index bound.
         let (p, d, i) = after.map_or((i64::from(i32::MAX) + 1, None, 0), |c| {
             (i64::from(c.priority), Some(c.due_at), c.id)
         });

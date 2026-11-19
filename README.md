@@ -21,7 +21,8 @@ workers and the admin UI.
 - **Idempotent enqueue:** each producer-supplied `task_key` maps to exactly one
   logical task while its row is kept (30 days by default). A retried enqueue returns the
   existing task. The same key with different content is rejected as an
-  idempotency conflict.
+  idempotency conflict. Typed producers reject arguments that JSON cannot
+  preserve: they must decode back equal.
 - **Atomic enqueue with domain state:** enqueue on the caller's connection, and
   the task commits or rolls back with the caller's own writes.
 - **One valid owner per attempt:** ownership is the task id, `locked_by`, a
