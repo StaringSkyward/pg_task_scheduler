@@ -514,6 +514,55 @@ async fn accepted_args_decode_equal_after_storage() {
     db.cleanup().await;
 }
 
+/// serde_json's default parser reads `0.10000000000000005` as `0.10000000000000003`, one ULP off,
+/// so the claimed argument would differ from the enqueued one and idempotency would treat the
+/// adjacent value as equal.
+#[tokio::test]
+async fn enqueue_preserves_f64_bits_and_rejects_the_adjacent_value() {
+    use std::num::NonZeroU32;
+
+    use pg_task_scheduler::TaskName;
+    use pg_task_scheduler::WorkerId;
+
+    struct Level;
+    impl Task for Level {
+        const NAME: &'static str = "level";
+        type Args = f64;
+    }
+    let a = f64::from_bits(0x3fb9_9999_9999_999d);
+    let b = f64::from_bits(0x3fb9_9999_9999_999c);
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    enqueue::<Level>(&mut conn, key("float"), a, EnqueueOptions::default())
+        .await
+        .unwrap();
+    let claimed = store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &QueueName::default(),
+        &[TaskName::try_from("level").unwrap()],
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap()
+    .ready;
+    assert_eq!(
+        serde_json::from_value::<f64>(claimed[0].payload.clone())
+            .unwrap()
+            .to_bits(),
+        a.to_bits()
+    );
+    let err = enqueue::<Level>(&mut conn, key("float"), b, EnqueueOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SchedulerError::IdempotencyConflict(_)),
+        "{err:?}"
+    );
+    db.cleanup().await;
+}
+
 /// A fresh `HashSet` serializes in another order, so the check must not re-serialize JSON that
 /// JSONB left unchanged.
 #[tokio::test]

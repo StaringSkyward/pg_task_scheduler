@@ -1498,6 +1498,9 @@ and recreated.
   - `enqueue` of an `f64` NaN is still `Serde`, now because the stored `null`
     does not decode.
   - `SchedulerError` has a new variant.
+- **Changed by entry 48:** the stored-form check now starts from the caller's
+  exact value, because `serde_json` parses floats exactly
+  ([entry 48](#48-serde_json-parses-floats-exactly)).
 
 ### 44. A dead letter with an invalid task key can be opened
 
@@ -1755,3 +1758,26 @@ and recreated.
   - A database built before this change lacks the function and the CHECKs and
     must be dropped and recreated, as must the example's
     (`docker compose down -v`). No Rust API changed.
+
+### 48. serde_json parses floats exactly
+
+- **Finding:** (review 05 #1) `serde_json`'s default parser can read a finite
+  `f64` back one ULP off: `0.10000000000000005` (bits `0x3fb999999999999d`)
+  parses as `0x3fb999999999999c`. A typed enqueue then stored and claimed a
+  different number than the caller passed, and idempotency treated adjacent
+  values as equal.
+- **Source:** call (the reviewer's fix).
+- **Decision:** enable the `float_roundtrip` feature of `serde_json`, and no
+  code change.
+- **Why not `serde_json::to_value` in `to_payload`:** claim
+  (`src/store/claim.rs:161`) and `check_stored` parse with the same parser.
+  Changing only `to_payload` would make `check_stored` reject exactly stored
+  values with `PayloadNotPreserved`, and claim would still misread them.
+- **Cost:** float parsing is about 2x slower. Cargo features unify, so the
+  feature applies to every crate in a dependent's build that uses
+  `serde_json`.
+- **Expected behaviour:**
+  - An `f64` enqueued as `0.10000000000000005` is claimed with the same bits,
+    and enqueueing the adjacent value under the same key is an
+    `IdempotencyConflict`
+    (`enqueue::enqueue_preserves_f64_bits_and_rejects_the_adjacent_value`).
