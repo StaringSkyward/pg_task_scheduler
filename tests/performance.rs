@@ -225,64 +225,73 @@ async fn seqscan_off_conn(
 #[tokio::test]
 async fn queued_page_uses_claim_and_due_indexes() {
     use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
     use diesel::sql_types::Text;
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let now = chrono::Utc::now();
-    let due = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_DUE))
-        .bind::<Text, _>("default")
-        .bind::<BigInt, _>(5_i64)
-        .bind::<Timestamptz, _>(now)
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(due, "queue_tasks_claim_idx");
-    let future = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_FUTURE))
-        .bind::<Text, _>("default")
-        .bind::<Timestamptz, _>(now)
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(future, "queue_tasks_due_idx");
+    // A first page (NULL) and a continuation.
+    for after in [None, Some(chrono::Utc::now())] {
+        let due = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_DUE))
+            .bind::<Text, _>("default")
+            .bind::<BigInt, _>(5_i64)
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(due, "queue_tasks_claim_idx");
+        let future = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_FUTURE))
+            .bind::<Text, _>("default")
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(future, "queue_tasks_due_idx");
+    }
     db.cleanup().await;
 }
 
 #[tokio::test]
 async fn running_page_uses_lease_index() {
     use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::RUNNING))
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_expired_lease_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::RUNNING))
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_expired_lease_idx");
+    }
     db.cleanup().await;
 }
 
 #[tokio::test]
 async fn done_page_uses_terminal_index() {
     use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::DONE))
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_terminal_cleanup_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::DONE))
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_terminal_cleanup_idx");
+    }
     db.cleanup().await;
 }
 
@@ -294,16 +303,18 @@ async fn failed_page_uses_failed_index() {
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED))
-        .bind::<Text, _>("dead")
-        .bind::<Nullable<Text>, _>(Some("boom"))
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_failed_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED))
+            .bind::<Text, _>("dead")
+            .bind::<Nullable<Text>, _>(Some("boom"))
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_failed_idx");
+    }
     db.cleanup().await;
 }
 
@@ -326,17 +337,19 @@ async fn failed_page_by_name_uses_failed_name_index() {
         .unwrap();
     drop(setup);
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED_BY_NAME))
-        .bind::<Text, _>("dead")
-        .bind::<Nullable<Text>, _>(None::<&str>)
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .bind::<Text, _>("email")
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_failed_name_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED_BY_NAME))
+            .bind::<Text, _>("dead")
+            .bind::<Nullable<Text>, _>(None::<&str>)
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .bind::<Text, _>("email")
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_failed_name_idx");
+    }
     db.cleanup().await;
 }
 
@@ -584,10 +597,14 @@ async fn count_replayable_uses_failed_name_index() {
 #[tokio::test]
 async fn failed_page_generic_plan_uses_failed_index() {
     let db = production_shaped_db().await;
-    // $1 status, $2 last_error, $3 completed_at, $4 id, $5 limit.
-    let args = "'dead', NULL, '9999-12-31', 0, 51";
-    let plans = custom_and_generic_plans(&db, store::FAILED, args).await;
-    assert_index_no_seq_scan(plans, "queue_tasks_failed_idx");
+    // $1 status, $2 last_error, $3 completed_at, $4 id, $5 limit: a first page, a continuation.
+    for args in [
+        "'dead', NULL, NULL, 0, 51",
+        "'dead', NULL, now() - interval '500 seconds', 500, 51",
+    ] {
+        let plans = custom_and_generic_plans(&db, store::FAILED, args).await;
+        assert_index_no_seq_scan(plans, "queue_tasks_failed_idx");
+    }
     db.cleanup().await;
 }
 
@@ -595,9 +612,13 @@ async fn failed_page_generic_plan_uses_failed_index() {
 async fn failed_page_by_name_generic_plan_uses_failed_name_index() {
     let db = production_shaped_db().await;
     // As FAILED, plus $6 task_name.
-    let args = "'dead', NULL, '9999-12-31', 0, 51, 'name1'";
-    let plans = custom_and_generic_plans(&db, store::FAILED_BY_NAME, args).await;
-    assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    for args in [
+        "'dead', NULL, NULL, 0, 51, 'name1'",
+        "'dead', NULL, now() - interval '500 seconds', 500, 51, 'name1'",
+    ] {
+        let plans = custom_and_generic_plans(&db, store::FAILED_BY_NAME, args).await;
+        assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    }
     db.cleanup().await;
 }
 

@@ -4,7 +4,6 @@
 use std::num::NonZeroU32;
 
 use chrono::DateTime;
-use chrono::TimeZone;
 use chrono::Utc;
 use diesel::sql_types;
 use diesel_async::AsyncPgConnection;
@@ -184,11 +183,12 @@ macro_rules! select {
 
 // Due segment, exactly the claim order. A mixed-direction keyset needs the expanded predicate;
 // each branch is its own ordered index scan (equal priority, then lower priority), so neither
-// reads past `limit` rows. Binds: $1 queue, $2 priority, $3 due_at, $4 id, $5 limit.
+// reads past `limit` rows. Binds: $1 queue, $2 priority, $3 due_at (NULL = first page),
+// $4 id, $5 limit.
 #[doc(hidden)]
 pub const QUEUED_DUE: &str = select!(
     "((SELECT * FROM queue_tasks WHERE status = 'queued' AND queue = $1 AND due_at <= now() \
-        AND priority = $2 AND (due_at, id) > ($3, $4) \
+        AND priority = $2 AND (due_at, id) > (COALESCE($3, '-infinity'::timestamptz), $4) \
         ORDER BY priority DESC, due_at, id LIMIT $5) \
       UNION ALL \
       (SELECT * FROM queue_tasks WHERE status = 'queued' AND queue = $1 AND due_at <= now() \
@@ -197,38 +197,43 @@ pub const QUEUED_DUE: &str = select!(
     "t.priority DESC, t.due_at, t.id"
 );
 
-// Not-yet-due segment. Binds: $1 queue, $2 due_at, $3 id, $4 limit.
+// Not-yet-due segment. Binds: $1 queue, $2 due_at (NULL = first page), $3 id, $4 limit.
 #[doc(hidden)]
 pub const QUEUED_FUTURE: &str = select!(
     "(SELECT * FROM queue_tasks WHERE status = 'queued' AND queue = $1 AND due_at > now() \
-      AND (due_at, id) > ($2, $3) ORDER BY due_at, id LIMIT $4)",
+      AND (due_at, id) > (COALESCE($2, '-infinity'::timestamptz), $3) \
+      ORDER BY due_at, id LIMIT $4)",
     "t.due_at, t.id"
 );
 
-// Binds: $1 locked_until, $2 id, $3 limit.
+// Binds: $1 locked_until (NULL = first page), $2 id, $3 limit.
 #[doc(hidden)]
 pub const RUNNING: &str = select!(
-    "(SELECT * FROM queue_tasks WHERE status = 'running' AND (locked_until, id) > ($1, $2) \
+    "(SELECT * FROM queue_tasks WHERE status = 'running' \
+      AND (locked_until, id) > (COALESCE($1, '-infinity'::timestamptz), $2) \
       ORDER BY locked_until, id LIMIT $3)",
     "t.locked_until, t.id"
 );
 
-// Binds: $1 completed_at, $2 id, $3 limit.
+// Binds: $1 completed_at (NULL = first page), $2 id, $3 limit.
 #[doc(hidden)]
 pub const DONE: &str = select!(
-    "(SELECT * FROM queue_tasks WHERE status = 'done' AND (completed_at, id) < ($1, $2) \
+    "(SELECT * FROM queue_tasks WHERE status = 'done' \
+      AND (completed_at, id) < (COALESCE($1, 'infinity'::timestamptz), $2) \
       ORDER BY completed_at DESC, id DESC LIMIT $3)",
     "t.completed_at DESC, t.id DESC"
 );
 
-// Binds: $1 status, $2 last_error (NULL = any), $3 completed_at, $4 id, $5 limit. The literal
-// `status IN (...)` lets a generic plan (where `$1` is unknown) still prove the partial index's
-// predicate; without it, a repeated prepared statement can fall back to a seq scan.
+// Binds: $1 status, $2 last_error (NULL = any), $3 completed_at (NULL = first page), $4 id,
+// $5 limit. The literal `status IN (...)` lets a generic plan (where `$1` is unknown) still
+// prove the partial index's predicate; without it, a repeated prepared statement can fall back
+// to a seq scan.
 #[doc(hidden)]
 pub const FAILED: &str = select!(
     "(SELECT * FROM queue_tasks WHERE status = $1 AND status IN ('dead', 'cancelled') \
       AND ($2::text IS NULL OR last_error = $2) \
-      AND (completed_at, id) < ($3, $4) ORDER BY completed_at DESC, id DESC LIMIT $5)",
+      AND (completed_at, id) < (COALESCE($3, 'infinity'::timestamptz), $4) \
+      ORDER BY completed_at DESC, id DESC LIMIT $5)",
     "t.completed_at DESC, t.id DESC"
 );
 
@@ -237,18 +242,16 @@ pub const FAILED: &str = select!(
 pub const FAILED_BY_NAME: &str = select!(
     "(SELECT * FROM queue_tasks WHERE task_name = $6 AND status = $1 \
       AND status IN ('dead', 'cancelled') AND ($2::text IS NULL OR last_error = $2) \
-      AND (completed_at, id) < ($3, $4) ORDER BY completed_at DESC, id DESC LIMIT $5)",
+      AND (completed_at, id) < (COALESCE($3, 'infinity'::timestamptz), $4) \
+      ORDER BY completed_at DESC, id DESC LIMIT $5)",
     "t.completed_at DESC, t.id DESC"
 );
 
-/// Stand-ins for "no cursor" that keep every keyset predicate a plain index bound. Only the
-/// no-cursor bounds: a page's own cursor comes from its last row's state.
-fn earliest() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).unwrap()
-}
-fn latest() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0).unwrap()
-}
+// No cursor: a page binds NULL for its timestamp, which the SQL reads as `-infinity` or
+// `infinity`, the type's own bounds. The id and priority stand-ins are likewise the bounds of
+// their columns' types: `i64::MAX` for `bigint`, `i32::MAX + 1` above every `integer`, and `0`
+// below every identity id. Every keyset predicate stays a plain index bound; a page's own
+// cursor comes from its last row's state.
 
 /// The `limit + 1` rows fetched so the page can tell whether more follow. Cannot overflow.
 fn lookahead(limit: NonZeroU32) -> i64 {
@@ -293,14 +296,14 @@ pub async fn queued_page(
     let mut due_len = 0;
     if after.is_none_or(|c| c.due) {
         // No cursor: priority "above everything" makes the second branch the whole segment.
-        let (p, d, i) = after.map_or((i64::from(i32::MAX) + 1, earliest(), 0), |c| {
-            (i64::from(c.priority), c.due_at, c.id)
+        let (p, d, i) = after.map_or((i64::from(i32::MAX) + 1, None, 0), |c| {
+            (i64::from(c.priority), Some(c.due_at), c.id)
         });
         items = rows(
             diesel::sql_query(QUEUED_DUE)
                 .bind::<sql_types::Text, _>(queue)
                 .bind::<sql_types::BigInt, _>(p)
-                .bind::<sql_types::Timestamptz, _>(d)
+                .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(d)
                 .bind::<sql_types::BigInt, _>(i)
                 .bind::<sql_types::BigInt, _>(want)
                 .get_results::<Row>(conn)
@@ -311,11 +314,11 @@ pub async fn queued_page(
     if rows_len(&items)? < want {
         let (d, i) = after
             .filter(|c| !c.due)
-            .map_or((earliest(), 0), |c| (c.due_at, c.id));
+            .map_or((None, 0), |c| (Some(c.due_at), c.id));
         items.extend(rows(
             diesel::sql_query(QUEUED_FUTURE)
                 .bind::<sql_types::Text, _>(queue)
-                .bind::<sql_types::Timestamptz, _>(d)
+                .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(d)
                 .bind::<sql_types::BigInt, _>(i)
                 .bind::<sql_types::BigInt, _>(want - rows_len(&items)?)
                 .get_results::<Row>(conn)
@@ -345,10 +348,10 @@ pub async fn running_page(
     after: Option<&RunningCursor>,
     limit: NonZeroU32,
 ) -> Result<Page<TaskRow, RunningCursor>, SchedulerError> {
-    let (u, i) = after.map_or((earliest(), 0), |c| (c.locked_until, c.id));
+    let (u, i) = after.map_or((None, 0), |c| (Some(c.locked_until), c.id));
     let items = rows(
         diesel::sql_query(RUNNING)
-            .bind::<sql_types::Timestamptz, _>(u)
+            .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(u)
             .bind::<sql_types::BigInt, _>(i)
             .bind::<sql_types::BigInt, _>(lookahead(limit))
             .get_results::<Row>(conn)
@@ -387,10 +390,10 @@ pub async fn done_page(
     after: Option<&FinishedCursor>,
     limit: NonZeroU32,
 ) -> Result<Page<TaskRow, FinishedCursor>, SchedulerError> {
-    let (c, i) = after.map_or((latest(), i64::MAX), |c| (c.completed_at, c.id));
+    let (c, i) = after.map_or((None, i64::MAX), |c| (Some(c.completed_at), c.id));
     let items = rows(
         diesel::sql_query(DONE)
-            .bind::<sql_types::Timestamptz, _>(c)
+            .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(c)
             .bind::<sql_types::BigInt, _>(i)
             .bind::<sql_types::BigInt, _>(lookahead(limit))
             .get_results::<Row>(conn)
@@ -425,7 +428,7 @@ pub async fn failed_page(
     after: Option<&FinishedCursor>,
     limit: NonZeroU32,
 ) -> Result<Page<TaskRow, FinishedCursor>, SchedulerError> {
-    let (c, i) = after.map_or((latest(), i64::MAX), |c| (c.completed_at, c.id));
+    let (c, i) = after.map_or((None, i64::MAX), |c| (Some(c.completed_at), c.id));
     let status = match status {
         FailedStatus::Dead => TaskStatus::Dead,
         FailedStatus::Cancelled => TaskStatus::Cancelled,
@@ -437,7 +440,7 @@ pub async fn failed_page(
     })
     .bind::<sql_types::Text, _>(status.as_str())
     .bind::<sql_types::Nullable<sql_types::Text>, _>(filter.last_error.as_deref())
-    .bind::<sql_types::Timestamptz, _>(c)
+    .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(c)
     .bind::<sql_types::BigInt, _>(i)
     .bind::<sql_types::BigInt, _>(lookahead(limit));
     let items = match &filter.task_name {

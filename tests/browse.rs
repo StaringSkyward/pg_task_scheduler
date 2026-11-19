@@ -334,6 +334,32 @@ async fn done_and_failed_pages_break_completed_at_ties_by_id() {
 }
 
 #[tokio::test]
+async fn first_pages_include_timestamps_past_year_9999() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) VALUES \
+         ('done', 'a', 'done', '10000-01-01 00:00:00+00'), \
+         ('dead', 'a', 'dead', '10000-01-01 00:00:00+00')",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let done = store::done_page(&mut conn, None, nz(10)).await.unwrap();
+    assert_eq!(ids(&done.items), [id_of(&db, "done").await]);
+    let dead = store::failed_page(
+        &mut conn,
+        FailedStatus::Dead,
+        &FailedFilter::default(),
+        None,
+        nz(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dead.items), [id_of(&db, "dead").await]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn largest_page_limit_does_not_overflow() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();

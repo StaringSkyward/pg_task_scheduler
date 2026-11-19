@@ -26,9 +26,9 @@ affects. Where a later review changed an entry, that entry ends with a
 **Changed by review 02**, **Changed by review 03** or **Changed by review 04**
 line that says what is different now and links to the later entry. An entry
 that entry 47 changed has a **Changed by entry 47** line in the same way. A
-**Changed by entry N** pointer (47, 48, 49, 50 or 51) says what that entry changed; when
-it changes one bullet only, it may sit inside that bullet instead of ending the
-entry.
+**Changed by entry N** pointer (47, 48, 49, 50, 51 or 52) says what that entry
+changed; when it changes one bullet only, it may sit inside that bullet instead
+of ending the entry.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
 02 (entries 17 and 33) and for entry 47; reviews 03, 04, 05 and 06's findings
@@ -346,6 +346,10 @@ and recreated.
     `Invariant` instead of a substitute timestamp
     (`browse::tests::cursor_builders_reject_a_row_in_the_wrong_state`). The
     year-1 and year-9999 bounds remain only as the first page's starting point.
+    **Changed by entry 52:** a first page binds `NULL` for its timestamp and
+    starts from `-infinity` or `infinity`; the year-1 and year-9999 bounds are
+    gone
+    ([entry 52](#52-browse-pages-start-from-infinity-not-year-1-or-9999)).
   - `TaskRow.attempt` is `None` when no attempt carries the task's current
     `lock_token`: never claimed, or replayed since. Ruling: this doc fix and the
     cursor test were folded into the work on entry 10, which touched the same
@@ -1933,3 +1937,43 @@ and recreated.
     the healthy task reaches `done` while they hold, exactly one session waits
     on the advisory lock, and all five rows end `dead` once the locks are
     released (`worker::stalled_background_work_leaves_room_for_healthy_work`).
+
+### 52. Browse pages start from ±infinity, not year 1 or 9999
+
+- **Finding:** (review 06 #3) With no cursor, the browse pages bound year 1
+  (queued and running) or year 9999 (done, dead and cancelled) in place of a
+  timestamp. PostgreSQL and chrono admit finite timestamps beyond them, and no
+  CHECK rules them out, so a `done` row with
+  `completed_at = '10000-01-01 00:00:00+00'` was missing from the first page,
+  with no continuation. The stand-ins also called `unwrap` outside tests.
+- **Source:** call.
+- **Decision:**
+  - **Binds:** a page with no cursor binds `NULL` for its timestamp. The SQL
+    bound is `COALESCE($n, 'infinity'::timestamptz)` in `DONE`, `FAILED` and
+    `FAILED_BY_NAME`, and `COALESCE($n, '-infinity'::timestamptz)` in
+    `RUNNING`, `QUEUED_DUE` and `QUEUED_FUTURE`.
+  - **Removed:** `earliest()` and `latest()`, with their `unwrap`s.
+  - **Kept:** the id and priority stand-ins (`0`, `i64::MAX`, `i32::MAX + 1`)
+    are bounds of their columns' own types.
+  - **Ruling:** one query per page is enough. The `COALESCE` bound is part of
+    the index condition in both custom and generic plans, so the fallback of
+    two query variants per page was not needed.
+- **Why:** the year-1 and year-9999 stand-ins were manufactured values with
+  `unwrap`s. Finite timestamps beyond them are valid in PostgreSQL and chrono,
+  so those rows dropped out of first pages, and `±infinity` are the type's own
+  bounds.
+- **Expected behaviour:**
+  - A `done` row and a `dead` row completed at `10000-01-01 00:00:00+00` each
+    appear on their first page
+    (`browse::first_pages_include_timestamps_past_year_9999`).
+  - Every page, first (`NULL`) and continued, reads its index with no seq scan
+    (`performance::queued_page_uses_claim_and_due_indexes`,
+    `performance::running_page_uses_lease_index`,
+    `performance::done_page_uses_terminal_index`,
+    `performance::failed_page_uses_failed_index`,
+    `performance::failed_page_by_name_uses_failed_name_index`), and so do the
+    custom and generic plans of `FAILED` and `FAILED_BY_NAME`
+    (`performance::failed_page_generic_plan_uses_failed_index`,
+    `performance::failed_page_by_name_generic_plan_uses_failed_name_index`).
+  - For ordinary data, first pages and continuations return the same rows as
+    before: the other `browse::` tests pass unchanged.
