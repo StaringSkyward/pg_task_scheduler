@@ -69,8 +69,8 @@ identifier CHECK was dropped by hand) comes back in `ClaimBatch::poisoned`,
 still leased, instead of failing the call. The worker dispatches the ready rows
 first, then dead-letters the poisoned ones with `store::dead_letter` on a task
 and connection of their own, so a slow dead-letter cannot spend a healthy row's
-lease. Only one such task runs at a time per scheduler. A poisoned row it
-misses, or claimed while it runs, stays `running` until the reaper requeues it,
+lease. Only one such task runs at a time per scheduler. A poisoned row that
+task misses, or that a claim returns while it runs, stays `running` until the reaper requeues it,
 and a later claim poisons it again until its attempts run out.
 
 A scheduler serves the queues configured with `.queue(name, limit)` (by default
@@ -406,7 +406,8 @@ Not yet automated:
 - process-kill fault injection at random points around claim, effect,
   completion, and heartbeat;
 - database outages longer than a lease;
-- pool exhaustion;
+- pool exhaustion (the dead-letter case is covered by
+  `worker::stalled_dead_letters_leave_room_for_healthy_work`);
 - throughput and latency at production scale.
 
 Run these with the host's PostgreSQL version, pool sizing, payload sizes, and

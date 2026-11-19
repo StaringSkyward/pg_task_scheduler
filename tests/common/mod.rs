@@ -53,7 +53,7 @@ fn unique_schema() -> String {
 
 /// A pool builder whose every connection pins `search_path` to `schema`.
 ///
-/// diesel-async 0.5.2 `SetupCallback<C>`:
+/// diesel-async `SetupCallback<C>`:
 ///   Box<dyn Fn(&str) -> future::BoxFuture<diesel::ConnectionResult<C>> + Send + Sync>
 /// i.e. an `Fn` (callable repeatedly, once per established connection),
 /// `Send + Sync`, taking the URL by `&str` and returning a `Send` boxed
@@ -119,7 +119,7 @@ impl TestDb {
     }
 
     /// Another pool on this schema, of at most `max_size` connections. `self.pool.resize`
-    /// cannot do this: deadpool 0.13 keeps the old permits until that many connections exist.
+    /// cannot do this: deadpool 0.13's `resize` forgets permits only for connections that exist when it is called, never later.
     pub fn sized_pool(&self, max_size: usize) -> Pool<AsyncPgConnection> {
         schema_pool(&database_url(), &self.schema)
             .max_size(max_size)

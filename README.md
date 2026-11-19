@@ -543,7 +543,7 @@ scanning retained rows (see
   `lock_timeout` or `statement_timeout` the host set.
 - **Connections:** each running scheduler holds one pool connection for
   `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
-  finalization, and maintenance. Handlers hold no connection unless they take
+  finalization, maintenance, and dead-lettering. Handlers hold no connection unless they take
   one. Per scheduler sharing a pool, that is 1 for `LISTEN`, 1 for claims and
   maintenance, 1 for dead-lettering claimed rows that direct SQL made unusable
   (a payload or count the types reject), and up to the sum of queue limits for

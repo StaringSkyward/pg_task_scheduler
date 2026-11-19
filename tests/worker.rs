@@ -1084,7 +1084,7 @@ async fn stalled_dead_letters_leave_room_for_healthy_work() {
         .queue("default", n(1))
         .unwrap()
         .max_poll_interval(ms(35))
-        .lease_duration(ms(600))
+        .lease_duration(Duration::from_secs(2))
         .heartbeat_interval(ms(150))
         .reaper_interval(ms(200))
         .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
@@ -1094,7 +1094,7 @@ async fn stalled_dead_letters_leave_room_for_healthy_work() {
     let run = start(scheduler);
 
     wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
-    // Before the skipped rows' leases expire (600 ms): the reaper's move to `dead` waits too.
+    // Before the skipped rows' leases expire (2 s): the reaper's move to `dead` waits too, and would be a second waiter.
     let waiting = diesel::sql_query(
         "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 4949 AND NOT granted",
     )
@@ -1102,7 +1102,7 @@ async fn stalled_dead_letters_leave_room_for_healthy_work() {
     .await
     .unwrap()
     .n;
-    assert!(waiting <= 1, "{waiting} sessions waiting to dead-letter");
+    assert_eq!(waiting, 1, "sessions waiting to dead-letter");
 
     lock.batch_execute("SELECT pg_advisory_unlock(4949)")
         .await

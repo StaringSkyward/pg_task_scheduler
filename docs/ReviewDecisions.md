@@ -1,6 +1,6 @@
 # Review Decisions and Expected Behaviour
 
-This records what was decided about each finding of the four
+This records what was decided about each finding of the five
 whole-repository reviews made before the first release, and what each decision
 looks like from outside. The reviews themselves are kept out of the repository,
 so each entry restates its finding.
@@ -14,6 +14,8 @@ so each entry restates its finding.
 - **Review 04** was run at `a3ab225`, the head of PR #9. Entries 43–46 follow
   its findings 1–4 in order; entry 47, approved after its triage, cuts across
   them and earlier entries.
+- **Review 05** was run at `6cd99f4`, the head of PR #9. Entries 48–49 follow
+  its findings 1–2 in order.
 
 It describes the code as shipped. Each entry has a source: **(user)** means the
 user decided it; **(call)** means it was a judgement call, open to change.
@@ -21,11 +23,14 @@ user decided it; **(call)** means it was a judgement call, open to change.
 affects. Where a later review changed an entry, that entry ends with a
 **Changed by review 02**, **Changed by review 03** or **Changed by review 04**
 line that says what is different now and links to the later entry. An entry
-that entry 47 changed has a **Changed by entry 47** line in the same way.
+that entry 47 changed has a **Changed by entry 47** line in the same way. A
+**Changed by entry N** pointer (47, 48 or 49) says what that entry changed; when
+it changes one bullet only, it may sit inside that bullet instead of ending the
+entry.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
-02 (entries 17 and 33) and for entry 47; reviews 03 and 04's findings changed
-none. A database built by an earlier version of this repository must be dropped
+02 (entries 17 and 33) and for entry 47; reviews 03, 04 and 05's findings
+changed none. A database built by an earlier version of this repository must be dropped
 and recreated.
 
 ## Review 01: findings
@@ -1764,6 +1769,8 @@ and recreated.
   - A database built before this change lacks the function and the CHECKs and
     must be dropped and recreated, as must the example's
     (`docker compose down -v`). No Rust API changed.
+
+## Review 05: findings
 
 ### 48. serde_json parses floats exactly
 

@@ -110,7 +110,8 @@ pub struct PoisonedClaim {
 /// untouched, so the healthy rows are never held up behind them. Callers of `claim` itself
 /// should [`dead_letter`] each one after dispatching the ready rows; one they leave stays
 /// `running` until its lease expires, the reaper requeues it, and a later claim poisons it
-/// again until its attempts run out. [`Scheduler`](crate::Scheduler) dead-letters them for you.
+/// again until its attempts run out. [`Scheduler`](crate::Scheduler) dead-letters them for you, one batch at a time; rows
+/// claimed while it is busy are left to the reaper.
 pub async fn claim(
     conn: &mut AsyncPgConnection,
     worker: &WorkerId,
