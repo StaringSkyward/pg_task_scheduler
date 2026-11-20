@@ -1,6 +1,6 @@
 # Review Decisions and Expected Behaviour
 
-This records what was decided about each finding of the six
+This records what was decided about each finding of the seven
 whole-repository reviews made before the first release, and what each decision
 looks like from outside. The reviews themselves are kept out of the repository,
 so each entry restates its finding.
@@ -18,6 +18,8 @@ so each entry restates its finding.
   its findings 1–2 in order.
 - **Review 06** was run at `21da0b6`, the head of PR #9. Entries 50–52 follow
   its findings 1–3 in order.
+- **Review 07** was run at `fecccd3`, the head of PR #9. Entries 53–55 follow
+  its findings 1–3 in order.
 
 It describes the code as shipped. Each entry has a source: **(user)** means the
 user decided it; **(call)** means it was a judgement call, open to change.
@@ -26,7 +28,7 @@ affects. Where a later review changed an entry, that entry ends with a
 **Changed by review 02**, **Changed by review 03** or **Changed by review 04**
 line that says what is different now and links to the later entry. An entry
 that entry 47 changed has a **Changed by entry 47** line in the same way. A
-**Changed by entry N** pointer (47, 48, 49, 50, 51 or 52) says what that entry
+**Changed by entry N** pointer (47 to 52, 54 or 55) says what that entry
 changed; when it changes one bullet only, it may sit inside that bullet instead
 of ending the entry.
 
@@ -1990,3 +1992,28 @@ and recreated.
   - A row with an infinite `completed_at` or `locked_until` cannot be stored
     (`schema_checks::infinite_completed_at_is_rejected`,
     `schema_checks::infinite_locked_until_is_rejected`).
+
+## Review 07: findings
+
+### 53. A handler suspended past its lease is never resumed
+
+- **Finding:** (review 07 #1) `dispatch` polled the handler first in a biased
+  `select!`. When the handler's awaited event and the lease keeper's timer were
+  both ready on one poll, the handler ran one more segment after its local lease
+  deadline, and could start an effect outside PostgreSQL on an expired lease.
+- **Source:** call (the reviewer's fix).
+- **Decision:** the arms are ordered `keep_lease`, `shutdown.expired`, then the
+  handler; the arm bodies are unchanged. A handler suspended past the local
+  deadline is dropped when it would next resume. A segment already running at
+  the deadline is not preempted, and a result returned in the same poll as the
+  deadline is dropped as a lost lease, which the reaper retries.
+- **Why:** the database fences worker transitions but cannot fence an effect
+  started outside PostgreSQL. This matches the rule that no handler starts on an
+  expired lease.
+- **Expected behaviour:**
+  - A handler whose timer is due when the local deadline passes is not resumed
+    (`worker::a_handler_suspended_past_its_lease_is_not_resumed`).
+  - A DB-contained handler holding its row lock still progresses while a
+    heartbeat waits, and a draining handler keeps its lease
+    (`worker::db_contained_handler_survives_heartbeat_while_holding_row_lock`,
+    `worker::draining_handler_keeps_its_lease`).

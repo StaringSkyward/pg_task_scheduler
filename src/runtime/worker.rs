@@ -575,21 +575,10 @@ fn dispatch<P: SchedulerPool>(
         let started = Instant::now();
         // The lease keeper is its own future, not a select! arm body: a DB-contained
         // handler holding the row lock must keep being polled while a heartbeat waits.
+        // It is polled before the handler (and so is forced-shutdown expiry): a handler
+        // suspended past the local deadline must be dropped, not resumed for one more segment.
         let result = tokio::select! {
             biased;
-            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
-                Ok(result) => result,
-                // Not finalized: the attempt stays open and the reaper recovers the task.
-                Err(panic) => {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("non-string panic payload");
-                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
-                    return;
-                }
-            },
             () = keep_lease(&pool, &task.lease, &config, &name, deadline, &lease_stop) => {
                 drop(cancel_on_drop); // cancel now, not after the check below
                 lease_stop.cancel(); // and end any heartbeat still in flight
@@ -614,6 +603,19 @@ fn dispatch<P: SchedulerPool>(
                 release(&pool, &task.lease, name).await;
                 return;
             }
+            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
+                Ok(result) => result,
+                // Not finalized: the attempt stays open and the reaper recovers the task.
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
+                    return;
+                }
+            },
         };
         metrics::histogram!("pg_task_scheduler_task_duration_seconds", "task_name" => name.clone())
             .record(started.elapsed());

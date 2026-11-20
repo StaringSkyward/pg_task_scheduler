@@ -5,6 +5,8 @@ use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -458,6 +460,49 @@ async fn draining_handler_keeps_its_lease() {
     let task = store::task(&mut conn, id).await.unwrap().unwrap();
     assert_eq!(task.state.status(), TaskStatus::Done);
     assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
+    db.cleanup().await;
+}
+
+/// A handler whose timer is due on the same poll as the lease deadline is dropped, not resumed:
+/// blocking the runtime stops heartbeats, so the local deadline passes with the handler suspended.
+#[tokio::test]
+async fn a_handler_suspended_past_its_lease_is_not_resumed() {
+    let db = TestDb::new().await;
+    enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let started = Arc::new(Notify::new());
+    let effect = Arc::new(AtomicBool::new(false));
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(300))
+        .heartbeat_interval(ms(100))
+        .register_task::<Job, _, _>({
+            let (started, effect) = (started.clone(), effect.clone());
+            move |_ctx, _args| {
+                let (started, effect) = (started.clone(), effect.clone());
+                async move {
+                    started.notify_one();
+                    tokio::time::sleep(ms(200)).await;
+                    effect.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(!AtomicBool::load(&effect, Ordering::SeqCst));
+    // No heartbeat can run meanwhile: the local deadline is at most 300 ms from here, and the
+    // handler's 200 ms timer is due too.
+    std::thread::sleep(ms(500));
+    tokio::time::sleep(ms(100)).await;
+    assert!(
+        !AtomicBool::load(&effect, Ordering::SeqCst),
+        "the handler resumed after its lease expired"
+    );
+    run.stop().await;
     db.cleanup().await;
 }
 
