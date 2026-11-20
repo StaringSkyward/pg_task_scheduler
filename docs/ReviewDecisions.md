@@ -1485,6 +1485,8 @@ and recreated.
     (`enqueue::idempotency_distinguishes_payloads_that_decode_differently`,
     `enqueue::idempotency_ignores_payload_key_order`). The same rule applies
     to the outbox (entry on `complete_with_outbox`): receivers decode payloads.
+    Changed by entry 54: a typed retry now compares decoded arguments, and
+    `Count(1)` then `Ratio(1.0)` still conflict.
   - Caveat: `Value` equality treats `-0.0` and `0.0` as equal and JSONB stores
     `0.0`, so a negative zero is accepted and the worker decodes `+0.0`.
 - **Why:** A producer's success should mean the handler decodes the arguments
@@ -2017,3 +2019,36 @@ and recreated.
     heartbeat waits, and a draining handler keeps its lease
     (`worker::db_contained_handler_survives_heartbeat_while_holding_row_lock`,
     `worker::draining_handler_keeps_its_lease`).
+
+### 54. Typed retries match on equal arguments
+
+- **Finding:** (review 07 #2) `enqueue` compared canonical JSONB text, so two
+  equal `HashSet`s that serialize in different orders were an
+  `IdempotencyConflict`, though the handler decodes them to the same value.
+- **Source:** user (compare typed values, rather than keeping canonical JSONB
+  text and documenting that a retry must reproduce the same array order).
+- **Decision:** `EXISTING` selects `task_name = $2 AS same_name` and
+  `payload::text AS stored`, and no longer binds the payload. A retry returns
+  the existing task when the name is the same and `decode_stored::<T::Args>`
+  (text, then `Value`, then `T::Args`, as the worker decodes it) yields a value
+  equal to `args` by `PartialEq`. Anything else, including a stored payload that
+  does not decode, is `IdempotencyConflict`. Admission already proved the new
+  arguments decode back equal, so comparing with `args` compares what the
+  handler would receive. The queue and priority are still not compared. The
+  outbox `same_content` check keeps canonical JSONB text.
+- **Why:** the handler receives the decoded value, so equal values are the same
+  request whatever order a set serializes in. `Value` equality still tells `1`
+  from `1.0`, and a stored payload the type cannot decode is not the same
+  request.
+- **Expected behaviour:**
+  - Equal sets in another serialization order return the first task
+    (`enqueue::idempotency_matches_equal_sets_in_another_order`).
+  - A stored payload that does not decode as `T::Args` is a conflict
+    (`enqueue::idempotency_conflicts_when_the_stored_payload_does_not_decode`).
+  - With `Args = Value`, `1` then `1.0` conflicts
+    (`enqueue::idempotency_with_value_args_keeps_numeric_scale`).
+  - Kept: `Count(1)` then `Ratio(1.0)` conflicts, reordered object keys match,
+    and different content conflicts
+    (`enqueue::idempotency_distinguishes_payloads_that_decode_differently`,
+    `enqueue::idempotency_ignores_payload_key_order`,
+    `enqueue::conflicting_duplicate_is_rejected`).

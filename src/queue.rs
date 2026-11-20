@@ -140,7 +140,9 @@ struct ExistingRow {
     #[diesel(sql_type = sql_types::Timestamptz)]
     due_at: DateTime<Utc>,
     #[diesel(sql_type = sql_types::Bool)]
-    same: bool,
+    same_name: bool,
+    #[diesel(sql_type = sql_types::Text)]
+    stored: String,
 }
 
 impl EnqueuedRow {
@@ -164,18 +166,22 @@ const INSERT: &str = r#"
     RETURNING id, status, due_at
 "#;
 
-// Canonical JSONB text: key order and whitespace do not matter, but numeric scale does, so
-// `1` and `1.0` differ (JSONB `=` would equate them, and the handler decodes them apart).
+// A retry matches when the task name is the same and the stored payload, decoded as the worker
+// decodes it (text, then `Value`, then `T::Args`), equals the new arguments by `PartialEq`.
+// Equal sets match in any serialization order, and `Value` still tells `1` from `1.0`.
 const EXISTING: &str = r#"
-    SELECT id, status, due_at, (task_name = $2 AND payload::text = $3::jsonb::text) AS same
+    SELECT id, status, due_at, task_name = $2 AS same_name, payload::text AS stored
     FROM queue_tasks
     WHERE task_key = $1
 "#;
 
 /// Enqueue a task on the caller's connection. If that connection is in a
 /// transaction, the task (and its notification) commit or roll back with the
-/// caller's data. Re-enqueueing the same `key` with the same task name and payload
-/// returns the existing task; different content is an `IdempotencyConflict`. The queue
+/// caller's data. Re-enqueueing the same `key` with the same task name and arguments returns
+/// the existing task: the stored payload, decoded as `T::Args` the way the worker decodes it,
+/// must equal `args` by `PartialEq` (equal `HashSet`s match whatever order they serialize in).
+/// Anything else, including a stored payload that does not decode, is an
+/// `IdempotencyConflict`. The queue
 /// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
 /// `T::Args` must be `PartialEq`: the arguments are stored only if they decode back equal to
 /// the caller's value, both from the JSON sent and from what PostgreSQL stores. JSON cannot
@@ -233,14 +239,15 @@ pub async fn enqueue<T: Task>(
         let existing = diesel::sql_query(EXISTING)
             .bind::<sql_types::Text, _>(&key)
             .bind::<sql_types::Text, _>(&name)
-            .bind::<sql_types::Jsonb, _>(&payload)
             .get_results::<ExistingRow>(conn)
             .await?
             .pop();
         let Some(existing) = existing else {
             continue;
         };
-        if !existing.same {
+        if !existing.same_name
+            || !decode_stored::<T::Args>(&existing.stored).is_ok_and(|stored| stored == args)
+        {
             return Err(SchedulerError::IdempotencyConflict(key));
         }
         return EnqueuedRow {
@@ -329,6 +336,11 @@ struct StoredRow {
     stored: String,
 }
 
+/// Decode stored payload text as the worker does: parsed as a `Value`, then as `A`.
+fn decode_stored<A: DeserializeOwned>(text: &str) -> Result<A, serde_json::Error> {
+    serde_json::from_value(serde_json::from_str::<serde_json::Value>(text)?)
+}
+
 /// Check that `payload` decodes as the same `A` once stored as JSONB, as the worker will
 /// decode it. JSONB normalizes numbers, so a value can decode differently (`1e18` reads back
 /// as an integer). A decode failure is [`SchedulerError::Serde`]; a different value is
@@ -342,9 +354,7 @@ pub(crate) async fn check_stored<A: DeserializeOwned + PartialEq>(
         .get_result::<StoredRow>(conn)
         .await?
         .stored;
-    // Decoded as the worker does: the text parsed as a `Value`, then as `A`.
-    let stored: serde_json::Value = serde_json::from_str(&text)?;
-    let decoded = serde_json::from_value::<A>(stored)?;
+    let decoded = decode_stored::<A>(&text)?;
     // JSONB stores `-0.0` as `0.0`, and `-0.0 == 0.0`, so a negative zero is accepted.
     if decoded != serde_json::from_value::<A>(payload.clone())? {
         return Err(SchedulerError::PayloadNotPreserved);

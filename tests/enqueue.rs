@@ -689,26 +689,26 @@ async fn enqueue_rejects_non_finite_floats_inside_an_option() {
     db.cleanup().await;
 }
 
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Mixed {
+    tags: std::collections::HashSet<String>,
+    x: f64,
+}
+struct MixedTask;
+impl Task for MixedTask {
+    const NAME: &'static str = "mixed";
+    type Args = Mixed;
+}
+
 /// A `HashSet` re-serializes in another order and `1e18` changes form in JSONB; comparing
 /// decoded values accepts both together.
 #[tokio::test]
 async fn enqueue_accepts_a_set_beside_a_large_float() {
-    use std::collections::HashSet;
     use std::num::NonZeroU32;
 
     use pg_task_scheduler::TaskName;
     use pg_task_scheduler::WorkerId;
 
-    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-    struct Mixed {
-        tags: HashSet<String>,
-        x: f64,
-    }
-    struct MixedTask;
-    impl Task for MixedTask {
-        const NAME: &'static str = "mixed";
-        type Args = Mixed;
-    }
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
     let make = || Mixed {
@@ -731,5 +731,93 @@ async fn enqueue_accepts_a_set_beside_a_large_float() {
     .ready;
     let got: Mixed = serde_json::from_value(claimed[0].payload.clone()).unwrap();
     assert_eq!(got, make());
+    db.cleanup().await;
+}
+
+/// Equal sets match whatever order they serialize in.
+#[tokio::test]
+async fn idempotency_matches_equal_sets_in_another_order() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let tags: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+    let build = || Mixed {
+        tags: tags.iter().cloned().collect(),
+        x: 1.0,
+    };
+    let a = build();
+    let a_json = serde_json::to_string(&a).unwrap();
+    let mut b = build();
+    let mut differed = false;
+    for _ in 0..100 {
+        b = build();
+        if serde_json::to_string(&b).unwrap() != a_json {
+            differed = true;
+            break;
+        }
+    }
+    assert!(differed, "no rebuilt set serialized in another order");
+    let first = enqueue::<MixedTask>(&mut conn, key("set"), a, EnqueueOptions::default())
+        .await
+        .unwrap();
+    let second = enqueue::<MixedTask>(&mut conn, key("set"), b, EnqueueOptions::default())
+        .await
+        .unwrap();
+    assert!(!second.inserted);
+    assert_eq!(second.id, first.id);
+    db.cleanup().await;
+}
+
+/// A stored payload the retry's type cannot decode is a conflict, not an error or a match.
+#[tokio::test]
+async fn idempotency_conflicts_when_the_stored_payload_does_not_decode() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "INSERT INTO queue_tasks (task_key, task_name, payload) \
+         VALUES ('bad', 'mixed', '\"not an object\"')",
+    )
+    .await
+    .unwrap();
+    let r = enqueue::<MixedTask>(
+        &mut conn,
+        key("bad"),
+        Mixed {
+            tags: Default::default(),
+            x: 1.0,
+        },
+        EnqueueOptions::default(),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(SchedulerError::IdempotencyConflict(_))),
+        "{r:?}"
+    );
+    db.cleanup().await;
+}
+
+/// `Value` equality tells an integer from a float, so `1` then `1.0` conflict.
+#[tokio::test]
+async fn idempotency_with_value_args_keeps_numeric_scale() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    enqueue::<Email>(
+        &mut conn,
+        key("n"),
+        json!({"n": 1}),
+        EnqueueOptions::default(),
+    )
+    .await
+    .unwrap();
+    let r = enqueue::<Email>(
+        &mut conn,
+        key("n"),
+        json!({"n": 1.0}),
+        EnqueueOptions::default(),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(SchedulerError::IdempotencyConflict(_))),
+        "{r:?}"
+    );
     db.cleanup().await;
 }
