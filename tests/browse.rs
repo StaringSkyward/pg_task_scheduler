@@ -360,6 +360,21 @@ async fn first_pages_include_timestamps_past_year_9999() {
 }
 
 #[tokio::test]
+async fn the_last_instant_chrono_can_hold_appears_on_a_first_page() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) VALUES \
+         ('last', 'a', 'done', '262142-12-31 23:59:59.999999+00')",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let done = store::done_page(&mut conn, None, nz(10)).await.unwrap();
+    assert_eq!(ids(&done.items), [id_of(&db, "last").await]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn largest_page_limit_does_not_overflow() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();

@@ -8,17 +8,17 @@ CREATE TABLE scheduler_jobs (
                     CHECK (queue_is_identifier(task_name)),
     cron_expression TEXT NOT NULL,
     job_args        JSONB NOT NULL DEFAULT '{}'::jsonb,
-    next_run_at     TIMESTAMPTZ NOT NULL CHECK (isfinite(next_run_at)),
+    next_run_at     queue_timestamptz NOT NULL,
     max_attempts    INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
     queue           TEXT NOT NULL DEFAULT 'default'
                     CONSTRAINT scheduler_jobs_queue_identifier CHECK (queue_is_identifier(queue)),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      queue_timestamptz NOT NULL DEFAULT now(),
+    updated_at      queue_timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX scheduler_jobs_due_idx ON scheduler_jobs (next_run_at);
 
 -- A row pauses its job: no occurrences are materialized until it is deleted.
 CREATE TABLE scheduler_job_pauses (
     job_id    UUID PRIMARY KEY REFERENCES scheduler_jobs (id) ON DELETE CASCADE,
-    paused_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    paused_at queue_timestamptz NOT NULL DEFAULT now()
 );

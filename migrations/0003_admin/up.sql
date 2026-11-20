@@ -13,7 +13,7 @@ CREATE TABLE queue_admin_actions (
     affected          BIGINT NOT NULL DEFAULT 0,
     operator          TEXT NOT NULL,
     reason            TEXT NOT NULL,
-    at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    at                queue_timestamptz NOT NULL DEFAULT now(),
 
     -- Shape per action: pause/resume name a queue only; a single replay/cancel names its task,
     -- name and queue; a bulk one names the task name and the max_task_id bound (only a bulk
@@ -42,7 +42,7 @@ CREATE TABLE queue_pauses (
         CONSTRAINT queue_pauses_queue_identifier CHECK (queue_is_identifier(queue)),
     operator  TEXT NOT NULL,
     reason    TEXT NOT NULL,
-    paused_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    paused_at queue_timestamptz NOT NULL DEFAULT now()
 );
 
 -- 4. worker registry: display-only, never read by claims or ownership. Each worker upserts its
@@ -52,9 +52,9 @@ CREATE TABLE queue_workers (
     worker_id    TEXT PRIMARY KEY
         CONSTRAINT queue_workers_worker_id_identifier CHECK (queue_is_identifier(worker_id)),
     label        TEXT,
-    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    lost_after   TIMESTAMPTZ NOT NULL,
+    started_at   queue_timestamptz NOT NULL DEFAULT now(),
+    last_seen_at queue_timestamptz NOT NULL DEFAULT now(),
+    lost_after   queue_timestamptz NOT NULL,
     status       TEXT NOT NULL CHECK (status IN ('starting', 'healthy', 'degraded', 'stopping')),
     last_error   TEXT
 );
@@ -67,7 +67,7 @@ CREATE TABLE queue_worker_queues (
         CONSTRAINT queue_worker_queues_queue_identifier CHECK (queue_is_identifier(queue)),
     slot_limit       BIGINT NOT NULL CHECK (slot_limit >= 1),
     in_use           BIGINT NOT NULL CHECK (in_use >= 0 AND in_use <= slot_limit),
-    last_finished_at TIMESTAMPTZ,
+    last_finished_at queue_timestamptz,
     PRIMARY KEY (worker_id, queue)
 );
 

@@ -34,7 +34,8 @@ of ending the entry.
 
 **Existing databases:** the migrations were edited in place, in reviews 01 and
 02 (entries 17 and 33), for entry 47 and in review 06 (entry 52's `isfinite`
-CHECKs on `completed_at` and `locked_until`); reviews 03, 04 and 05's findings
+CHECKs on `completed_at` and `locked_until`) and in review 07 (entry 55's
+`queue_timestamptz` domain); reviews 03, 04 and 05's findings
 changed none. A database built by an earlier version of this repository must be dropped
 and recreated.
 
@@ -701,6 +702,8 @@ and recreated.
 - **Decision:**
   - `queue_tasks.due_at` has `CHECK (isfinite(due_at))`. A claimed row is due,
     so it is finite and at most `now()`, which chrono can represent.
+    **Changed by entry 55:** the column is `queue_timestamptz`, which is finite
+    and below chrono's limit, in place of the CHECK.
   - Claim reads `payload` as text and parses it per row. A row whose attempt
     number, `task_key`, payload or `max_attempts` fails to convert is logged at
     error level (`claimed task is unusable; marking it dead`) and dead-lettered
@@ -757,7 +760,8 @@ and recreated.
 - **Source:** call.
 - **Decision:**
   - `scheduler_jobs.next_run_at` has `CHECK (isfinite(next_run_at))`. A due
-    cursor is finite and at most `now()`, so it decodes.
+    cursor is finite and at most `now()`, so it decodes. **Changed by entry
+    55:** the column is `queue_timestamptz` in place of the CHECK.
   - The materializer no longer reads `job_args`. The occurrence's insert copies
     them from the schedule row in SQL
     (`INSERT … SELECT … FROM scheduler_jobs j WHERE j.id = $6`).
@@ -1962,7 +1966,8 @@ and recreated.
     are in-domain bounds: `i64::MAX` is the top of `bigint`, `0` is below every
     identity id (they start at 1) and `i32::MAX + 1` is above every `integer`.
   - **CHECKs:** migration 0001 adds `CHECK (isfinite(completed_at))` and
-    `CHECK (isfinite(locked_until))`, as `due_at` already has. A stored
+    `CHECK (isfinite(locked_until))`, as `due_at` already has (**Changed by
+    entry 55:** the `queue_timestamptz` domain replaces all four). A stored
     infinity would sort onto the first page, where chrono cannot decode it, so
     the CHECKs keep the `±infinity` bounds from ever meeting one. NULL passes
     them, and every writer sets finite values.
@@ -2052,3 +2057,35 @@ and recreated.
     (`enqueue::idempotency_distinguishes_payloads_that_decode_differently`,
     `enqueue::idempotency_ignores_payload_key_order`,
     `enqueue::conflicting_duplicate_is_rejected`).
+
+### 55. Every stored timestamp is one chrono can hold
+
+- **Finding:** (review 07 #3) PostgreSQL's finite `TIMESTAMPTZ` range runs to
+  294276 AD, but chrono 0.4's `NaiveDate::MAX` is 262142-12-31. A row past it
+  (for example from a SQL import) fails Diesel's decode ("Tried to deserialize
+  a timestamp that is too large for Chrono"), and one such row failed a whole
+  browse page. The four `isfinite` CHECKs covered only four columns.
+- **Source:** call.
+- **Decision:** migration 0001 creates
+  `queue_timestamptz AS TIMESTAMPTZ CHECK (isfinite(VALUE) AND VALUE < '262143-01-01 00:00:00+00')`.
+  Every `TIMESTAMPTZ` column in migrations 0001 to 0003 (19 columns) uses it,
+  keeping `NOT NULL` and defaults, and the four `isfinite` CHECKs (`due_at`,
+  `locked_until`, `completed_at`, `next_run_at`) are removed. `src/schema.rs`
+  and every bind stay `Timestamptz`. PostgreSQL's lower bound (4713 BC) is
+  already inside chrono's range.
+- **Why:** a SQL import can write any timestamp column, and Rust decodes all of
+  them. Following entry 47, every column gets the rule, and a domain states it
+  once. The browse pages' `±infinity` bounds still lie outside the domain, so
+  they never meet a stored value.
+- **Expected behaviour:**
+  - A timestamp at or past `262143-01-01` is a check violation
+    (`schema_checks::timestamp_past_chronos_range_is_rejected`).
+  - No `timestamptz` column lacks the domain
+    (`schema_checks::every_timestamp_column_uses_queue_timestamptz`).
+  - The last instant chrono can hold appears on a first page
+    (`browse::the_last_instant_chrono_can_hold_appears_on_a_first_page`).
+  - Kept: `schema_checks::infinite_due_at_is_rejected`,
+    `schema_checks::infinite_completed_at_is_rejected`,
+    `schema_checks::infinite_locked_until_is_rejected`,
+    `schema_checks::infinite_next_run_at_is_rejected` and
+    `browse::first_pages_include_timestamps_past_year_9999` still pass.

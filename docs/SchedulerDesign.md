@@ -80,8 +80,8 @@ running                  ⇔ locked_by and locked_until are set
 done | dead | cancelled  ⇔ completed_at is set
 ```
 
-`due_at` has `CHECK (isfinite(due_at))`, so PostgreSQL's `infinity` and
-`-infinity`, which chrono cannot represent, never reach a claim. `task_key`,
+`due_at` is `queue_timestamptz`, which is finite and below chrono's limit, so
+PostgreSQL's `infinity` and `-infinity` never reach a claim. `task_key`,
 `task_name`, `queue` and `locked_by` have identifier CHECKs
 (`queue_tasks_task_key_identifier` and so on); `locked_by` may still be NULL.
 
@@ -197,7 +197,7 @@ Recurring definitions: a unique schedule `name` (`ScheduleName`), the
 expression, the payload template (`job_args`), `max_attempts ≥ 1`, the queue,
 the `next_run_at` cursor, and timestamps. `name`, `task_name` and `queue` have
 identifier CHECKs (`scheduler_jobs_name_identifier` and so on).
-`next_run_at` has `CHECK (isfinite(next_run_at))`.
+`next_run_at` is `queue_timestamptz`.
 `scheduler_jobs_due_idx (next_run_at)` finds due schedules.
 
 `scheduler_job_pauses (job_id, paused_at)` holds one row per paused schedule. It
@@ -232,13 +232,12 @@ is an approved exception:
 | `scheduler_jobs` keeps the `next_run_at` cursor in the row with the definition (`name`, `task_name`, `cron_expression`, `job_args`, `max_attempts`, `queue`) | The cursor is computed from the row's own cron expression, by the materializer and by `jobs::reschedule`, under one row lock that orders it against `ensure_job`, pause and delete. `scheduler_jobs_due_idx (next_run_at)` then finds a due schedule and its definition with one index scan and no join. |
 | The worker registry keeps its observed values in its rows: `queue_workers.label`, `last_error`, `status`, `last_seen_at` and `lost_after`; `queue_worker_queues.in_use` and `last_finished_at` | They are display-only observations. Their one writer, the worker, rewrites them together in one transaction at every registry write, and nothing reads them for correctness. `in_use` also has a CHECK against `slot_limit` in the same row. |
 
-Four CHECKs keep timestamps finite: `isfinite(due_at)`, `isfinite(locked_until)`
-and `isfinite(completed_at)` on `queue_tasks`, and `isfinite(next_run_at)` on
-`scheduler_jobs`. PostgreSQL accepts `infinity` and `-infinity`, which chrono
-cannot represent. With the CHECKs, every row the claim or the materializer
-reads is due, so it is finite and at most `now()`, and always within chrono's
-range, and the browse pages' `±infinity` first-page bounds never meet a stored
-infinity.
+Every timestamp column is `queue_timestamptz`, a `TIMESTAMPTZ` domain that is
+finite and below 262143-01-01, where chrono's range ends. PostgreSQL accepts
+`infinity`, `-infinity` and years chrono cannot hold, so without the domain a
+SQL import could write a row that fails to decode. With it, every stored
+timestamp decodes, and the browse pages' `±infinity` first-page bounds still lie
+outside it.
 
 ## Design Choices
 
@@ -378,7 +377,7 @@ inserted with `task_key = "schedule:{id}:{next_run_at}"` (microsecond RFC 3339)
 and `ON CONFLICT DO NOTHING`, and `next_run_at` moves to the next future
 occurrence, in the same transaction. The insert copies `job_args` from the
 schedule row in SQL (`INSERT … SELECT`), so the materializer never decodes them,
-and its CHECK keeps `next_run_at` finite. After downtime, one occurrence is
+and the `queue_timestamptz` domain keeps `next_run_at` decodable. After downtime, one occurrence is
 created for the missed slot.
 
 The pause re-check needs READ COMMITTED. A pause does not change the job row, so

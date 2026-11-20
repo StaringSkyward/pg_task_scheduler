@@ -24,6 +24,13 @@ AS $$
        AND s !~ E'[\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]$'
 $$;
 
+-- A TIMESTAMPTZ that chrono's DateTime<Utc> can hold: finite, and below 262143-01-01
+-- (chrono 0.4's NaiveDate::MAX is 262142-12-31). PostgreSQL's own lower bound (4713 BC)
+-- is already inside chrono's range. Every timestamp column uses it, so every stored
+-- timestamp decodes.
+CREATE DOMAIN queue_timestamptz AS TIMESTAMPTZ
+    CHECK (isfinite(VALUE) AND VALUE < '262143-01-01 00:00:00+00');
+
 CREATE TABLE queue_tasks (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 
@@ -50,7 +57,7 @@ CREATE TABLE queue_tasks (
     --   immediate task -> now()
     --   scheduled task -> future timestamp
     --   retry          -> retry timestamp
-    due_at TIMESTAMPTZ NOT NULL DEFAULT now() CHECK (isfinite(due_at)),
+    due_at queue_timestamptz NOT NULL DEFAULT now(),
 
     -- Number of attempts that have been claimed/started.
     attempts INTEGER NOT NULL DEFAULT 0
@@ -64,13 +71,13 @@ CREATE TABLE queue_tasks (
         CONSTRAINT queue_tasks_locked_by_identifier CHECK (queue_is_identifier(locked_by)),
     lock_token BIGINT NOT NULL DEFAULT 0
         CHECK (lock_token >= 0),
-    locked_until TIMESTAMPTZ CHECK (isfinite(locked_until)),
+    locked_until queue_timestamptz,
 
     last_error TEXT,
 
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at TIMESTAMPTZ CHECK (isfinite(completed_at)),
+    created_at queue_timestamptz NOT NULL DEFAULT now(),
+    updated_at queue_timestamptz NOT NULL DEFAULT now(),
+    completed_at queue_timestamptz,
 
     -- The admin action (queue_admin_actions) that last replayed or cancelled this task. No FK:
     -- the audit outlives task retention.
@@ -121,8 +128,8 @@ CREATE TABLE queue_task_attempts (
     lock_token BIGINT NOT NULL,
     worker_id TEXT NOT NULL
         CONSTRAINT queue_task_attempts_worker_id_identifier CHECK (queue_is_identifier(worker_id)),
-    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    finished_at TIMESTAMPTZ,
+    started_at queue_timestamptz NOT NULL DEFAULT now(),
+    finished_at queue_timestamptz,
     outcome TEXT
         CHECK (outcome IN ('done', 'retry', 'dead', 'lease_expired', 'released', 'cancelled')),
     error TEXT,
@@ -152,8 +159,8 @@ CREATE TABLE queue_outbox (
     topic TEXT NOT NULL
         CONSTRAINT queue_outbox_topic_identifier CHECK (queue_is_identifier(topic)),
     payload JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at TIMESTAMPTZ,
+    created_at queue_timestamptz NOT NULL DEFAULT now(),
+    published_at queue_timestamptz,
 
     UNIQUE (task_key, effect_name)
 );

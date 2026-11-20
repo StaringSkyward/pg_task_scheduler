@@ -95,6 +95,56 @@ async fn infinite_due_at_is_rejected() {
 }
 
 #[tokio::test]
+async fn timestamp_past_chronos_range_is_rejected() {
+    let db = TestDb::new().await;
+    let e = exec(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         VALUES ('k', 'n', 'done', '262143-01-01 00:00:00+00')",
+    )
+    .await
+    .unwrap_err();
+    assert!(is_check_violation(&e), "{e:?}");
+    db.cleanup().await;
+}
+
+#[derive(diesel::QueryableByName)]
+struct ColumnName {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+}
+
+#[tokio::test]
+async fn every_timestamp_column_uses_queue_timestamptz() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let rows: Vec<ColumnName> = diesel::sql_query(
+        "SELECT table_name || '.' || column_name AS name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND data_type = 'timestamp with time zone' \
+         AND domain_name IS DISTINCT FROM 'queue_timestamptz'",
+    )
+    .load(&mut conn)
+    .await
+    .unwrap();
+    assert!(
+        rows.is_empty(),
+        "columns outside the domain: {:?}",
+        rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+    let proof: Vec<ColumnName> = diesel::sql_query(
+        "SELECT column_name AS name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'queue_tasks' \
+         AND column_name = 'completed_at' AND domain_name = 'queue_timestamptz'",
+    )
+    .load(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(proof.len(), 1);
+    drop(conn);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn infinite_completed_at_is_rejected() {
     let db = TestDb::new().await;
     let e = exec(
