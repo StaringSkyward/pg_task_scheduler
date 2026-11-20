@@ -37,12 +37,9 @@ impl Registry {
         self.handlers.is_empty()
     }
 
-    /// Returns the inner task-name strings, for use in the `ANY($1)` claim filter.
-    pub fn names(&self) -> Vec<String> {
-        self.handlers
-            .keys()
-            .map(|n| n.as_str().to_owned())
-            .collect()
+    /// The registered task names: the claim filter and the worker registry's list.
+    pub fn task_names(&self) -> Vec<TaskName> {
+        self.handlers.keys().cloned().collect()
     }
 
     pub fn get(&self, name: &TaskName) -> Option<Handler> {
@@ -91,6 +88,7 @@ mod tests {
     use crate::ids::TaskId;
     use crate::ids::TaskKey;
     use crate::ids::WorkerId;
+    use crate::models::MaxAttempts;
     use crate::models::TaskLease;
 
     fn ctx() -> TaskContext {
@@ -99,11 +97,11 @@ mod tests {
                 task_id: TaskId(1),
                 worker_id: WorkerId::generate(),
                 lock_token: LockToken(1),
-                attempt_no: 1,
+                attempt_no: crate::AttemptNo::FIRST,
             },
             task_key: TaskKey::try_from("k").unwrap(),
             task_name: TaskName::try_from("t").unwrap(),
-            max_attempts: 3,
+            max_attempts: MaxAttempts::try_from(3u32).unwrap(),
             locked_until: Utc::now(),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }

@@ -9,7 +9,8 @@ scheduled tasks, and retries all use the same `due_at` mechanism.
 releases.
 
 Requires PostgreSQL 13 or later, Rust 1.88 or later, Tokio, Diesel 2.3 and
-`diesel-async` 0.9.
+`diesel-async` 0.9. The migrations require a UTF8 database, and fail at once in
+any other encoding.
 
 Try it locally with the example app: `docker compose up` in
 [example-app/](https://github.com/StaringSkyward/pg_task_scheduler/tree/main/example-app) starts a demo with a web page, two
@@ -18,22 +19,30 @@ workers and the admin UI.
 ## Guarantees
 
 - **Idempotent enqueue:** each producer-supplied `task_key` maps to exactly one
-  logical task for the idempotency horizon. A retried enqueue returns the
-  existing task. The same key with different content is rejected as an
-  idempotency conflict.
+  logical task while its row is kept (30 days by default). A retried enqueue returns the
+  existing task when the task name is the same and the stored arguments, decoded as
+  `T::Args`, equal the new ones by `PartialEq` (equal `HashSet`s match in any
+  order). Anything else, including a stored payload that does not decode, is
+  rejected as an idempotency conflict. Typed producers reject arguments that JSON cannot
+  preserve: they must decode back equal.
 - **Atomic enqueue with domain state:** enqueue on the caller's connection, and
   the task commits or rolls back with the caller's own writes.
 - **One valid owner per attempt:** ownership is the task id, `locked_by`, a
   monotonically increasing `lock_token`, and an unexpired `locked_until`. Every
   worker transition checks all four.
-- **Hard leases:** once `locked_until` passes, the old worker can no longer
+- **Hard leases:** a transition checks the lease when it runs, after it has
+  locked the row. Once `locked_until` has passed, the old worker can no longer
   heartbeat, complete, retry, or fail the task, even if the reaper has not run.
 - **Exactly-once PostgreSQL-contained effects:** business writes and the `done`
   transition can share one transaction.
 - **At-least-once external effects:** a worker can perform a remote effect and
-  crash before recording completion. External effects are effectively
-  exactly-once only when the destination deduplicates by `task_key` (or fences
-  by `lock_token`).
+  crash before recording completion, and the retry performs it again. A
+  non-idempotent effect needs deduplication on the receiving side, keyed to the
+  logical effect (for example by `task_key`). Fencing by `lock_token` does not
+  replace it: it only rejects a stale write from an earlier owner, and a retry
+  carries a newer token, so it passes the fence. Tokens are ordered per task
+  row, and a `task_key` can be reused after retention, so scope a remote fence
+  to the task id.
 - **Best-effort priority:** `FOR UPDATE SKIP LOCKED` can skip a locked
   high-priority task and run a lower one. Priority applies within a queue; use
   queues to isolate work that must not starve.
@@ -56,12 +65,15 @@ version:
 
 | File | Contents |
 | --- | --- |
-| `migrations/0001_create_queue_tables/up.sql` | `queue_tasks`, `queue_task_attempts`, `queue_outbox` |
-| `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` (only with the `cron` feature) |
-| `migrations/0003_admin/up.sql` | `cancelled` task and attempt status; `queue_admin_actions`; `queue_pauses`; `queue_workers`; `queue_tasks.admin_action_id`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
+| `migrations/0001_create_queue_tables/up.sql` | the UTF8 check; `queue_is_identifier`, the identifier rule that every identifier column's CHECK calls; `queue_tasks` (with the `cancelled` status and `admin_action_id`), `queue_task_attempts`, `queue_outbox` |
+| `migrations/0002_create_schedule_tables/up.sql` | `scheduler_jobs` and `scheduler_job_pauses` (only with the `cron` feature) |
+| `migrations/0003_admin/up.sql` | `queue_admin_actions`; `queue_pauses`; `queue_workers`, `queue_worker_queues`, `queue_worker_task_names`; partial indexes on dead/cancelled tasks (none on `queue_task_attempts`, so closing an attempt can stay a HOT update) |
 
 Every user needs `0003`, whether or not they run the admin UI: cancel, pause and
 the worker registry are part of the core crate and always on.
+
+Roles that write the queue tables need EXECUTE on `queue_is_identifier(text)`,
+which PUBLIC has by default.
 
 ## Enqueue
 
@@ -77,7 +89,7 @@ impl Task for SendEmail {
     type Args = SendEmailArgs;
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
 struct SendEmailArgs {
     user_id: uuid::Uuid,
 }
@@ -100,11 +112,31 @@ queue is not part of idempotency equality: re-enqueueing a key with another queu
 returns the existing task. When the
 connection is inside a transaction, the task and its `queue_available`
 notification commit with the caller's data. Run producers at `READ COMMITTED`.
+Every direct store caller needs `READ COMMITTED`: the transitions' recheck after
+a lock wait, `ensure_job`'s recreate-on-delete and claim rely on it, and under
+`REPEATABLE READ` they fail with a `40001` serialization error rather than their
+documented outcome. The materializer enforces it itself.
 
-**Idempotency horizon:** a `task_key` stays reserved while its row exists. Rows
-are kept for at least `Retention::idempotency_horizon` (default 7 days), and
-workers refuse a retention shorter than that. Producers must not reuse a key
-within the horizon for a different logical task.
+**Arguments:** `Task::Args` must be `PartialEq`. A typed producer stores
+arguments only if they decode back equal to the caller's value, both from the
+JSON it sends and from what PostgreSQL stores, and writes nothing if not.
+JSON cannot represent every value: `Some(f64::INFINITY)` is written as `null`
+and decodes as `None`, so it is `SchedulerError::PayloadNotPreserved`. So is
+an `f64` of `1e18` when the type decodes the integer JSONB normalizes it to
+(`1000000000000000000`) as a different value, such as an untagged enum picking
+another variant. A plain `f64` field is accepted, because the integer decodes
+back as an equal `f64`.
+Arguments the worker cannot parse back or decode as `T::Args` at all (nested
+deeper than 128, or a bare `f64` NaN) are `SchedulerError::Serde`. With
+`Args = serde_json::Value`, any `f64` of magnitude 1e16 or more in the 64-bit
+integer range, such as `json!({"x": 1e18})`, is rejected: `serde_json` writes
+it in exponent form, and the handler would receive an integer. This check costs
+one extra round trip per `enqueue`.
+
+**Idempotency horizon:** a `task_key` stays reserved while its row exists, which
+is `Retention::done` after completion for done tasks and `Retention::dead` for
+dead and cancelled ones (30 days by default). Producers must not reuse a key
+within that time for a different logical task.
 
 ## Worker
 
@@ -246,11 +278,13 @@ progress keyed by `task_key`.
 
 Each worker keeps a row in `queue_workers`, for display only: claims, ownership
 and health never read it. The row holds its label, status (`starting`,
-`healthy`, `degraded` or `stopping`), last error, task names, and per queue the
-limit, handlers in use, whether the queue is paused, and when one of its
-dispatches there last ended. The worker writes it at start and every
-`registry_interval`, marks it `stopping` when shutdown begins, and deletes it
-once the drain ends. Each shutdown write is bounded by 0.5 s, so a stalled
+`healthy`, `degraded` or `stopping`) and last error; its task names and, per
+queue, the limit, handlers in use, and when one of its dispatches there last
+ended are rows of `queue_worker_task_names` and `queue_worker_queues`. Whether
+each queue is paused is read from `queue_pauses` when the workers are listed.
+The worker writes these rows at start and every `registry_interval`, in one
+transaction, marks its row `stopping` when shutdown begins, and deletes it once
+the drain ends. Each shutdown write is bounded by 0.5 s, so a stalled
 database adds at most 1 s to shutdown. `store::workers` lists the rows, live
 workers first. A row not written for 3 × `registry_interval` reads as `lost`
 (for example, the process was killed), and every worker's maintenance deletes
@@ -262,7 +296,7 @@ health.
   `HOSTNAME` environment variable when that is set and non-empty, and otherwise
   the worker id is shown.
 - `.registry_interval(d)` sets how often the row is written (default 15 s;
-  `build()` rejects zero and anything over 5 years).
+  `build()` rejects anything under 1 µs or over 5 years).
 
 Since the row is a periodic snapshot, it lags: a new worker reads `starting`
 until its second write, a draining worker's row is not refreshed after its
@@ -301,8 +335,12 @@ async fn ship_order(
 }
 ```
 
-The lease must outlast the transaction. A transaction that finishes after
-`locked_until` cannot complete the task, and it rolls back.
+In the runtime, the whole transaction, including its commit, must finish within
+the lease: a handler holding the row lock (`lock_owned`) makes every heartbeat
+wait on it, so the lease cannot be extended meanwhile, and the worker drops a
+handler whose lease deadline passes, abandoning its transaction. A direct store
+caller that commits after `locked_until` still holds exclusive ownership, because
+the row lock keeps the reaper and every other worker away; it does not roll back.
 
 ### Transactional outbox
 
@@ -311,20 +349,28 @@ To emit a command for later delivery, complete with
 ownership-guarded completion succeeds:
 
 ```rust,no_run
-# use pg_task_scheduler::{OutboxCommand, SchedulerError, TaskContext, store};
+# use pg_task_scheduler::{CommandKey, EffectName, OutboxCommand, OutboxWrite, SchedulerError, TaskContext, Topic, store};
 # async fn example(conn: &mut diesel_async::AsyncPgConnection, ctx: &TaskContext) -> Result<(), SchedulerError> {
 let command = OutboxCommand {
-    effect_name: "order-shipped".into(),
-    // Any unambiguous, stable encoding of (task_key, effect_name).
-    command_key: serde_json::to_string(&(ctx.task_key.as_str(), "order-shipped"))?,
-    topic: "orders".into(),
+    effect_name: EffectName::try_from("order-shipped")?,
+    // Any unambiguous, stable encoding of (task_key, effect_name), at most 2048 bytes;
+    // hash it (for example a hex SHA-256) if very long keys could exceed that.
+    command_key: CommandKey::try_from(serde_json::to_string(&(ctx.task_key.as_str(), "order-shipped"))?)?,
+    topic: Topic::try_from("orders")?,
     payload: serde_json::json!({ "order": 12345 }),
 };
-let inserted = store::complete_with_outbox(conn, &ctx.lease, &command).await?;
-# let _ = inserted;
+match store::complete_with_outbox(conn, &ctx.lease, &command).await? {
+    OutboxWrite::Inserted => {}        // a new outbox row was written
+    OutboxWrite::AlreadyPresent => {}  // an earlier attempt wrote the same command
+}
 # Ok(())
 # }
 ```
+
+If the task already has a row for the same `effect_name` but with a different
+command key, topic or payload, `complete_with_outbox` returns
+`SchedulerError::OutboxConflict` and the completion rolls back. Propagating it
+with `?` fails the task permanently.
 
 Publishing `queue_outbox` rows is the application's job. The relay must set
 `published_at`, and receivers must deduplicate by `command_key`.
@@ -349,7 +395,8 @@ Advice for choosing queues, sizing workers and deploying. The API is in
   and splits capacity.
 - Set the queue on the task type (`Task::QUEUE`). Use `EnqueueOptions::queue`
   only to route a single call, such as a backfill of a task type that normally
-  runs live. Cron schedules set it with `CreateJob::queue`.
+  runs live. Cron schedules built with `CreateJob::for_task` take `Task::QUEUE`;
+  `CreateJob::queue` overrides it.
 - Queue names should be short, lowercase and stable, and describe the kind of
   work rather than the team that owns it.
 - To rename a queue without stranding tasks:
@@ -380,7 +427,7 @@ no tasks, only a valid name. `store::paused_queues` lists the pauses.
   and retries.
 - Run separate deployments for queues that scale differently. Each process
   configures only its own queues.
-- Size the pool at the sum of the queue limits + 2 per scheduler, plus whatever
+- Size the pool at the sum of the queue limits + 5 per scheduler, plus whatever
   handlers take (see Connections under [Operations](#operations)). Keep
   (instances × pool size) under PostgreSQL's `max_connections`, with room to
   spare.
@@ -430,6 +477,12 @@ scanning retained rows (see
 
 ## Operations
 
+- **Database TLS:** `AsyncPgConnection::establish` connects without TLS. For a
+  database that requires TLS, build the pool with a TLS-capable connection
+  through `diesel_async::pooled_connection::ManagerConfig::custom_setup`; this
+  crate's pools accept it unchanged. See the
+  [`AsyncPgConnection` documentation](https://docs.rs/diesel-async/0.9/diesel_async/struct.AsyncPgConnection.html)
+  for a TLS example.
 - **Reaper:** every worker runs it every `reaper_interval`. Expired leases go
   back to `queued` after `crash_retry_delay`, or to `dead` when no attempts
   remain. Running it on many instances is safe.
@@ -463,12 +516,13 @@ scanning retained rows (see
   exact `last_error`) act on a task name, and optionally one queue. They work in
   batches of `BULK_BATCH` (500), each one statement and transaction, until a
   batch comes back short, or until the budget (`BULK_BUDGET`, 10 s) has run out
-  after a full batch. Then `more_remain` is `true`: call again, which is a new
-  action. Each call records one `queue_admin_actions` row, with its `affected`
+  after a full batch. `BulkOutcome::stopped` says which: `BudgetSpent` (call
+  again, which is a new action) or `ShortBatch`. Each call records one `queue_admin_actions` row, with its `affected`
   count and `max_task_id`, and touches only tasks with an id up to the highest
   one when it started, so it ends even while producers keep enqueuing. Rows
   locked elsewhere are skipped, so concurrent calls split the work; for the same
-  reason `more_remain = false` does not prove that nothing matching is left.
+  reason a `ShortBatch` does not prove that nothing matching is left; calling
+  again catches the skipped rows.
   `count_cancellable` and `count_replayable` count up to a cap. Cancel by name
   reads every queued and running row through their partial indexes (never the
   retained done, dead and cancelled rows) and filters by name: an index on the
@@ -490,18 +544,27 @@ scanning retained rows (see
   Status becomes stopped when `run_until_shutdown` returns or its future is
   dropped.
 - **Timeouts:** set `statement_timeout` and `lock_timeout` on pool connections.
-  Queue statements are short.
+  Queue statements are short. The worker's heartbeat bounds its own
+  transaction by the time left on its lease, but never raises a stricter
+  `lock_timeout` or `statement_timeout` the host set.
 - **Connections:** each running scheduler holds one pool connection for
-  `LISTEN queue_available`, and briefly takes others for claims, heartbeats,
-  finalization, and maintenance. Handlers hold no connection unless they take
-  one. Per scheduler sharing a pool, that is 1 for `LISTEN`, 1 for claims and
-  maintenance, and up to the sum of queue limits for heartbeats and
-  finalization, plus one per handler that takes its own. So set the pool's
-  `max_size` to at least the sum of queue limits + 2 per scheduler, plus whatever
-  handlers take. A smaller pool starves heartbeats until local deadlines drop
-  handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4 on a
-  2-vCPU host), well below the 16 + 2 = 18 that the default queue's limit of 16
-  needs.
+  `LISTEN queue_available`, and takes others for claims, heartbeats,
+  finalization, maintenance, the worker registry, and dead-lettering. Handlers
+  hold no connection unless they take one. Maintenance, the registry and
+  dead-lettering each run on a task of their own, so a stalled database can
+  hold all three connections at once. Per scheduler sharing a pool, that is
+  one connection each for `LISTEN`, the claim loop (claims and cron
+  materialization), maintenance, the worker registry, and dead-lettering
+  claimed rows that direct SQL made unusable (a payload or count the types
+  reject), and up to the sum of queue limits for heartbeats and finalization.
+  So set the pool's `max_size` to at least the sum of queue limits + 5 per
+  scheduler. On top of that, a handler that finishes while its heartbeat
+  transaction is still in flight briefly holds a second connection, and its
+  finishing update waits on that transaction's row lock anyway. Add whatever
+  handlers and the host take. A smaller pool starves heartbeats until local
+  deadlines drop handlers. Deadpool's default `max_size` is 2 × the logical
+  CPU count (4 on a 2-vCPU host), well below the 16 + 5 = 21 that the default
+  queue's limit of 16 needs.
 
 ### Observability
 
@@ -574,14 +637,46 @@ in [GitHub issues](https://github.com/StaringSkyward/pg_task_scheduler/issues).
 ## Recurring Schedules
 
 With the `cron` feature, `jobs::create`, `jobs::ensure_job`, pause/resume, and
-reschedule manage rows in `scheduler_jobs`. Each due occurrence becomes an
-ordinary queue task with `task_key = "schedule:{id}:{scheduled_for}"`, so a
-re-materialized occurrence never creates a second task. Every running scheduler
-materializes due schedules at most once per `max_poll_interval`, so an occurrence
-becomes a task within `max_poll_interval` of its time. Deleting or editing a
-schedule does not change tasks it already created. After downtime, one
-occurrence is created for the missed slot (`run_once`). `CreateJob::queue(..)`
-picks the queue for the tasks a schedule produces (default `default`).
+reschedule manage rows in `scheduler_jobs`. A schedule has its own unique name
+(`ScheduleName`) and names the task each occurrence runs (`TaskName`), so one
+handler can have several schedules, such as `digest-hourly` and `digest-daily`.
+Build the schedule with `CreateJob::for_task::<T>(name, cron, max_attempts,
+lifecycle, args)`: the task name, queue and argument type come from `T`.
+`CreateJob::new(name, task_name, ...)` is the untyped alternative, for a task
+whose type is not at hand; it takes any serializable `args` and the `default`
+queue. `CreateJob::queue(..)` overrides the queue for either. `jobs::create` and
+`jobs::ensure_job` check a `for_task` schedule's arguments as `enqueue` does
+(see [Enqueue](#enqueue)), and return `PayloadNotPreserved` without writing if
+storage would change them.
+
+Each due occurrence becomes an ordinary queue task with
+`task_key = "schedule:{id}:{scheduled_for}"`, so a re-materialized occurrence
+never creates a second task. Every running scheduler wakes to materialize due
+schedules once per `max_poll_interval`, and each wake runs one bounded pass of
+at most 100 due schedules. A larger backlog catches up over later passes, and
+query time and lock contention add to the delay, so `max_poll_interval` is the
+cadence, not a bound on how late an occurrence becomes a task. Deleting or
+editing a schedule does not change tasks it already created. After downtime,
+one occurrence is created for the missed slot (`run_once`). Task keys starting
+with `schedule:` are reserved for schedule occurrences; `enqueue` rejects such
+keys with `ReservedTaskKey`. The first materialization of an occurrence defines
+its content, for as long as its task row is retained: re-pointing a schedule at
+a slot it already ran creates nothing new.
+
+A paused schedule has a row in `scheduler_job_pauses`; `jobs::pause` adds it and
+`jobs::resume` removes it. `ensure_job` reconciles a schedule's configuration but
+never its pause state or `next_run_at`, so a redeploy cannot resume a schedule an
+operator paused. Deleting a schedule deletes its pause, so a schedule recreated
+under the same name does not inherit it. Where a schedule's defect shows
+depends on what is wrong:
+
+- **Arguments:** an argument the worker cannot parse dead-letters that
+  occurrence's task, and the schedule keeps advancing. Such arguments come from
+  direct SQL, or from `CreateJob::new` with the wrong type for the handler.
+- **Cron or routing:** a bad cron expression, task name, queue or `max_attempts`
+  (only possible through direct SQL, and for a task name or queue only once its
+  CHECK is dropped) pauses the schedule, with an error logged, rather than
+  stopping other schedules.
 
 ## Feature Flags
 

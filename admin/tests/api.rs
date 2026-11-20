@@ -59,10 +59,30 @@ async fn list_jobs_returns_view() {
         serde_json::json!([{
             "id": id.to_string(),
             "name": "j",
+            "task_name": "j",
             "cron_expression": "*/5 * * * *",
             "is_paused": false,
         }])
     );
+    db.cleanup().await;
+}
+
+#[cfg(feature = "cron")]
+#[tokio::test]
+async fn list_jobs_survives_unreadable_args() {
+    let db = TestDb::new().await;
+    let id = db
+        .insert_job(
+            "j",
+            "*/5 * * * *",
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+    db.make_job_args_unreadable(id).await;
+    let (status, body) = send(app(&db), Method::GET, "/api/jobs".into(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
     db.cleanup().await;
 }
 
@@ -101,6 +121,7 @@ async fn resume_existing_204_missing_404() {
     let db = TestDb::new().await;
     let id = db
         .insert_job_full(
+            "j",
             "j",
             "*/5 * * * *",
             chrono::Utc::now() + chrono::Duration::hours(1),
@@ -206,7 +227,9 @@ async fn task_route_returns_view_and_404() {
     assert_eq!(v["status"], "queued");
     assert_eq!(v["attempts"], 0);
     assert!(v["locked_by"].is_null() && v["last_error"].is_null() && v["completed_at"].is_null());
-    assert!(v["task_key"].is_string() && v["due_at"].is_string() && v["max_attempts"].is_i64());
+    assert!(
+        v["task_key"]["valid"].is_string() && v["due_at"].is_string() && v["max_attempts"].is_i64()
+    );
     let (status, _) = send(app.clone(), Method::GET, "/api/tasks/999999".into(), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = send(
@@ -217,6 +240,95 @@ async fn task_route_returns_view_and_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    db.cleanup().await;
+}
+
+/// `payload` is `{"json": ...}`, or `{"unreadable": {"text", "error"}}` for a stored payload
+/// `serde_json` cannot parse, which the claim poisons and the caller dead-letters.
+#[tokio::test]
+async fn task_route_payload_is_json_or_unreadable() {
+    let db = TestDb::new().await;
+    let readable = enqueue_one(&db).await;
+    let unreadable = db
+        .scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'admin-task', '{\"x\":1e500}'::jsonb) RETURNING id) \
+             SELECT id AS n FROM t",
+        )
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let batch = pg_task_scheduler::store::claim(
+        &mut conn,
+        &pg_task_scheduler::WorkerId::generate(),
+        &pg_task_scheduler::QueueName::default(),
+        &[pg_task_scheduler::TaskName::try_from("admin-task").unwrap()],
+        std::num::NonZeroU32::new(2).unwrap(),
+        common::lease(std::time::Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    for poisoned in &batch.poisoned {
+        pg_task_scheduler::store::dead_letter(&mut conn, poisoned)
+            .await
+            .unwrap();
+    }
+    let get = |id: i64| send(app(&db), Method::GET, format!("/api/tasks/{id}"), None);
+
+    let (status, body) = get(readable.0).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["payload"], serde_json::json!({"json": {}}));
+    assert!(v.get("payload_error").is_none());
+
+    let (status, body) = get(unreadable).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "dead");
+    let p = v["payload"].as_object().unwrap();
+    assert_eq!(p.keys().collect::<Vec<_>>(), ["unreadable"]);
+    // PostgreSQL prints the numeric expanded, not as `1e500`.
+    let text = p["unreadable"]["text"].as_str().unwrap();
+    assert!(text.starts_with(r#"{"x": 1000"#), "{text}");
+    assert!(!p["unreadable"]["error"].as_str().unwrap().is_empty());
+    assert!(v.get("payload_error").is_none());
+    db.cleanup().await;
+}
+
+/// `task_key` is `{"valid": ...}`, or `{"invalid": {"text", "error"}}` for a stored key that
+/// fails the identifier policy; such a dead letter still opens.
+#[tokio::test]
+async fn task_route_task_key_is_valid_or_invalid() {
+    let db = TestDb::new().await;
+    let good = enqueue_one(&db).await;
+    // Simulates a database whose CHECK was dropped by hand, which `StoredTaskKey` still covers.
+    db.drop_constraint("queue_tasks", "queue_tasks_task_key_identifier")
+        .await;
+    let bad = db
+        .scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name) \
+             VALUES (repeat('x', 300), 'admin-task') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await;
+    let get = |id: i64| send(app(&db), Method::GET, format!("/api/tasks/{id}"), None);
+
+    let (status, body) = get(good.0).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["task_key"]["valid"].is_string(), "{v}");
+
+    let (status, body) = get(bad).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["task_key"]["invalid"]["text"].as_str().unwrap().len(),
+        300
+    );
+    assert!(
+        !v["task_key"]["invalid"]["error"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
     db.cleanup().await;
 }
 
@@ -259,7 +371,7 @@ async fn replay_route_requeues_dead_task_and_409s_otherwise() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, pg_task_scheduler::TaskStatus::Queued);
+    assert_eq!(t.state.status(), pg_task_scheduler::TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     let n = db
         .scalar(&format!(
@@ -304,7 +416,7 @@ async fn replay_route_requires_reason() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, pg_task_scheduler::TaskStatus::Dead);
+    assert_eq!(t.state.status(), pg_task_scheduler::TaskStatus::Dead);
     let req = serde_json::json!({ "reason": "  fixed  " });
     let (status, _) = send(app(&db), Method::POST, uri, Some(req)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);

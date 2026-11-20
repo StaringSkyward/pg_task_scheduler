@@ -1,9 +1,12 @@
 mod common;
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,6 +18,7 @@ use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::HealthStatus;
 use pg_task_scheduler::MaxAttempts;
@@ -27,6 +31,7 @@ use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::TaskView;
 use pg_task_scheduler::WorkerId;
@@ -94,13 +99,13 @@ async fn wait_for(db: &TestDb, id: TaskId, status: TaskStatus, timeout: Duration
             let mut conn = db.pool.get().await.unwrap();
             store::task(&mut conn, id).await.unwrap().unwrap()
         };
-        if t.status == status {
+        if t.state.status() == status {
             return t;
         }
         assert!(
             start.elapsed() < timeout,
             "task still {:?} after {timeout:?}, wanted {status:?}",
-            t.status
+            t.state
         );
         tokio::time::sleep(ms(20)).await;
     }
@@ -112,7 +117,7 @@ async fn outcomes(db: &TestDb, id: TaskId) -> Vec<Option<AttemptOutcome>> {
         .await
         .unwrap()
         .into_iter()
-        .map(|a| a.outcome)
+        .map(|a| common::outcome(&a))
         .collect()
 }
 
@@ -211,12 +216,15 @@ async fn retryable_error_requeues_with_backoff_then_dies() {
     assert_eq!(task.last_error.as_deref(), Some("flaky"));
     let mut conn = db.pool.get().await.unwrap();
     let attempts = store::attempts(&mut conn, id).await.unwrap();
-    let got: Vec<_> = attempts.iter().map(|a| a.outcome).collect();
+    let got: Vec<_> = attempts.iter().map(common::outcome).collect();
     assert_eq!(
         got,
         [Some(AttemptOutcome::Retry), Some(AttemptOutcome::Dead)]
     );
-    let gap = attempts[1].started_at - attempts[0].finished_at.unwrap();
+    let AttemptState::Closed { finished_at, .. } = attempts[0].state else {
+        panic!("first attempt still open");
+    };
+    let gap = attempts[1].started_at - finished_at;
     assert!(
         gap >= chrono::Duration::milliseconds(200),
         "backoff gap {gap}"
@@ -248,6 +256,25 @@ async fn permanent_error_marks_dead_after_one_attempt() {
 }
 
 #[tokio::test]
+async fn permanent_failure_with_a_nul_in_its_message_is_recorded() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .register_task::<Job, _, _>(|_ctx, _args| async { Err(TaskError::permanent("bad\0news")) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    let task = wait_for(&db, id, TaskStatus::Dead, Duration::from_secs(5)).await;
+    assert_eq!(task.attempts, 1);
+    assert_eq!(task.last_error.as_deref(), Some("bad\\0news"));
+
+    run.stop().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn interrupted_without_shutdown_is_a_counted_retry() {
     let db = TestDb::new().await;
     let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
@@ -268,7 +295,7 @@ async fn interrupted_without_shutdown_is_a_counted_retry() {
     let mut conn = db.pool.get().await.unwrap();
     let task = store::task(&mut conn, id).await.unwrap().unwrap();
     drop(conn);
-    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.state.status(), TaskStatus::Queued);
     assert_eq!(task.attempts, 1, "outside shutdown the attempt counts");
     assert!(task.due_at > Utc::now() + chrono::Duration::minutes(30));
 
@@ -320,7 +347,161 @@ async fn db_contained_handler_survives_heartbeat_while_holding_row_lock() {
     wait_for(&db, id, TaskStatus::Done, Duration::from_secs(3)).await;
     assert_eq!(db.scalar("SELECT count(*) AS n FROM effects").await, 1);
     assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
+    // A cancelled heartbeat must not leave a transaction open on the row.
+    let mut idle = -1;
+    for _ in 0..50 {
+        idle = db
+            .scalar(
+                "SELECT count(*) AS n FROM pg_locks l \
+                 JOIN pg_stat_activity a ON a.pid = l.pid \
+                 WHERE a.state = 'idle in transaction' AND a.pid <> pg_backend_pid() \
+                 AND l.relation = 'queue_tasks'::regclass",
+            )
+            .await;
+        if idle == 0 {
+            break;
+        }
+        tokio::time::sleep(ms(100)).await;
+    }
+    assert_eq!(idle, 0, "idle-in-transaction backend left behind");
 
+    run.stop().await;
+    db.cleanup().await;
+}
+
+async fn locked_until(db: &TestDb, id: TaskId) -> chrono::DateTime<Utc> {
+    let mut conn = db.pool.get().await.unwrap();
+    match store::task(&mut conn, id).await.unwrap().unwrap().state {
+        TaskState::Running { locked_until, .. } => locked_until,
+        other => panic!("task not running: {other:?}"),
+    }
+}
+
+/// Dropping the scheduler future ends its dispatches, so a heartbeat already waiting on the
+/// row lock renews nothing once the lock is free.
+#[tokio::test]
+async fn dropped_scheduler_does_not_renew_a_pending_heartbeat() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(600))
+        .heartbeat_interval(ms(150))
+        .register_task::<Job, _, _>(|_ctx, _args| async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    wait_for(&db, id, TaskStatus::Running, Duration::from_secs(3)).await;
+
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM queue_tasks WHERE id = {} FOR UPDATE",
+            id.0
+        ))
+        .await
+        .unwrap();
+    // This test's schema resolves the regclass, so only its own heartbeat counts.
+    let start = Instant::now();
+    while db
+        .scalar(
+            "SELECT count(*) AS n FROM pg_locks l \
+             JOIN pg_stat_activity a ON a.pid = l.pid \
+             WHERE a.wait_event_type = 'Lock' AND l.relation = 'queue_tasks'::regclass",
+        )
+        .await
+        == 0
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "no heartbeat blocked on the row lock"
+        );
+        tokio::time::sleep(ms(10)).await;
+    }
+
+    run.handle.abort();
+    assert!(run.handle.await.unwrap_err().is_cancelled());
+    let before = locked_until(&db, id).await;
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(
+        locked_until(&db, id).await,
+        before,
+        "a heartbeat renewed the lease after its scheduler was dropped"
+    );
+    db.cleanup().await;
+}
+
+/// Graceful shutdown does not stop heartbeats: a handler that ignores `ctx.cancellation` and
+/// outlives three leases while draining still completes its task.
+#[tokio::test]
+async fn draining_handler_keeps_its_lease() {
+    let db = TestDb::new().await;
+    let id = enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(300))
+        .heartbeat_interval(ms(100))
+        .reaper_interval(ms(50))
+        .shutdown_timeout(Duration::from_secs(5))
+        .register_task::<Job, _, _>(|_ctx, _args| async {
+            tokio::time::sleep(ms(1000)).await;
+            Ok(())
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    wait_for(&db, id, TaskStatus::Running, Duration::from_secs(3)).await;
+    run.stop().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let task = store::task(&mut conn, id).await.unwrap().unwrap();
+    assert_eq!(task.state.status(), TaskStatus::Done);
+    assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
+    db.cleanup().await;
+}
+
+/// A handler whose timer is due on the same poll as the lease deadline is dropped, not resumed:
+/// blocking the runtime stops heartbeats, so the local deadline passes with the handler suspended.
+#[tokio::test]
+async fn a_handler_suspended_past_its_lease_is_not_resumed() {
+    let db = TestDb::new().await;
+    enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let started = Arc::new(Notify::new());
+    let effect = Arc::new(AtomicBool::new(false));
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(300))
+        .heartbeat_interval(ms(100))
+        .register_task::<Job, _, _>({
+            let (started, effect) = (started.clone(), effect.clone());
+            move |_ctx, _args| {
+                let (started, effect) = (started.clone(), effect.clone());
+                async move {
+                    started.notify_one();
+                    tokio::time::sleep(ms(200)).await;
+                    effect.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(!AtomicBool::load(&effect, Ordering::SeqCst));
+    // No heartbeat can run meanwhile: the local deadline is at most 300 ms from here, and the
+    // handler's 200 ms timer is due too.
+    std::thread::sleep(ms(500));
+    tokio::time::sleep(ms(100)).await;
+    assert!(
+        !AtomicBool::load(&effect, Ordering::SeqCst),
+        "the handler resumed after its lease expired"
+    );
     run.stop().await;
     db.cleanup().await;
 }
@@ -435,7 +616,7 @@ async fn worker_claims_only_its_configured_queues() {
         let mut conn = db.pool.get().await.unwrap();
         store::task(&mut conn, d).await.unwrap().unwrap()
     };
-    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.state.status(), TaskStatus::Queued);
     assert_eq!(task.attempts, 0);
 
     run.stop().await;
@@ -519,12 +700,13 @@ async fn claim_elsewhere(db: &TestDb, name: &str) -> TaskId {
         &mut conn,
         &WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
-        &[name.to_owned()],
-        NonZeroUsize::MIN,
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from(name).unwrap()],
+        NonZeroU32::MIN,
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
+    .ready
     .pop()
     .unwrap()
     .lease
@@ -580,7 +762,7 @@ async fn aborted_run_stops_maintenance_and_unlistens() {
         store::task(&mut conn, other).await.unwrap().unwrap()
     };
     assert_eq!(
-        task.status,
+        task.state.status(),
         TaskStatus::Running,
         "maintenance outlived the run"
     );
@@ -663,7 +845,7 @@ async fn cleanup_backlog_does_not_starve_reaper() {
         .reaper_interval(Duration::from_secs(60)) // one pass, starting now
         .crash_retry_delay(Duration::from_secs(3600)) // keep the reaped task queued
         .retention(Retention {
-            batch_size: NonZeroUsize::MIN, // one row per cleanup batch: a long drain
+            batch_size: NonZeroU32::MIN, // one row per cleanup batch: a long drain
             ..Retention::default()
         })
         .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
@@ -796,5 +978,221 @@ async fn db_contained_completion_before_handler_returns_counts_as_done() {
     assert_eq!((counters.get(done), counters.get(lost)), (1, 0));
 
     run.stop().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn healthy_task_in_a_batch_with_a_bad_payload_runs() {
+    let db = TestDb::new().await;
+    let bad = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('bad', 'job', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let good = TaskId(
+        db.scalar(
+            "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+             VALUES ('good', 'job', '{}') RETURNING id) SELECT id AS n FROM t",
+        )
+        .await,
+    );
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
+    // Dead-lettered on its own task, after the dispatch.
+    wait_for(&db, bad, TaskStatus::Dead, Duration::from_secs(5)).await;
+
+    run.stop().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn handler_does_not_start_when_the_claim_arrives_after_its_lease() {
+    let db = TestDb::new().await;
+    // The claim's response is delayed past the lease, after the row is leased.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE FUNCTION slow_claim() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN NEW; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER slow_claim AFTER UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'running') EXECUTE FUNCTION slow_claim();",
+        )
+        .await
+        .unwrap();
+    enqueue_job(&db, "k", EnqueueOptions::immediate()).await;
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(90))
+        .heartbeat_interval(ms(30))
+        .register_task::<Job, _, _>(move |_ctx, _args| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    run.stop().await;
+
+    assert!(!std::sync::atomic::AtomicBool::load(
+        &started,
+        std::sync::atomic::Ordering::SeqCst
+    ));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn slow_dead_letter_does_not_delay_a_healthy_claim() {
+    let db = TestDb::new().await;
+    // Every dead-letter takes longer than the whole lease.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE FUNCTION slow_dead() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.25); RETURN NEW; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER slow_dead BEFORE UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'dead') EXECUTE FUNCTION slow_dead();",
+        )
+        .await
+        .unwrap();
+    // Both queued before the worker starts, so one claim takes them together.
+    db.scalar(
+        "WITH t AS (INSERT INTO queue_tasks (task_key, task_name, payload) \
+         VALUES ('bad', 'job', '{\"x\":1e500}'::jsonb) RETURNING id) SELECT id AS n FROM t",
+    )
+    .await;
+    let good = enqueue_job(&db, "good", EnqueueOptions::immediate()).await;
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = started.clone();
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .lease_duration(ms(90))
+        .heartbeat_interval(ms(30))
+        .register_task::<Job, _, _>(move |_ctx, _args| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
+    assert!(std::sync::atomic::AtomicBool::load(
+        &started,
+        std::sync::atomic::Ordering::SeqCst
+    ));
+    run.stop().await;
+    db.cleanup().await;
+}
+
+/// Maintenance, the registry and dead-lettering each hold a connection of their own: all three
+/// stalled in the database must not fill a pool sized at queue limits + 5 and starve the
+/// healthy task's claim.
+#[tokio::test]
+async fn stalled_background_work_leaves_room_for_healthy_work() {
+    let db = TestDb::new().await;
+    // The scheduler's own pool, at the stated budget (queue limit 1 + 5); the test reads
+    // through `db.pool`, so it never waits behind the scheduler.
+    let pool = db.sized_pool(6);
+    // Held outside the pool: every move to `dead` waits on the advisory lock, maintenance's
+    // outbox cleanup on `queue_outbox`, and the registry refresh on `queue_worker_task_names`.
+    let mut lock = AsyncPgConnection::establish(&common::database_url())
+        .await
+        .unwrap();
+    lock.batch_execute(&format!(
+        "SELECT pg_advisory_lock(4949); BEGIN; \
+         LOCK TABLE \"{s}\".queue_outbox, \"{s}\".queue_worker_task_names IN ACCESS EXCLUSIVE MODE",
+        s = db.schema
+    ))
+    .await
+    .unwrap();
+    // Poisoned rows due first, so the claims reach them before the healthy task.
+    db.install(
+        "CREATE FUNCTION stall_dead() RETURNS trigger AS $$ BEGIN PERFORM pg_advisory_lock(4949); PERFORM pg_advisory_unlock(4949); RETURN NEW; END $$ LANGUAGE plpgsql;
+         CREATE TRIGGER stall_dead BEFORE UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'dead') EXECUTE FUNCTION stall_dead();
+         INSERT INTO queue_tasks (task_key, task_name, payload, max_attempts, due_at)
+         SELECT 'bad' || i, 'job', '{\"x\":1e500}'::jsonb, 1, now() - interval '1 minute' FROM generate_series(1, 5) AS i;",
+    )
+    .await;
+    let good = enqueue_job(&db, "good", EnqueueOptions::immediate()).await;
+    let scheduler = Scheduler::builder(pool.clone())
+        .queue("default", n(1))
+        .unwrap()
+        .max_poll_interval(ms(35))
+        .lease_duration(Duration::from_secs(2))
+        .heartbeat_interval(ms(150))
+        .reaper_interval(ms(200))
+        .registry_interval(ms(200))
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = start(scheduler);
+
+    // Each stall is real before anything is checked: its statement waits on its lock. The
+    // relations resolve in this test's schema through `db.pool`'s search_path.
+    let advisory_waiters = "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'advisory' AND objid = 4949 AND NOT granted";
+    for (what, waiters) in [
+        ("dead-lettering", advisory_waiters),
+        (
+            "maintenance",
+            "SELECT count(*) AS n FROM pg_locks WHERE relation = 'queue_outbox'::regclass AND NOT granted",
+        ),
+        (
+            "the registry refresh",
+            "SELECT count(*) AS n FROM pg_locks WHERE relation = 'queue_worker_task_names'::regclass AND NOT granted",
+        ),
+    ] {
+        let started = Instant::now();
+        while db.scalar(waiters).await == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{what} never stalled"
+            );
+            tokio::time::sleep(ms(20)).await;
+        }
+    }
+    wait_for(&db, good, TaskStatus::Done, Duration::from_secs(5)).await;
+    // The reaper's move to `dead` would be a second waiter, but it is stalled with maintenance.
+    assert_eq!(
+        db.scalar(advisory_waiters).await,
+        1,
+        "sessions waiting to dead-letter"
+    );
+
+    lock.batch_execute("COMMIT; SELECT pg_advisory_unlock(4949)")
+        .await
+        .unwrap();
+    let started = Instant::now();
+    while db
+        .scalar("SELECT count(*) AS n FROM queue_tasks WHERE status = 'dead'")
+        .await
+        < 5
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "poisoned rows not dead after the locks were released"
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+
+    run.stop().await;
+    pool.close();
     db.cleanup().await;
 }

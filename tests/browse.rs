@@ -1,12 +1,13 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::TestDb;
 use diesel_async::SimpleAsyncConnection;
 use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::QueueName;
+use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::TaskStatus;
@@ -14,7 +15,12 @@ use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::store::AdminActionKind;
 use pg_task_scheduler::store::FailedFilter;
 use pg_task_scheduler::store::FailedStatus;
+use pg_task_scheduler::store::QueuedCursor;
 use pg_task_scheduler::store::{self};
+
+fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).unwrap()
+}
 
 async fn sql(db: &TestDb, stmt: &str) {
     let mut conn = db.pool.get().await.unwrap();
@@ -79,31 +85,40 @@ async fn queued_page_matches_claim_order_across_segments() {
     ];
     let mut conn = db.pool.get().await.unwrap();
     let q = QueueName::default();
-    let p1 = store::queued_page(&mut conn, &q, None, 2).await.unwrap();
+    let p1 = store::queued_page(&mut conn, &q, None, nz(2))
+        .await
+        .unwrap();
     assert_eq!(ids(&p1.items), want[0..2]);
     let c1 = p1.next.unwrap();
     assert!(c1.due);
     assert_eq!(c1.position, 2);
     // The second page straddles both segments.
-    let p2 = store::queued_page(&mut conn, &q, Some(&c1), 2)
+    let p2 = store::queued_page(&mut conn, &q, Some(&c1), nz(2))
         .await
         .unwrap();
     assert_eq!(ids(&p2.items), want[2..4]);
     let c2 = p2.next.unwrap();
     assert!(!c2.due);
     assert_eq!(c2.position, 4);
-    let p3 = store::queued_page(&mut conn, &q, Some(&c2), 2)
+    let p3 = store::queued_page(&mut conn, &q, Some(&c2), nz(2))
         .await
         .unwrap();
     assert_eq!(ids(&p3.items), want[4..]);
     assert!(p3.next.is_none());
     // An exactly-full last page has no next either.
-    let all = store::queued_page(&mut conn, &q, None, 5).await.unwrap();
-    assert_eq!(ids(&all.items), want);
-    assert!(all.next.is_none());
-    let other = store::queued_page(&mut conn, &QueueName::try_from("other").unwrap(), None, 5)
+    let all = store::queued_page(&mut conn, &q, None, nz(5))
         .await
         .unwrap();
+    assert_eq!(ids(&all.items), want);
+    assert!(all.next.is_none());
+    let other = store::queued_page(
+        &mut conn,
+        &QueueName::try_from("other").unwrap(),
+        None,
+        nz(5),
+    )
+    .await
+    .unwrap();
     assert!(other.items.is_empty() && other.next.is_none());
     db.cleanup().await;
 }
@@ -121,12 +136,12 @@ async fn running_page_orders_by_lease_expiry() {
     )
     .await;
     let mut conn = db.pool.get().await.unwrap();
-    let p1 = store::running_page(&mut conn, None, 2).await.unwrap();
+    let p1 = store::running_page(&mut conn, None, nz(2)).await.unwrap();
     assert_eq!(
         ids(&p1.items),
         [id_of(&db, "soon").await, id_of(&db, "mid").await]
     );
-    let p2 = store::running_page(&mut conn, p1.next.as_ref(), 2)
+    let p2 = store::running_page(&mut conn, p1.next.as_ref(), nz(2))
         .await
         .unwrap();
     assert_eq!(ids(&p2.items), [id_of(&db, "late").await]);
@@ -150,20 +165,20 @@ async fn done_and_failed_pages_newest_first_with_filters() {
     )
     .await;
     let mut conn = db.pool.get().await.unwrap();
-    let p1 = store::done_page(&mut conn, None, 1).await.unwrap();
+    let p1 = store::done_page(&mut conn, None, nz(1)).await.unwrap();
     assert_eq!(ids(&p1.items), [id_of(&db, "d2").await]);
-    let p2 = store::done_page(&mut conn, p1.next.as_ref(), 1)
+    let p2 = store::done_page(&mut conn, p1.next.as_ref(), nz(1))
         .await
         .unwrap();
     assert_eq!(ids(&p2.items), [id_of(&db, "d1").await]);
     assert!(p2.next.is_none());
-    assert_eq!(p2.items[0].status, TaskStatus::Done);
+    assert_eq!(p2.items[0].state.status(), TaskStatus::Done);
 
     let f = FailedFilter {
         task_name: Some(TaskName::try_from("a").unwrap()),
         last_error: Some("x".into()),
     };
-    let p = store::failed_page(&mut conn, FailedStatus::Dead, &f, None, 10)
+    let p = store::failed_page(&mut conn, FailedStatus::Dead, &f, None, nz(10))
         .await
         .unwrap();
     assert_eq!(
@@ -173,16 +188,22 @@ async fn done_and_failed_pages_newest_first_with_filters() {
     assert!(p.next.is_none());
     // Unfiltered, paged: newest first, then the cursor continues.
     let none = FailedFilter::default();
-    let p1 = store::failed_page(&mut conn, FailedStatus::Dead, &none, None, 3)
+    let p1 = store::failed_page(&mut conn, FailedStatus::Dead, &none, None, nz(3))
         .await
         .unwrap();
     assert_eq!(p1.items.len(), 3);
-    let p2 = store::failed_page(&mut conn, FailedStatus::Dead, &none, p1.next.as_ref(), 3)
-        .await
-        .unwrap();
+    let p2 = store::failed_page(
+        &mut conn,
+        FailedStatus::Dead,
+        &none,
+        p1.next.as_ref(),
+        nz(3),
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&p2.items), [id_of(&db, "dead1").await]);
     assert!(p2.next.is_none());
-    let c = store::failed_page(&mut conn, FailedStatus::Cancelled, &none, None, 10)
+    let c = store::failed_page(&mut conn, FailedStatus::Cancelled, &none, None, nz(10))
         .await
         .unwrap();
     assert_eq!(ids(&c.items), [id_of(&db, "canc").await]);
@@ -203,12 +224,13 @@ async fn task_detail_has_attempts_and_actions() {
         &mut conn,
         &WorkerId::generate(),
         &QueueName::default(),
-        &["job".to_owned()],
-        NonZeroUsize::new(1).unwrap(),
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from("job").unwrap()],
+        NonZeroU32::new(1).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
+    .ready
     .pop()
     .unwrap();
     store::retry(&mut conn, &claimed.lease, "boom", Duration::from_secs(3600))
@@ -217,10 +239,10 @@ async fn task_detail_has_attempts_and_actions() {
     store::cancel(&mut conn, id, "ops", "why").await.unwrap();
 
     let d = store::task_detail(&mut conn, id).await.unwrap().unwrap();
-    assert_eq!(d.task.status, TaskStatus::Cancelled);
+    assert_eq!(d.task.state.status(), TaskStatus::Cancelled);
     assert_eq!(d.attempts.len(), 1);
-    assert_eq!(d.attempts[0].outcome, Some(AttemptOutcome::Retry));
-    assert_eq!(d.actions[0].action, AdminActionKind::Cancel);
+    assert_eq!(common::outcome(&d.attempts[0]), Some(AttemptOutcome::Retry));
+    assert_eq!(d.actions[0].kind(), AdminActionKind::Cancel);
     assert!(
         store::task_detail(&mut conn, TaskId(id.0 + 1000))
             .await
@@ -253,7 +275,7 @@ async fn queued_page_resumes_inside_equal_priority_group() {
     ];
     let mut conn = db.pool.get().await.unwrap();
     let q = QueueName::default();
-    let seen = walk!(cursor => store::queued_page(&mut conn, &q, cursor, 1));
+    let seen = walk!(cursor => store::queued_page(&mut conn, &q, cursor, nz(1)));
     assert_eq!(seen, want);
     db.cleanup().await;
 }
@@ -272,7 +294,7 @@ async fn queued_page_breaks_ties_by_id() {
     .await;
     let mut conn = db.pool.get().await.unwrap();
     let q = QueueName::default();
-    let seen = walk!(cursor => store::queued_page(&mut conn, &q, cursor, 2));
+    let seen = walk!(cursor => store::queued_page(&mut conn, &q, cursor, nz(2)));
     let mut sorted = seen.clone();
     sorted.sort_by_key(|i| i.0);
     sorted.dedup();
@@ -294,12 +316,13 @@ async fn done_and_failed_pages_break_completed_at_ties_by_id() {
     )
     .await;
     let mut conn = db.pool.get().await.unwrap();
-    let done = walk!(cursor => store::done_page(&mut conn, cursor, 2));
+    let done = walk!(cursor => store::done_page(&mut conn, cursor, nz(2)));
     let f = FailedFilter {
         task_name: Some(TaskName::try_from("a").unwrap()),
         last_error: None,
     };
-    let dead = walk!(cursor => store::failed_page(&mut conn, FailedStatus::Dead, &f, cursor, 2));
+    let dead =
+        walk!(cursor => store::failed_page(&mut conn, FailedStatus::Dead, &f, cursor, nz(2)));
     for seen in [done, dead] {
         let mut want = seen.clone();
         want.sort_by_key(|i| std::cmp::Reverse(i.0));
@@ -307,5 +330,79 @@ async fn done_and_failed_pages_break_completed_at_ties_by_id() {
         assert_eq!(seen.len(), 5);
         assert_eq!(seen, want);
     }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn first_pages_include_timestamps_past_year_9999() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) VALUES \
+         ('done', 'a', 'done', '10000-01-01 00:00:00+00'), \
+         ('dead', 'a', 'dead', '10000-01-01 00:00:00+00')",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let done = store::done_page(&mut conn, None, nz(10)).await.unwrap();
+    assert_eq!(ids(&done.items), [id_of(&db, "done").await]);
+    let dead = store::failed_page(
+        &mut conn,
+        FailedStatus::Dead,
+        &FailedFilter::default(),
+        None,
+        nz(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&dead.items), [id_of(&db, "dead").await]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_last_instant_chrono_can_hold_appears_on_a_first_page() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) VALUES \
+         ('last', 'a', 'done', '262142-12-31 23:59:59.999999+00')",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let done = store::done_page(&mut conn, None, nz(10)).await.unwrap();
+    assert_eq!(ids(&done.items), [id_of(&db, "last").await]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn largest_page_limit_does_not_overflow() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let page = store::running_page(&mut conn, None, NonZeroU32::MAX)
+        .await
+        .unwrap();
+    assert!(page.items.is_empty() && page.next.is_none());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn queued_cursor_at_max_position_is_invalid() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, due_at) \
+         SELECT 'k' || g, 'job', now() - interval '1 hour' FROM generate_series(1, 2) g",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let after = QueuedCursor {
+        due: true,
+        priority: i32::MAX,
+        due_at: chrono::Utc::now() - chrono::Duration::days(1),
+        id: 0,
+        position: i64::MAX,
+    };
+    let r = store::queued_page(&mut conn, &QueueName::default(), Some(&after), nz(1)).await;
+    assert!(matches!(r, Err(SchedulerError::InvalidCursor(_))), "{r:?}");
     db.cleanup().await;
 }

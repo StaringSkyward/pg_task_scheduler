@@ -16,10 +16,13 @@ mod workers;
 
 pub use admin::AdminAction;
 pub use admin::AdminActionKind;
+pub use admin::AdminActionTarget;
 pub use admin::BULK_BATCH;
 pub use admin::BULK_BUDGET;
+pub use admin::BulkAction;
 pub use admin::BulkFilter;
 pub use admin::BulkOutcome;
+pub use admin::BulkStop;
 #[doc(hidden)]
 pub use admin::CANCEL_BATCH;
 #[doc(hidden)]
@@ -27,9 +30,11 @@ pub use admin::COUNT_CANCELLABLE;
 #[doc(hidden)]
 pub use admin::COUNT_REPLAYABLE;
 pub use admin::CancelOutcome;
+pub use admin::QueueAction;
 pub use admin::QueuePause;
 #[doc(hidden)]
 pub use admin::REPLAY_BATCH;
+pub use admin::TaskAction;
 pub use admin::admin_actions;
 pub use admin::cancel;
 pub use admin::cancel_matching;
@@ -65,7 +70,10 @@ pub use browse::failed_page;
 pub use browse::queued_page;
 pub use browse::running_page;
 pub use browse::task_detail;
+pub use claim::ClaimBatch;
+pub use claim::PoisonedClaim;
 pub use claim::claim;
+pub use claim::dead_letter;
 pub use claim::next_due_in;
 pub use inspect::attempts;
 pub use inspect::queue_stats;
@@ -104,6 +112,8 @@ pub use transitions::complete_with_outbox;
 pub use transitions::completed_by;
 pub use transitions::fail_permanently;
 pub use transitions::heartbeat;
+#[doc(hidden)]
+pub use transitions::heartbeat_bounded;
 pub use transitions::lease_status;
 pub use transitions::lock_owned;
 pub use transitions::release;

@@ -94,7 +94,8 @@ async fn status_of(db: &TestDb, id: i64) -> String {
         .await
         .unwrap()
         .unwrap()
-        .status
+        .state
+        .status()
         .as_str()
         .to_owned()
 }
@@ -274,7 +275,7 @@ async fn bulk_requires_typed_name() {
 }
 
 #[tokio::test]
-async fn bulk_cancel_runs_and_offers_continue() {
+async fn bulk_cancel_runs_and_offers_rerun() {
     let db = TestDb::new().await;
     for i in 0..3 {
         queued(&db, "a", "default", &format!("k{i}")).await;
@@ -309,7 +310,25 @@ async fn bulk_cancel_runs_and_offers_continue() {
         "{}",
         r.body
     );
-    assert!(!r.body.contains("class=\"continue\""));
+    // A short batch offers a re-run of the same filter.
+    assert!(r.body.contains("class=\"continue\""), "{}", r.body);
+    assert!(r.body.contains("Run again"), "{}", r.body);
+    assert!(
+        r.body
+            .contains("Finished, or some rows were locked by other work and skipped"),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"task_name\" value=\"a\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"reason\" value=\"cleanup\""),
+        "{}",
+        r.body
+    );
     let n = db
         .scalar(
             "SELECT count(*) AS n FROM queue_tasks WHERE status = 'cancelled' AND task_name = 'a'",
@@ -338,6 +357,32 @@ async fn bulk_cancel_runs_and_offers_continue() {
             || c.body.contains("value=\"boom &#60;b&#62;\""),
         "{}",
         c.body
+    );
+    // The re-run form carries the queue and error filters too.
+    let r = post(
+        app(&db),
+        "/bulk",
+        &[
+            ("action", "replay"),
+            ("task_name", "other"),
+            ("queue", "default"),
+            ("error", "boom <b>"),
+            ("confirm_name", "other"),
+            ("reason", "again"),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(
+        r.body.contains("name=\"queue\" value=\"default\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"error\" value=\"boom &lt;b&gt;\"")
+            || r.body.contains("name=\"error\" value=\"boom &#60;b&#62;\""),
+        "{}",
+        r.body
     );
     db.cleanup().await;
 }

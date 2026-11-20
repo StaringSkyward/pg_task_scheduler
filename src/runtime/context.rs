@@ -3,6 +3,7 @@ use chrono::Utc;
 
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
+use crate::models::MaxAttempts;
 use crate::models::TaskLease;
 
 /// What a handler knows about the task it is running, passed as its first argument.
@@ -18,7 +19,7 @@ pub struct TaskContext {
     /// The task's name.
     pub task_name: TaskName,
     /// Attempts allowed in total; `lease.attempt_no` is this attempt.
-    pub max_attempts: i32,
+    pub max_attempts: MaxAttempts,
     /// Lease expiry as of claim; not updated by heartbeats.
     pub locked_until: DateTime<Utc>,
     /// Cancelled when worker shutdown begins, when a heartbeat proves this

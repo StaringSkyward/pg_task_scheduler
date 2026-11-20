@@ -9,8 +9,11 @@ use pg_task_scheduler::CronExpression;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
 use pg_task_scheduler::QueueName;
+use pg_task_scheduler::ScheduleName;
+use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
+use pg_task_scheduler::TaskPayload;
 use pg_task_scheduler::jobs::CreateJob;
 use pg_task_scheduler::jobs::ScheduleUpdate;
 use pg_task_scheduler::jobs::{self};
@@ -41,8 +44,8 @@ async fn materializes_missed_slot_and_advances() {
     assert_eq!(task.task_key.as_str(), occurrence_key(job, old_next_run_at));
     assert_eq!(task.task_name.as_str(), "j");
     assert_eq!(task.due_at, old_next_run_at);
-    assert_eq!(task.payload, serde_json::json!({}));
-    assert_eq!(task.max_attempts, 3);
+    assert_eq!(task.payload, TaskPayload::Json(serde_json::json!({})));
+    assert_eq!(task.max_attempts.get(), 3);
     assert!(db.job_next_run_at(job).await > Utc::now());
     // second pass: next_run_at now future → nothing
     assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 0);
@@ -57,6 +60,7 @@ async fn skips_not_due_and_paused() {
     db.insert_job("future", "*/1 * * * *", future).await;
     let paused = db
         .insert_job_full(
+            "paused",
             "paused",
             "*/1 * * * *",
             Utc::now() - Duration::minutes(1),
@@ -99,6 +103,7 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
     let mut conn = db.pool.get().await.unwrap();
     let make_spec = |version| {
         CreateJob::new(
+            ScheduleName::try_from("snapshot").unwrap(),
             TaskName::try_from("snapshot").unwrap(),
             CronExpression::parse("*/5 * * * *").unwrap(),
             MaxAttempts::try_from(3).unwrap(),
@@ -129,7 +134,10 @@ async fn materialized_task_keeps_payload_and_survives_schedule_deletion() {
         task.task_key.as_str(),
         occurrence_key(job.id.0, db_time(&due))
     );
-    assert_eq!(task.payload["version"], 1);
+    let TaskPayload::Json(p) = &task.payload else {
+        panic!("unreadable")
+    };
+    assert_eq!(p["version"], 1);
     db.cleanup().await;
 }
 
@@ -177,6 +185,7 @@ async fn materialized_task_uses_the_job_queue() {
     let job = jobs::create(
         &mut conn,
         CreateJob::new(
+            ScheduleName::try_from("bulk-job").unwrap(),
             TaskName::try_from("bulk-job").unwrap(),
             CronExpression::parse("*/1 * * * *").unwrap(),
             MaxAttempts::try_from(3u32).unwrap(),
@@ -249,5 +258,215 @@ async fn materializer_transaction_ends_itself_when_left_idle() {
             .unwrap()
             .v;
     assert_eq!(after, "0");
+    db.cleanup().await;
+}
+
+/// Nested in a caller's transaction, materialization must not leave its idle-in-transaction
+/// guard on the caller's transaction.
+#[tokio::test]
+async fn nested_materialization_leaves_the_callers_idle_timeout_alone() {
+    use diesel_async::AsyncConnection;
+    use diesel_async::RunQueryDsl;
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(5))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let after = conn
+        .transaction::<_, SchedulerError, _>(async |c| {
+            assert_eq!(store::materialize_due_jobs(c).await?, 1);
+            Ok(diesel::sql_query(
+                "SELECT current_setting('idle_in_transaction_session_timeout') AS v",
+            )
+            .get_result::<Setting>(c)
+            .await?
+            .v)
+        })
+        .await
+        .unwrap();
+    assert_eq!(after, "0");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn unsatisfiable_cron_pauses_its_job_and_later_jobs_still_materialize() {
+    let db = TestDb::new().await;
+    let past = Utc::now() - Duration::minutes(2);
+    // Parses, but 31 February never occurs; only direct SQL can store it.
+    let bad = db.insert_job("feb-31", "0 0 31 2 *", past).await;
+    let good = db
+        .insert_job("good", "*/1 * * * *", past + Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    assert!(db.is_paused(bad).await);
+    assert!(db.task_ids(bad).await.is_empty());
+    assert_eq!(db.task_ids(good).await.len(), 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn occurrence_runs_the_task_name_not_the_schedule_name() {
+    let db = TestDb::new().await;
+    let job = db
+        .insert_job_full(
+            "nightly",
+            "report",
+            "*/1 * * * *",
+            Utc::now() - Duration::minutes(1),
+            3,
+            false,
+        )
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let id = db.task_ids(job).await[0];
+    let t = store::task(&mut conn, TaskId(id)).await.unwrap().unwrap();
+    assert_eq!(t.task_name.as_str(), "report");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn invalid_stored_queue_pauses_its_job_and_the_pass_continues() {
+    use diesel_async::RunQueryDsl;
+    let db = TestDb::new().await;
+    let past = Utc::now() - Duration::minutes(2);
+    let bad = db.insert_job("bad-queue", "*/1 * * * *", past).await;
+    let good = db
+        .insert_job("good", "*/1 * * * *", past + Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    // Simulates a database whose CHECK was dropped by hand, which `parse_due` still covers.
+    db.drop_constraint("scheduler_jobs", "scheduler_jobs_queue_identifier")
+        .await;
+    diesel::sql_query("UPDATE scheduler_jobs SET queue = '' WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(bad)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    assert!(db.is_paused(bad).await);
+    assert_eq!(db.task_ids(good).await.len(), 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn job_args_that_serde_cannot_parse_are_copied_into_the_task() {
+    use diesel_async::RunQueryDsl;
+    let db = TestDb::new().await;
+    let job = db
+        .insert_job("huge", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    // Valid JSONB, but outside f64: serde_json cannot parse it.
+    diesel::sql_query(r#"UPDATE scheduler_jobs SET job_args = '{"x":1e500}' WHERE id = $1"#)
+        .bind::<diesel::sql_types::Uuid, _>(job)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let ids = db.task_ids(job).await;
+    assert_eq!(ids.len(), 1);
+    let payload = diesel::sql_query("SELECT payload::text AS v FROM queue_tasks WHERE id = $1")
+        .bind::<diesel::sql_types::BigInt, _>(ids[0])
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    let args = diesel::sql_query("SELECT job_args::text AS v FROM scheduler_jobs WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(job)
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    assert_eq!(payload, args);
+    assert!(!db.is_paused(job).await);
+    db.cleanup().await;
+}
+
+#[derive(diesel::QueryableByName)]
+struct DefaultIsolation {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    default_transaction_isolation: String,
+}
+
+/// Each job transaction begins at READ COMMITTED itself, so a REPEATABLE READ session default
+/// neither breaks the pause recheck nor turns into a configuration error. A trigger records the
+/// isolation from inside the transaction.
+#[tokio::test]
+async fn materialize_runs_read_committed_under_a_repeatable_read_session() {
+    use diesel_async::RunQueryDsl;
+    use diesel_async::SimpleAsyncConnection;
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    conn.batch_execute(
+        "CREATE TABLE seen (v text); \
+         CREATE FUNCTION record_isolation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+           INSERT INTO seen VALUES (current_setting('transaction_isolation')); \
+           RETURN NEW; END $$; \
+         CREATE TRIGGER record_isolation BEFORE INSERT ON queue_tasks \
+           FOR EACH ROW EXECUTE FUNCTION record_isolation(); \
+         SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    )
+    .await
+    .unwrap();
+    assert_eq!(store::materialize_due_jobs(&mut conn).await.unwrap(), 1);
+    let inside = diesel::sql_query("SELECT v FROM seen")
+        .get_result::<Setting>(&mut conn)
+        .await
+        .unwrap()
+        .v;
+    assert_eq!(inside, "read committed");
+    let level = diesel::sql_query("SHOW default_transaction_isolation")
+        .get_result::<DefaultIsolation>(&mut conn)
+        .await
+        .unwrap()
+        .default_transaction_isolation;
+    assert_eq!(level, "repeatable read");
+    db.cleanup().await;
+}
+
+/// The `BEGIN` goes through diesel-async's transaction manager, which does not see one sent with
+/// `batch_execute`. Inside such an untracked block our own `BEGIN ... READ COMMITTED` would
+/// switch it to READ COMMITTED (or fail, once it has run a query), never run at REPEATABLE READ.
+#[tokio::test]
+async fn materialize_inside_a_repeatable_read_transaction_is_a_config_error() {
+    use diesel_async::AnsiTransactionManager;
+    use diesel_async::TransactionManager;
+    let db = TestDb::new().await;
+    let job = db
+        .insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    AnsiTransactionManager::begin_transaction_sql(
+        &mut *conn,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    )
+    .await
+    .unwrap();
+    let r = store::materialize_due_jobs(&mut conn).await;
+    assert!(matches!(r, Err(SchedulerError::Config(_))), "{r:?}");
+    AnsiTransactionManager::rollback_transaction(&mut *conn)
+        .await
+        .unwrap();
+    assert!(db.task_ids(job).await.is_empty());
+    db.cleanup().await;
+}
+
+/// Inside a READ COMMITTED transaction each job runs in a savepoint of it.
+#[tokio::test]
+async fn materialize_inside_a_read_committed_transaction_runs() {
+    let db = TestDb::new().await;
+    db.insert_job("j", "*/1 * * * *", Utc::now() - Duration::minutes(1))
+        .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let n = conn
+        .build_transaction()
+        .read_committed()
+        .run(async |c| store::materialize_due_jobs(c).await)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
     db.cleanup().await;
 }

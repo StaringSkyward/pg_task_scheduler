@@ -1,6 +1,7 @@
 //! TOML config for the standalone server: parsing, validation, mapping to `AdminConfig`.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use pg_task_scheduler::store::OverviewParams;
@@ -34,12 +35,14 @@ struct Raw {
     refresh_seconds: u64,
     overview_cache_seconds: u64,
     statement_timeout_seconds: u64,
-    count_cap: i64,
+    count_cap: NonZeroU32,
     window_seconds: u64,
     thresholds: RawThresholds,
     #[serde(default = "missing_auth")]
     auth: RawAuth,
 }
+
+const DEFAULT_COUNT_CAP: NonZeroU32 = NonZeroU32::new(10_000).unwrap();
 
 impl Default for Raw {
     fn default() -> Self {
@@ -52,7 +55,7 @@ impl Default for Raw {
             refresh_seconds: 10,
             overview_cache_seconds: 5,
             statement_timeout_seconds: 5,
-            count_cap: 10_000,
+            count_cap: DEFAULT_COUNT_CAP,
             window_seconds: 3600,
             thresholds: RawThresholds::default(),
             auth: missing_auth(),
@@ -127,7 +130,7 @@ pub struct StandaloneConfig {
     pub refresh_seconds: u64,
     pub overview_cache_seconds: u64,
     pub statement_timeout_seconds: u64,
-    pub count_cap: i64,
+    pub count_cap: NonZeroU32,
     pub window_seconds: u64,
     pub backlog_after_seconds: u64,
     pub stall_after_seconds: u64,
@@ -285,7 +288,7 @@ password_hash = "$argon2id$x"
         assert_eq!(a.refresh_seconds, 20);
         assert_eq!(a.overview_cache, Duration::from_secs(6));
         assert_eq!(a.statement_timeout, Duration::from_secs(3));
-        assert_eq!(a.overview.count_cap, 500);
+        assert_eq!(a.overview.count_cap.get(), 500);
         assert_eq!(a.overview.window, Duration::from_secs(600));
         assert_eq!(a.thresholds.default.backlog_after, Duration::from_secs(120));
         assert_eq!(a.thresholds.default.stall_after, Duration::from_secs(240));
@@ -319,6 +322,12 @@ password_hash = "$argon2id$x"
     fn rejects_basic_without_users() {
         let r = parse_with_env(&auth("[auth]\nmode = \"basic\"\n"), None);
         assert!(matches!(r, Err(ConfigError::NoUsers)));
+    }
+
+    #[test]
+    fn rejects_zero_count_cap() {
+        let t = auth("count_cap = 0\n[auth]\nmode = \"trusted_header\"\n");
+        assert!(parse_with_env(&t, None).is_err());
     }
 
     #[test]

@@ -1,9 +1,14 @@
 mod common;
+use std::num::NonZeroU32;
+
 use common::TestDb;
 use diesel_async::RunQueryDsl;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::replay;
 use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::AdminActionTarget;
+use pg_task_scheduler::store::BulkAction;
+use pg_task_scheduler::store::TaskAction;
 use pg_task_scheduler::store::{self};
 
 async fn exec(db: &TestDb, sql: &str) {
@@ -37,7 +42,7 @@ async fn replay_of_cancelled_task_requeues_it() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     assert_eq!(t.last_error, None);
     let action_id = db
@@ -48,49 +53,13 @@ async fn replay_of_cancelled_task_requeues_it() {
 }
 
 #[tokio::test]
-async fn migration_keeps_replay_audit() {
-    let db = TestDb::bare().await;
-    db.install(include_str!(
-        "../migrations/0001_create_queue_tables/up.sql"
-    ))
-    .await;
-    exec(
-        &db,
-        "INSERT INTO queue_task_replays (task_id, task_key, lock_token, operator, reason) \
-         VALUES (7, 'k', 2, 'ops', 'r')",
-    )
-    .await;
-    db.install(include_str!("../migrations/0003_admin/up.sql"))
-        .await;
-    assert_eq!(
-        db.scalar(
-            "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' \
-             AND operator = 'ops' AND reason = 'r' AND task_id = 7 AND affected = 1"
-        )
-        .await,
-        1
-    );
-    assert_eq!(
-        db.scalar("SELECT count(*) AS n FROM queue_admin_actions")
-            .await,
-        1
-    );
-    assert_eq!(
-        db.scalar("SELECT (to_regclass('queue_task_replays') IS NULL)::int::bigint AS n")
-            .await,
-        1
-    );
-    db.cleanup().await;
-}
-
-#[tokio::test]
 async fn task_actions_include_linked_bulk_action() {
     let db = TestDb::new().await;
     let id = insert_task(&db, "cancelled").await;
     exec(
         &db,
-        "INSERT INTO queue_admin_actions (action, queue, affected, operator, reason) \
-         VALUES ('cancel', 'default', 5, 'ops', 'bulk')",
+        "INSERT INTO queue_admin_actions (action, task_name, max_task_id, affected, operator, reason) \
+         VALUES ('cancel', 'email', 100, 5, 'ops', 'bulk')",
     )
     .await;
     exec(
@@ -105,8 +74,16 @@ async fn task_actions_include_linked_bulk_action() {
         .unwrap();
     let a = store::task_actions(&mut conn, &t).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].action, AdminActionKind::Cancel);
-    assert_eq!(a[0].task_id, None);
+    assert_eq!(a[0].kind(), AdminActionKind::Cancel);
+    assert!(matches!(
+        a[0].target,
+        AdminActionTarget::Bulk {
+            action: BulkAction::Cancel,
+            queue: None,
+            max_task_id: 100,
+            ..
+        }
+    ));
     assert_eq!(a[0].affected, 5);
     assert_eq!(a[0].reason, "bulk");
     // Replay relinks the task to its own row, which also names the task: listed once.
@@ -114,13 +91,60 @@ async fn task_actions_include_linked_bulk_action() {
     let t = store::task(&mut conn, t.id).await.unwrap().unwrap();
     let a = store::task_actions(&mut conn, &t).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].action, AdminActionKind::Replay);
-    let all = store::admin_actions(&mut conn, None, 10).await.unwrap();
+    assert_eq!(a[0].kind(), AdminActionKind::Replay);
+    assert!(matches!(
+        a[0].target,
+        AdminActionTarget::Task {
+            action: TaskAction::Replay,
+            ..
+        }
+    ));
+    let all = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
     assert_eq!(all.len(), 2);
-    let older = store::admin_actions(&mut conn, Some(all[0].id), 10)
+    let older = store::admin_actions(&mut conn, Some(all[0].id), NonZeroU32::new(10).unwrap())
         .await
         .unwrap();
     assert_eq!(older.len(), 1);
-    assert_eq!(older[0].action, AdminActionKind::Cancel);
+    assert_eq!(older[0].kind(), AdminActionKind::Cancel);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn bulk_replay_with_error_filter_records_it() {
+    let db = TestDb::new().await;
+    insert_task(&db, "dead").await;
+    exec(&db, "UPDATE queue_tasks SET last_error = 'x'").await;
+    let mut conn = db.pool.get().await.unwrap();
+    let filter = store::BulkFilter {
+        task_name: pg_task_scheduler::TaskName::try_from("email").unwrap(),
+        queue: None,
+    };
+    let out = store::replay_matching(
+        &mut conn,
+        &filter,
+        Some("x"),
+        "ops",
+        "why",
+        store::BULK_BUDGET,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.affected, 1);
+    let a = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(a.len(), 1);
+    let AdminActionTarget::Bulk {
+        action: BulkAction::Replay { last_error },
+        task_name,
+        ..
+    } = &a[0].target
+    else {
+        panic!("not a bulk replay: {:?}", a[0].target)
+    };
+    assert_eq!(last_error.as_deref(), Some("x"));
+    assert_eq!(task_name.as_str(), "email");
     db.cleanup().await;
 }

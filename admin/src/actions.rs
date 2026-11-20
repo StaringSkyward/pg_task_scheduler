@@ -22,6 +22,7 @@ use pg_task_scheduler::TaskName;
 use pg_task_scheduler::replay;
 use pg_task_scheduler::store::BULK_BUDGET;
 use pg_task_scheduler::store::BulkFilter;
+use pg_task_scheduler::store::BulkStop;
 use pg_task_scheduler::store::CancelOutcome;
 use pg_task_scheduler::store::{self};
 use serde::Deserialize;
@@ -236,7 +237,7 @@ struct ResultPage<'a> {
     p: &'a BulkParams,
     verb: &'a str,
     affected: i64,
-    more: bool,
+    budget_spent: bool,
 }
 
 async fn confirm<P: SchedulerPool>(
@@ -264,7 +265,7 @@ async fn confirm<P: SchedulerPool>(
                 refresh: state.config.refresh_seconds,
                 p: &p,
                 verb: if b.replay { "replay" } else { "cancel" },
-                count: if n >= cap {
+                count: if n >= i64::from(cap.get()) {
                     format!("{n}+")
                 } else {
                     n.to_string()
@@ -321,10 +322,38 @@ async fn bulk<P: SchedulerPool>(
                 p: &p,
                 verb: if b.replay { "replayed" } else { "cancelled" },
                 affected: o.affected,
-                more: o.more_remain,
+                budget_spent: o.stopped == BulkStop::BudgetSpent,
             },
             StatusCode::OK,
         ),
         Err(e) => db_fail(&state, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The budget-spent branch needs 500+ rows and the fixed 10 s budget to reach end to end.
+    #[test]
+    fn budget_spent_result_offers_continue() {
+        let p = BulkParams {
+            action: "cancel".into(),
+            task_name: "a".into(),
+            ..Default::default()
+        };
+        let html = ResultPage {
+            base: "",
+            refresh: 0,
+            p: &p,
+            verb: "cancelled",
+            affected: 500,
+            budget_spent: true,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("Continue"), "{html}");
+        assert!(!html.contains("Run again"), "{html}");
+        assert!(html.contains("name=\"task_name\" value=\"a\""), "{html}");
     }
 }

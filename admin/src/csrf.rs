@@ -1,4 +1,4 @@
-//! Cross-site request check for state-changing requests (spec §6.1). Browsers attach
+//! Cross-site request check for state-changing requests (docs/AdminUI.md §2.8). Browsers attach
 //! basic-auth credentials and proxy cookies to cross-site requests, so without it a
 //! hostile page could trigger an action.
 use axum::extract::Request;

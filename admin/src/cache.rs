@@ -1,4 +1,4 @@
-//! A single-flight, time-boxed cache for the overview (spec §7.4).
+//! A single-flight, time-boxed cache for the overview (docs/AdminUI.md §3.6).
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;

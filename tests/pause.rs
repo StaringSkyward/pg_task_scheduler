@@ -1,6 +1,6 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -13,6 +13,8 @@ use pg_task_scheduler::TaskKey;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::AdminActionTarget;
+use pg_task_scheduler::store::QueueAction;
 use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -41,12 +43,13 @@ async fn claim(db: &TestDb, queue: &str) -> Vec<pg_task_scheduler::ClaimedTask> 
         &mut conn,
         &WorkerId::generate(),
         &q(queue),
-        &["job".to_owned()],
-        NonZeroUsize::new(5).unwrap(),
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from("job").unwrap()],
+        NonZeroU32::new(5).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
+    .ready
 }
 
 async fn pause(db: &TestDb, queue: &str) -> bool {
@@ -109,7 +112,7 @@ async fn next_due_in_ignores_paused_queues() {
     let db = TestDb::new().await;
     add(&db, "a", "bulk").await;
     let mut conn = db.pool.get().await.unwrap();
-    let names = ["job".to_owned()];
+    let names = [pg_task_scheduler::TaskName::try_from("job").unwrap()];
     assert!(
         store::next_due_in(&mut conn, &[q("bulk")], &names)
             .await
@@ -144,14 +147,20 @@ async fn pause_is_idempotent_and_audited() {
     assert!(!resume(&db, "bulk").await);
     let mut conn = db.pool.get().await.unwrap();
     assert!(store::paused_queues(&mut conn).await.unwrap().is_empty());
-    let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
-    let kinds: Vec<_> = actions.iter().map(|a| a.action).collect();
+    let actions = store::admin_actions(&mut conn, None, NonZeroU32::new(10).unwrap())
+        .await
+        .unwrap();
+    let kinds: Vec<_> = actions.iter().map(|a| a.kind()).collect();
     assert_eq!(kinds, [AdminActionKind::Resume, AdminActionKind::Pause]);
-    assert!(
-        actions
-            .iter()
-            .all(|a| a.affected == 0 && a.queue == Some(q("bulk")))
-    );
+    assert!(matches!(
+        actions[1].target,
+        AdminActionTarget::Queue {
+            action: QueueAction::Pause,
+            ..
+        }
+    ));
+    assert!(actions.iter().all(|a| a.affected == 0
+        && matches!(&a.target, AdminActionTarget::Queue { queue, .. } if *queue == q("bulk"))));
     db.cleanup().await;
 }
 

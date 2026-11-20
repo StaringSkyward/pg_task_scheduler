@@ -12,8 +12,9 @@ pub type PoolError = Box<dyn std::error::Error + Send + Sync>;
 /// `Pool::get`).
 pub trait SchedulerPool: Clone + Send + Sync + 'static {
     /// The guard / smart pointer returned by the pool. Must deref to
-    /// `AsyncPgConnection` so callers can pass `&mut *conn` to store fns.
-    type Conn: DerefMut<Target = AsyncPgConnection> + Send;
+    /// `AsyncPgConnection` so callers can pass `&mut *conn` to store fns, and
+    /// own its connection (`'static`) so the worker can move it into a spawned heartbeat.
+    type Conn: DerefMut<Target = AsyncPgConnection> + Send + 'static;
 
     /// Takes a connection from the pool, waiting if none is free.
     fn acquire(&self) -> impl std::future::Future<Output = Result<Self::Conn, PoolError>> + Send;

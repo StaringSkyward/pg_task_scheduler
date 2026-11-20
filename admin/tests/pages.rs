@@ -45,10 +45,11 @@ const DUE_EMAIL: &str = "INSERT INTO queue_tasks (task_key, task_name, queue, du
 /// A worker row serving `queue` (limit 4), seen now and finished a task 5s ago.
 fn worker_sql(queue: &str, lost_after: &str) -> String {
     format!(
-        "INSERT INTO queue_workers (worker_id, label, lost_after, status, queues, task_names) \
-         VALUES ('w1', 'box', {lost_after}, 'healthy', \
-           jsonb_build_array(jsonb_build_object('name', '{queue}', 'limit', 4, 'in_use', 0, \
-             'paused', false, 'last_finished_at', now() - interval '5 seconds')), '{{send}}')"
+        "INSERT INTO queue_workers (worker_id, label, lost_after, status) \
+         VALUES ('w1', 'box', {lost_after}, 'healthy'); \
+         INSERT INTO queue_worker_queues (worker_id, queue, slot_limit, in_use, last_finished_at) \
+         VALUES ('w1', '{queue}', 4, 0, now() - interval '5 seconds'); \
+         INSERT INTO queue_worker_task_names (worker_id, task_name) VALUES ('w1', 'send')"
     )
 }
 
@@ -367,6 +368,31 @@ async fn names_with_url_characters_round_trip() {
     db.cleanup().await;
 }
 
+/// A dead letter with an invalid key opens, showing the raw key and why it is invalid.
+#[tokio::test]
+async fn task_page_shows_why_a_task_key_is_invalid() {
+    let db = TestDb::new().await;
+    // Simulates a database whose CHECK was dropped by hand, which `StoredTaskKey` still covers.
+    db.drop_constraint("queue_tasks", "queue_tasks_task_key_identifier")
+        .await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, queue, status, last_error, completed_at) \
+         VALUES (repeat('k', 300), 'n', 'q', 'dead', 'e', now())",
+    )
+    .await;
+    let (status, _, body) = get(app(&db), "/tasks/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&"k".repeat(300)), "{body}");
+    assert!(
+        body.contains(
+            r#"<small class="invalid">invalid: identifier must be at most 255 characters</small>"#
+        ),
+        "{body}"
+    );
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn task_data_is_escaped() {
     let db = TestDb::new().await;
@@ -378,14 +404,14 @@ async fn task_data_is_escaped() {
     .await;
     sql(
         &db,
-        "INSERT INTO queue_admin_actions (action, task_id, affected, operator, reason) \
-         SELECT 'cancel', id, 1, 'op', '<i>r</i>' FROM queue_tasks",
+        "INSERT INTO queue_admin_actions (action, task_id, task_name, queue, affected, operator, reason) \
+         SELECT 'cancel', id, task_name, queue, 1, 'op', '<i>r</i>' FROM queue_tasks",
     )
     .await;
     sql(
         &db,
-        "INSERT INTO queue_workers (worker_id, label, lost_after, status, queues, task_names) \
-         VALUES ('w1', '<u>w</u>', now() + interval '1 minute', 'healthy', '[]', '{}')",
+        "INSERT INTO queue_workers (worker_id, label, lost_after, status) \
+         VALUES ('w1', '<u>w</u>', now() + interval '1 minute', 'healthy')",
     )
     .await;
     for (path, want, raw) in [
@@ -434,7 +460,7 @@ async fn failed_attempts_header_shows_covered_span() {
     assert!(body.contains("<th>Failed attempts (1h)</th>"), "{body}");
     let config = AdminConfig {
         overview: pg_task_scheduler::store::OverviewParams {
-            count_cap: 2,
+            count_cap: std::num::NonZeroU32::new(2).unwrap(),
             ..Default::default()
         },
         ..Default::default()

@@ -131,8 +131,14 @@ it was a judgement call made during the work, open to change.
   dependencies need at most 1.86 (Diesel). The workspace was checked with 1.88,
   and failed to build with 1.87.
 - **Expected behaviour:** Cargo reports a clear error on an older toolchain.
-  CI builds only on nightly, so a newer language feature could raise the real
-  minimum without anyone noticing.
+  CI's `msrv` job runs `cargo +1.88 check --workspace --all-features --locked`,
+  so a newer language feature in either crate, or a locked dependency that
+  needs a newer Rust, fails CI. That job only checks: it runs no tests or
+  clippy on 1.88, and does not cover the example app. CI's other cargo builds,
+  clippy runs and tests use the toolchain pinned in `rust-toolchain.toml`
+  (1.100.0), against PostgreSQL 13 and 18; only the format check uses nightly.
+- **Changed by review 02:** no CI job ran on 1.88
+  ([Review decisions, entry 32](ReviewDecisions.md#32-ci-checks-the-minimum-rust-and-postgresql-18)).
 
 ### 11. First release is plain `0.1.0`
 
@@ -147,12 +153,18 @@ it was a judgement call made during the work, open to change.
 - **Source:** call.
 - **Decision:** These notes came out of the READMEs, because no published
   version has ever lacked `0003`:
-  - "Upgrading to `0003`";
+  - how to upgrade to `0003`;
   - behaviour of workers from before `0003`;
-  - `queue_task_replays`;
+  - the replay audit table that `0003` used to replace;
   - the core crate's former `axum` feature.
-- **Expected behaviour:** The upgrade notes stay in git history and in
-  [Admin UI decisions](AdminUI.md).
+
+  Later, review 01 edited `0001`–`0003` in place, so the first release has no
+  schema history at all
+  ([Review decisions, entry 17](ReviewDecisions.md#17-the-migrations-were-edited-in-place)).
+- **Expected behaviour:** The old upgrade notes survive only as history, in git
+  and in section 9 of [Admin UI decisions](AdminUI.md#9-upgrade), which is
+  marked superseded. A database built by an unreleased version must be dropped
+  and recreated; there is no upgrade path from it.
 
 ## Release steps
 

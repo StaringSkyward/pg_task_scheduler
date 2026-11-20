@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match std::env::args().nth(1).as_deref() {
         Some("worker") => {
-            let scheduler = tasks::scheduler(pool(&required_env("DATABASE_URL"), 12))?;
+            // 5 handler slots (default 4, bulk 1) + 5 for the scheduler (LISTEN, claims,
+            // maintenance, registry, dead-lettering) + 4 for `place_order` handlers, which
+            // take their own connection.
+            let scheduler = tasks::scheduler(pool(&required_env("DATABASE_URL"), 14))?;
             let token = CancellationToken::new();
             tokio::spawn({
                 let token = token.clone();

@@ -9,7 +9,9 @@ use pg_task_scheduler::JobId;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
 use pg_task_scheduler::QueueName;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::SchedulerError;
+use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::jobs::Applied;
 use pg_task_scheduler::jobs::CreateJob;
@@ -17,22 +19,34 @@ use pg_task_scheduler::jobs::ScheduleUpdate;
 use pg_task_scheduler::jobs::{self};
 use pg_task_scheduler::store;
 
-fn spec(name: &str, cron: &str) -> CreateJob {
+fn spec(name: &str, task_name: &str, cron: &str) -> CreateJob {
+    spec_with(name, task_name, cron, JobLifecycle::Active)
+}
+
+fn spec_with(name: &str, task_name: &str, cron: &str, lifecycle: JobLifecycle) -> CreateJob {
     CreateJob::new(
-        TaskName::try_from(name).unwrap(),
+        ScheduleName::try_from(name).unwrap(),
+        TaskName::try_from(task_name).unwrap(),
         CronExpression::parse(cron).unwrap(),
         MaxAttempts::try_from(3u32).unwrap(),
-        JobLifecycle::Active,
+        lifecycle,
         serde_json::json!({"k": "v"}),
     )
     .unwrap()
+}
+
+struct Report;
+impl Task for Report {
+    const NAME: &'static str = "report";
+    const QUEUE: &'static str = "reports";
+    type Args = serde_json::Value;
 }
 
 #[tokio::test]
 async fn create_sets_future_next_run() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let job = jobs::create(&mut conn, spec("digest", "*/5 * * * *"))
+    let job = jobs::create(&mut conn, spec("digest", "digest", "*/5 * * * *"))
         .await
         .unwrap();
     assert!(job.next_run_at > Utc::now());
@@ -40,14 +54,32 @@ async fn create_sets_future_next_run() {
 }
 
 #[tokio::test]
+async fn schedules_list_even_when_their_args_are_unreadable() {
+    let db = TestDb::new().await;
+    let id = db
+        .insert_job(
+            "odd",
+            "*/5 * * * *",
+            Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+    db.make_job_args_unreadable(id).await;
+    let mut conn = db.pool.get().await.unwrap();
+    let all = jobs::list(&mut conn).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(jobs::get(&mut conn, all[0].id).await.unwrap().is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn ensure_job_inserts_then_reconciles_config() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let a = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *"))
+    let a = jobs::ensure_job(&mut conn, spec("sync", "sync", "*/5 * * * *"))
         .await
         .unwrap();
     assert!(a.next_run_at > Utc::now()); // insert path: cursor in the future
-    let b = jobs::ensure_job(&mut conn, spec("sync", "0 * * * *"))
+    let b = jobs::ensure_job(&mut conn, spec("sync", "sync", "0 * * * *"))
         .await
         .unwrap();
     assert_eq!(a.id, b.id); // idempotent by name — same row
@@ -67,7 +99,7 @@ async fn ensure_job_preserves_due_cursor_and_no_slot_skipped() {
 
     // ensure_job with a CHANGED cron must NOT advance the cursor.
     let mut conn = db.pool.get().await.unwrap();
-    let job = jobs::ensure_job(&mut conn, spec("sync", "0 * * * *"))
+    let job = jobs::ensure_job(&mut conn, spec("sync", "sync", "0 * * * *"))
         .await
         .unwrap();
     assert_eq!(job.id, JobId(id)); // updated the existing row
@@ -92,15 +124,16 @@ async fn ensure_job_preserves_is_paused_on_conflict() {
     let id = db
         .insert_job_full(
             "p",
+            "p",
             "*/5 * * * *",
             Utc::now() + chrono::Duration::hours(1),
             3,
             true,
         )
         .await;
-    // ensure_job carries is_paused=false (the spec() default); it must NOT resume.
+    // ensure_job with an Active spec (the spec() default) must NOT resume it.
     let mut conn = db.pool.get().await.unwrap();
-    jobs::ensure_job(&mut conn, spec("p", "*/5 * * * *"))
+    jobs::ensure_job(&mut conn, spec("p", "p", "*/5 * * * *"))
         .await
         .unwrap();
     assert!(
@@ -114,7 +147,7 @@ async fn ensure_job_preserves_is_paused_on_conflict() {
 async fn pause_resume_list_get_delete() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let job = jobs::create(&mut conn, spec("p", "*/5 * * * *"))
+    let job = jobs::create(&mut conn, spec("p", "p", "*/5 * * * *"))
         .await
         .unwrap();
     assert_eq!(
@@ -280,14 +313,234 @@ async fn pause_resume_delete_missing_is_not_found() {
 async fn ensure_job_reconciles_queue() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    let a = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *"))
+    let a = jobs::ensure_job(&mut conn, spec("sync", "sync", "*/5 * * * *"))
         .await
         .unwrap();
     assert_eq!(a.queue, QueueName::default());
     let bulk = QueueName::try_from("bulk").unwrap();
-    let b = jobs::ensure_job(&mut conn, spec("sync", "*/5 * * * *").queue(bulk))
+    let b = jobs::ensure_job(&mut conn, spec("sync", "sync", "*/5 * * * *").queue(bulk))
         .await
         .unwrap();
     assert_eq!(b.queue.as_str(), "bulk");
     db.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_schedules_can_run_one_task() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let a = jobs::create(&mut conn, spec("digest-hourly", "digest", "0 * * * *"))
+        .await
+        .unwrap();
+    let b = jobs::create(&mut conn, spec("digest-daily", "digest", "0 0 * * *"))
+        .await
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(
+        (a.task_name.as_str(), b.task_name.as_str()),
+        ("digest", "digest")
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn for_task_takes_name_and_queue_from_the_task() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let spec = CreateJob::for_task::<Report>(
+        ScheduleName::try_from("nightly-report").unwrap(),
+        CronExpression::parse("0 3 * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        serde_json::json!({}),
+    )
+    .unwrap();
+    let job = jobs::create(&mut conn, spec).await.unwrap();
+    assert_eq!(
+        (job.task_name.as_str(), job.queue.as_str()),
+        ("report", "reports")
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn created_paused_job_is_paused_and_ensure_keeps_it_paused() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = jobs::create(
+        &mut conn,
+        spec_with("p", "p", "*/5 * * * *", JobLifecycle::Paused),
+    )
+    .await
+    .unwrap();
+    assert_eq!(job.lifecycle, JobLifecycle::Paused);
+    let again = jobs::ensure_job(&mut conn, spec("p", "p", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(again.lifecycle, JobLifecycle::Paused);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_ensure_job_creates_one_job() {
+    let db = TestDb::new().await;
+    let (mut c1, mut c2) = (db.pool.get().await.unwrap(), db.pool.get().await.unwrap());
+    let (a, b) = tokio::join!(
+        jobs::ensure_job(
+            &mut c1,
+            spec_with("race", "race", "*/5 * * * *", JobLifecycle::Paused)
+        ),
+        jobs::ensure_job(
+            &mut c2,
+            spec_with("race", "race", "*/5 * * * *", JobLifecycle::Paused)
+        ),
+    );
+    assert_eq!(a.unwrap().id, b.unwrap().id);
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM scheduler_job_pauses")
+            .await,
+        1
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn ensure_job_survives_a_concurrent_delete() {
+    use diesel_async::SimpleAsyncConnection;
+    let db = TestDb::new().await;
+    let mut setup = db.pool.get().await.unwrap();
+    let _ = jobs::create(&mut setup, spec("race", "race", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let mut holder = db.pool.get().await.unwrap();
+    holder
+        .batch_execute("BEGIN; SELECT 1 FROM scheduler_jobs WHERE name = 'race' FOR UPDATE")
+        .await
+        .unwrap();
+    let mut racer = db.pool.get().await.unwrap();
+    let pid = common::backend_pid(&mut racer).await;
+    let handle = tokio::spawn(async move {
+        jobs::ensure_job(&mut racer, spec("race", "race", "*/5 * * * *")).await
+    });
+    db.wait_until_lock_blocked(pid).await;
+    holder
+        .batch_execute("DELETE FROM scheduler_jobs WHERE name = 'race'; COMMIT")
+        .await
+        .unwrap();
+    let job = handle.await.unwrap().unwrap();
+    assert!(jobs::get(&mut setup, job.id).await.unwrap().is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn recreated_schedule_is_not_paused() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let job = jobs::create(&mut conn, spec("again", "again", "*/5 * * * *"))
+        .await
+        .unwrap();
+    let _ = jobs::pause(&mut conn, job.id).await.unwrap();
+    let _ = jobs::delete(&mut conn, job.id).await.unwrap();
+    let fresh = jobs::create(&mut conn, spec("again", "again", "*/5 * * * *"))
+        .await
+        .unwrap();
+    assert_eq!(fresh.lifecycle, JobLifecycle::Active);
+    db.cleanup().await;
+}
+
+#[test]
+fn create_job_rejects_a_payload_the_worker_cannot_parse() {
+    let deep = (0..140).fold(serde_json::json!([]), |v, _| serde_json::json!([v]));
+    let r = CreateJob::new(
+        ScheduleName::try_from("deep").unwrap(),
+        TaskName::try_from("report").unwrap(),
+        CronExpression::parse("* * * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        deep,
+    );
+    assert!(matches!(r, Err(SchedulerError::Serde(_))));
+}
+
+#[test]
+fn for_task_rejects_args_that_do_not_round_trip() {
+    #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Reading {
+        value: f64,
+    }
+    struct Measure;
+    impl pg_task_scheduler::Task for Measure {
+        const NAME: &'static str = "measure";
+        type Args = Reading;
+    }
+    let r = CreateJob::for_task::<Measure>(
+        ScheduleName::try_from("nan").unwrap(),
+        CronExpression::parse("* * * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        Reading { value: f64::NAN },
+    );
+    assert!(matches!(r, Err(SchedulerError::Serde(_))));
+}
+
+#[tokio::test]
+async fn for_task_rejects_args_whose_meaning_changes_in_jsonb() {
+    #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(untagged)]
+    enum Amount {
+        Count(u64),
+        Ratio(f64),
+    }
+    struct Measure;
+    impl Task for Measure {
+        const NAME: &'static str = "measure";
+        type Args = Amount;
+    }
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let spec = || {
+        CreateJob::for_task::<Measure>(
+            ScheduleName::try_from("ratio").unwrap(),
+            CronExpression::parse("* * * * *").unwrap(),
+            MaxAttempts::try_from(3u32).unwrap(),
+            JobLifecycle::Active,
+            Amount::Ratio(1e18),
+        )
+        .unwrap()
+    };
+    let created = jobs::create(&mut conn, spec()).await;
+    assert!(
+        matches!(created, Err(SchedulerError::PayloadNotPreserved)),
+        "{created:?}"
+    );
+    let ensured = jobs::ensure_job(&mut conn, spec()).await;
+    assert!(
+        matches!(ensured, Err(SchedulerError::PayloadNotPreserved)),
+        "{ensured:?}"
+    );
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM scheduler_jobs").await,
+        0
+    );
+    db.cleanup().await;
+}
+
+#[test]
+fn for_task_rejects_non_finite_floats_inside_an_option() {
+    struct Reading;
+    impl Task for Reading {
+        const NAME: &'static str = "reading";
+        type Args = Option<f64>;
+    }
+    let r = CreateJob::for_task::<Reading>(
+        ScheduleName::try_from("inf").unwrap(),
+        CronExpression::parse("* * * * *").unwrap(),
+        MaxAttempts::try_from(3u32).unwrap(),
+        JobLifecycle::Active,
+        Some(f64::INFINITY),
+    );
+    assert!(
+        matches!(r, Err(SchedulerError::PayloadNotPreserved)),
+        "{r:?}"
+    );
 }

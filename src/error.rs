@@ -1,5 +1,6 @@
 //! Crate error types.
 
+use crate::ids::EffectName;
 use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
 use crate::ids::JobId;
@@ -22,11 +23,14 @@ pub enum SchedulerError {
     #[cfg(feature = "cron")]
     #[error("cron parse error: {0}")]
     Cron(String),
-    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting.
+    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting, or (with
+    /// `cron`) `store::materialize_due_jobs` was called inside a transaction that is not READ
+    /// COMMITTED.
     #[error("configuration error: {0}")]
     Config(String),
-    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName)
-    /// or [`WorkerId`](crate::WorkerId).
+    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName),
+    /// [`WorkerId`](crate::WorkerId), [`EffectName`], [`Topic`](crate::Topic),
+    /// [`CommandKey`](crate::CommandKey) or (with `cron`) `ScheduleName`.
     #[error("invalid identifier: {0}")]
     Identifier(#[from] IdentifierError),
     /// A handler registration was rejected.
@@ -38,9 +42,31 @@ pub enum SchedulerError {
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
-    /// The same `task_key` was enqueued with a different task name or payload.
+    /// Concurrent changes invalidated a bounded retry loop on every pass; retry the call.
+    #[error("concurrent changes kept invalidating the operation: {0}")]
+    Contention(&'static str),
+    /// A page cursor cannot advance (its position would overflow).
+    #[error("invalid cursor: {0}")]
+    InvalidCursor(&'static str),
+    /// A typed producer's arguments decode back as a different value than the caller's: JSON
+    /// cannot represent them (a non-finite `f64` is written as `null`), or PostgreSQL's JSONB
+    /// normalizes a number (`1e18` reads back as an integer). Nothing is written.
+    #[error("task arguments change meaning when stored as JSON")]
+    PayloadNotPreserved,
+    /// The same `task_key` was enqueued with a different task name or different arguments.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),
+    /// The task key starts with the prefix reserved for schedule occurrences.
+    #[error("task key {} starts with the reserved prefix \"schedule:\"", .0.as_str())]
+    ReservedTaskKey(TaskKey),
+    /// The task already recorded this effect with a different command key, topic or payload.
+    #[error("outbox conflict: effect {} of task key {} already exists with different content", .effect_name.as_str(), .task_key.as_str())]
+    OutboxConflict {
+        /// The task's key.
+        task_key: TaskKey,
+        /// The effect whose stored content differs.
+        effect_name: EffectName,
+    },
     /// A worker-owned mutation matched no row: the lease was lost or expired.
     #[error("lost ownership of task {0:?}")]
     LostOwnership(TaskId),

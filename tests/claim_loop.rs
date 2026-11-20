@@ -166,3 +166,57 @@ async fn locked_due_task_does_not_spin_the_claim_loop() {
     drop(locker);
     db.cleanup().await;
 }
+
+/// Poisoned rows take no permit, so they must not count toward a full batch: a backlog of
+/// them would loop at once and start a dead-letter task (and connection) per batch.
+#[tokio::test]
+async fn poisoned_backlog_is_dead_lettered_one_batch_at_a_time() {
+    let _serial = SERIAL.lock().await;
+    let db = TestDb::new().await;
+    // Slow dead-letters, so overlapping ones show as several rows running at once.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE FUNCTION slow_dead() RETURNS trigger AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER slow_dead BEFORE UPDATE ON queue_tasks FOR EACH ROW WHEN (NEW.status = 'dead') EXECUTE FUNCTION slow_dead();
+             INSERT INTO queue_tasks (task_key, task_name, payload)
+             SELECT 'bad' || i, 'job', '{\"x\":1e500}'::jsonb FROM generate_series(1, 6) AS i;",
+        )
+        .await
+        .unwrap();
+    // Raw-SQL rows send no NOTIFY, so only a finished dead-letter (or the 5 s poll) wakes the
+    // loop between claims.
+    let scheduler = Scheduler::builder(db.pool.clone())
+        .claim_batch_size(std::num::NonZeroU32::MIN)
+        .max_poll_interval(Duration::from_secs(5))
+        .shutdown_timeout(Duration::from_millis(100))
+        .register_task::<Job, _, _>(|_ctx, _args| async { Ok(()) })
+        .unwrap()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let run = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
+
+    let count =
+        |status: &str| format!("SELECT count(*) AS n FROM queue_tasks WHERE status = '{status}'");
+    let (started, mut max_running) = (std::time::Instant::now(), 0);
+    while db.scalar(&count("dead")).await < 6 {
+        max_running = max_running.max(db.scalar(&count("running")).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "backlog not dead-lettered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A spinning loop leases the whole backlog at once, with a dead-letter task per row.
+    assert!(
+        max_running <= 1,
+        "{max_running} poisoned rows running at once"
+    );
+
+    cancel.cancel();
+    run.await.unwrap().unwrap();
+    db.cleanup().await;
+}

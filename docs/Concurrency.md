@@ -26,9 +26,23 @@ AND locked_until > clock_timestamp()  -- hard lease, database time
 ```
 
 Heartbeat, completion, completion with outbox, retry, permanent failure, release,
-and the DB-contained `lock_owned` all use this predicate. A guarded statement that
-matches zero rows means ownership is lost (`SchedulerError::LostOwnership`). It
-never means success.
+and the DB-contained `lock_owned` all use this predicate. Each first locks the row
+in its own statement, in the same transaction:
+
+```sql
+SELECT id FROM queue_tasks
+WHERE id = $1 AND locked_by = $2 AND lock_token = $3
+FOR UPDATE
+```
+
+Only then does it run the guarded statement. The order matters: after a lock
+wait PostgreSQL re-evaluates a statement's `WHERE` only if the blocker updated
+the row, so a blocker that merely locked the row would leave the
+`clock_timestamp()` check stale. The separate statement evaluates expiry after
+the wait. The lock matches the ownership identity but not the expiry, so a
+stale or fenced worker matches no row at once instead of queueing behind the
+current owner. A guarded statement that matches zero rows means ownership is
+lost (`SchedulerError::LostOwnership`). It never means success.
 
 The lease is **hard**. Once `locked_until` passes, the old worker is stale even if
 no reaper has touched the row yet. It can no longer heartbeat or finalize.
@@ -49,6 +63,16 @@ The statement is atomic, so a claim and its attempt row commit together or not a
 all. Concurrent claimers skip each other's locked rows, so a queued task gets one
 owner.
 
+Rust then converts each claimed row on its own. A row that fails (a payload or
+count written by direct SQL that the types reject, or a key in a database whose
+identifier CHECK was dropped by hand) comes back in `ClaimBatch::poisoned`,
+still leased, instead of failing the call. The worker dispatches the ready rows
+first, then dead-letters the poisoned ones with `store::dead_letter` on a task
+and connection of their own, so a slow dead-letter cannot spend a healthy row's
+lease. Only one such task runs at a time per scheduler. A poisoned row that
+task misses, or that a claim returns while it runs, stays `running` until the reaper requeues it,
+and a later claim poisons it again until its attempts run out.
+
 A scheduler serves the queues configured with `.queue(name, limit)` (by default
 `default` at 16), each with its own permits. Each cycle, it claims from every
 queue with a free permit, in configuration order, at most
@@ -65,11 +89,11 @@ Worker groups with different registrations can share one queue.
 | --- | --- |
 | Two workers claim one task | One locks and claims it; the other skips it. |
 | Two producers enqueue one `task_key` | `ON CONFLICT DO NOTHING` waits for the first insert to commit; the second returns the existing task. |
-| Worker ACKs after its hard lease expired | The predicate fails on `locked_until`; zero rows; the worker cannot complete. |
+| Worker ACKs after its hard lease expired | The row is locked first (waiting out any other holder), then the predicate fails on `locked_until`; zero rows; the worker cannot complete. |
 | Old generation ACKs after a reclaim | `lock_token` no longer matches; zero rows. |
 | Heartbeat races the reaper | Either the heartbeat extends a still-valid lease, or the reaper requeues the expired row and the heartbeat matches zero rows. |
-| Completion races the reaper | Completion needs an unexpired lease; once expired, only the reaper can move the row. |
-| Release races lease expiry | Release needs an unexpired lease; after expiry only the reaper moves the row, and the attempt counts. |
+| Completion races the reaper | A transition starting after expiry matches zero rows; a transition that already holds the row lock keeps the row away from the reaper. |
+| Release races lease expiry | A release starting after expiry matches zero rows; the reaper requeues the row and the attempt counts. |
 | Reaper races a DB-contained transaction | The handler holds the task row via `lock_owned`; the reaper's `SKIP LOCKED` passes over it. |
 | Two reapers select one expired task | One locks it; the other skips it. |
 | Stale worker emits an outbox command | The outbox insert depends on the guarded completion CTE; no completed row means no outbox row. |
@@ -97,8 +121,18 @@ future when either:
   advanced on each successful heartbeat. This covers heartbeats that keep failing
   or hang, for example during a database outage.
 
+The dispatch polls the lease keeper and forced-shutdown expiry before the
+handler, so once the runtime has observed the deadline, a handler suspended
+past it is dropped when it would next resume, not resumed. A segment already
+running when the deadline passes is not preempted and runs to its next await. A
+result the handler returns in the same poll as the deadline is dropped as a
+lost lease, and the reaper recovers the task: a retry, or `dead` on its last
+attempt.
+
 The local deadline only makes the worker give up early. It never extends
-ownership, and host clocks never decide validity.
+ownership, and host clocks never decide validity. A claim whose response
+arrives after that deadline starts no handler: the dispatch counts a lost lease
+and leaves the task to the reaper.
 
 `ctx.cancellation` is cancelled when worker shutdown begins, when the lease
 keeper gives up, or when the dispatch ends. When the lease keeper gives up, the
@@ -116,11 +150,32 @@ Cancellation is cooperative. Async code stops when its future is dropped or when
 it observes the token. Blocking code, independently spawned work, and remote
 requests already in flight cannot be recalled.
 
-A DB-contained handler holds its row lock while a heartbeat may be waiting on it.
-Because the lease keeper is a separate future, the handler keeps being polled and
-commits, and the heartbeat then sees a `done` row. The lease must still outlast
-the database transaction. An expired lease makes the final guarded update match
-zero rows, and the transaction rolls back.
+A DB-contained handler that called `lock_owned` holds its row lock for its whole
+transaction, so every heartbeat's lock statement waits on it and the lease
+cannot be extended meanwhile. The lease keeper returns at the local deadline
+(`sent + lease`, never after the database's `locked_until`), and the worker then
+drops the handler future, abandoning its transaction. In the runtime the whole
+transaction, including its commit, must therefore finish within the lease. The
+lease is checked when a transition runs, after it has locked the row. A direct
+store caller that commits after `locked_until` still holds exclusive ownership,
+because its row lock kept the reaper and every other worker away; it does not
+roll back. Each heartbeat's transaction runs
+on a spawned task, so when the lease keeper is dropped mid-heartbeat (the
+handler finished, or the local deadline passed) the heartbeat still commits or
+rolls back, and never leaves an open transaction holding the row lock. The
+spawned heartbeat is bounded by the lease: its `lock_timeout` and
+`statement_timeout` are both the time left until the local deadline, except
+that each keeps the session's value when the host set a smaller non-zero one,
+so it never raises the host's timeouts. PostgreSQL applies `lock_timeout` to
+each lock wait, and a statement can wait more than once, so `statement_timeout`
+bounds each statement as a whole. Both accept at most `i32::MAX` milliseconds
+(about 24.8 days), so for a longer lease the wait is capped there instead. Once
+its dispatch has ended (finished, lease lost, released, or dropped with the
+scheduler future), it renews nothing: after taking the row lock it sees the
+dispatch's token cancelled and rolls back. The token is checked once, between
+the lock and the update, so a dispatch that ends in that window still gets one
+last renewal, which delays the reaper by at most one lease. Graceful shutdown
+does not cancel that token, so handlers keep their leases while they drain.
 
 ## Admin Actions
 
@@ -176,8 +231,8 @@ was still open) can still be included. Each batch locks its rows
 `FOR UPDATE SKIP LOCKED`, so two bulk actions on the same name split the work,
 and a row locked by a handler or a claim is skipped. A batch can also come back
 short when a row it found changed before it locked it. A short batch ends the
-call with `more_remain = false`, so `more_remain = false` does not prove that no
-matching task is left: count again.
+call with `BulkStop::ShortBatch`, which therefore does not prove that no
+matching task is left: count again, or run the action again.
 
 ## Crash Recovery
 
@@ -200,12 +255,20 @@ Fencing protects PostgreSQL state, not remote systems. This is a valid history:
 
 So:
 
-- pass `ctx.task_key` as the remote idempotency key for every once-per-task
-  effect. It is stable across retries and replay.
-- where the remote supports ordered conditional writes, also pass
-  `ctx.lease.lock_token` as a fencing token.
-- without remote idempotency or fencing, duplicate external effects remain
-  possible.
+- a non-idempotent external effect needs deduplication on the receiving side,
+  keyed to the logical effect. Pass `ctx.task_key` as the remote idempotency
+  key, with the effect's name if a task has more than one effect. It is stable
+  across retries and replay.
+- fencing is a different guarantee. Where the remote supports ordered
+  conditional writes, also pass `ctx.lease.lock_token` as a fencing token: a
+  receiver that keeps the highest token it has seen rejects a stale write from
+  an earlier owner. It does not deduplicate. Worker A's call with token 1 and
+  worker B's retry with token 2 both pass the fence.
+- `lock_token` is ordered only within one task row. A `task_key` can be reused
+  once retention has deleted its row, and the new row's tokens start again, so
+  scope a remote fence to the task id (`ctx.lease.task_id`), not to the
+  `task_key`.
+- without remote deduplication, duplicate external effects remain possible.
 
 ## PostgreSQL-Contained Effects and the Outbox
 
@@ -226,9 +289,16 @@ per key, and a duplicate returns the existing task. Enqueue inside the producer'
 own transaction to make the domain change and the task atomic. Use
 `READ COMMITTED`: the duplicate path re-reads the committed winner.
 
-A key stays reserved while its row exists. Retention never deletes terminal rows
-younger than `Retention::idempotency_horizon`, and the builder rejects a
-retention configuration that would.
+`READ COMMITTED` is a host requirement for every direct store caller. The
+transitions' recheck after a lock wait, `ensure_job`'s recreate-on-delete and
+claim all rely on it; under `REPEATABLE READ` they fail safely with a `40001`
+serialization error rather than their documented outcome. The materializer
+enforces `READ COMMITTED` itself.
+
+A key stays reserved while its row exists, so retention is the idempotency
+horizon: `Retention::done` for `done` tasks, and `Retention::dead` for `dead` and
+`cancelled` ones (30 days each by default). A key can be reused once cleanup has
+deleted its row.
 
 With the `cron` feature, every scheduler also materializes due schedules, at
 most once per `max_poll_interval`. It locks one schedule row with `SKIP LOCKED`,
@@ -273,15 +343,24 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 ## Capacity and Operations
 
 - **Connection pool:** each scheduler permanently holds one connection for
-  `LISTEN`. Claims, heartbeats, finalization, maintenance, and DB-contained
-  handlers take short-lived connections. Each scheduler needs 1 connection for
-  `LISTEN`, plus 1 for claims and maintenance, plus up to the sum of queue limits
-  for heartbeats and finalization, plus one per handler that takes its own. So
-  size `max_size ≥ sum of queue limits + 2` per scheduler sharing the pool, plus
-  whatever handlers take. If DB-contained handlers share an undersized pool,
-  heartbeats wait for connections until local deadlines drop the handlers.
-  Deadpool's default `max_size` is 2 × the logical CPU count (4 on a 2-vCPU
-  host), well below the 16 + 2 = 18 that the default queue's limit of 16 needs.
+  `LISTEN`. Claims, heartbeats, finalization, maintenance, the worker registry,
+  dead-lettering and DB-contained handlers take short-lived connections.
+  Maintenance, the registry and dead-lettering each run on a task of their own,
+  so a stalled database can hold all three at once. Each scheduler needs a
+  connection for each of `LISTEN`, the claim loop (claims and cron
+  materialization), maintenance, the worker registry, and dead-lettering
+  poisoned rows, plus up to the sum of queue limits for heartbeats and
+  finalization. So size `max_size ≥ sum of queue limits + 5` per scheduler
+  sharing the pool. On top of that, a handler that finishes while its
+  heartbeat transaction is still in flight briefly holds a second connection,
+  and its finishing update waits on that transaction's row lock anyway. Add
+  whatever handlers and the host take. If DB-contained handlers share an
+  undersized pool, heartbeats wait for connections until local deadlines drop
+  the handlers. Deadpool's default `max_size` is 2 × the logical CPU count (4
+  on a 2-vCPU host), well below the 16 + 5 = 21 that the default queue's limit
+  of 16 needs.
+  At most one dead-letter task runs at a time; rows poisoned while it runs stay
+  `running`, and the reaper recovers them after their lease.
 - **Sizing:** the handlers needed across all instances are about arrival rate ×
   average handler duration (Little's law). Each instance's limit is that number
   divided by the instance count, times 1.5 to 2 for bursts and retries. Keep
@@ -292,7 +371,9 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   above the longest DB-contained transaction. A database outage longer than the
   lease lets another worker start the task.
 - **Timeouts:** configure `statement_timeout` and `lock_timeout` on pool
-  connections. Queue statements are short.
+  connections. Queue statements are short. The worker's heartbeat bounds its
+  own transaction by the time left on its lease, but never raises a stricter
+  value the host set.
 - **Retry storms:** exponential backoff with jitter spreads correlated failures.
   `crash_retry_delay` does the same for crash loops.
 - **Table health:** every claim, heartbeat, retry, and finalization updates the
@@ -303,7 +384,7 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
   so a cleanup backlog never delays lease recovery. Sustained input above
   capacity still grows `queued`. Watch `store::queue_stats`.
 
-## Failure Semantics (§22)
+## Failure Semantics
 
 | Failure | Result |
 | --- | --- |
@@ -312,14 +393,15 @@ Polling is authoritative. `LISTEN/NOTIFY` only reduces latency:
 | Worker crashes before claim commit | The claim rolls back; the task stays `queued`. |
 | Worker crashes after claim | The lease expires; the reaper requeues the task or marks it `dead`. |
 | Claim committed but the response was lost | The task stays `running` with no live handler; the reaper recovers it after expiry. |
+| Dead-lettering a poisoned row fails, is busy with another batch, or shutdown aborts it | The row stays `running`; the reaper requeues it after expiry, and a later claim poisons it again until its attempts run out. |
 | Completion committed but the response was lost | The task is `done`; nothing re-runs it. |
 | PostgreSQL unavailable | No transition happens; claim errors (and, with `cron`, materialize errors) set `Degraded`; heartbeat and maintenance failures do not affect health, and a worker with no free handler slot in any queue runs no claim cycle so it keeps its last status. Workers retry without inventing local state. |
 | Graceful shutdown with handlers still running | Shutdown cancels every `ctx.cancellation` and drains for up to `shutdown_timeout`. A handler that returns `TaskError::interrupted()`, or is still running at the timeout and is dropped, has its task released: back to `queued`, due at once, the attempt not counted. A release not finished within 5 s more (the database is unreachable, or a dropped DB-contained transaction still holds the row lock) is aborted; the reaper recovers that task after the lease, and the attempt counts. A kept-alive pool can leave a dropped transaction's connection holding that lock, so exit the process after shutdown. |
 
 ## Validation Status
 
-The integration suite covers every §27 requirement. See the table in
-[Scheduler Design](SchedulerDesign.md#testing-contract-27). It also covers:
+The integration suite covers every requirement of the
+[testing contract](SchedulerDesign.md#testing-contract). It also covers:
 heartbeats while a handler holds the row lock, replay followed by a reclaim,
 notification and next-due wakeups, shutdown without detached work, and shutdown
 release: an interrupted handler, a handler still running at `shutdown_timeout`,
@@ -338,7 +420,8 @@ Not yet automated:
 - process-kill fault injection at random points around claim, effect,
   completion, and heartbeat;
 - database outages longer than a lease;
-- pool exhaustion;
+- pool exhaustion (stalled maintenance, registry and dead-letter writes are
+  covered by `worker::stalled_background_work_leaves_room_for_healthy_work`);
 - throughput and latency at production scale.
 
 Run these with the host's PostgreSQL version, pool sizing, payload sizes, and

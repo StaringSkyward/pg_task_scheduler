@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -8,6 +9,8 @@ use crate::ids::IdentifierError;
 use crate::ids::QueueName;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
+use crate::models::LeaseDuration;
+use crate::models::MAX_DURATION;
 use crate::models::Retention;
 use crate::pool::SchedulerPool;
 use crate::queue::Task;
@@ -16,27 +19,23 @@ use crate::runtime::health::WorkerHealth;
 use crate::runtime::registry::Registry;
 
 const SIXTEEN: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-const HUNDRED: NonZeroUsize = NonZeroUsize::new(100).unwrap();
-
-/// Longest duration `build()` accepts for any setting: 5 years (5 × 365 days). Every
-/// duration becomes a PostgreSQL interval added to or subtracted from `now()`, and a far
-/// larger one (such as `Duration::MAX`) fails each such statement with
-/// "timestamp out of range".
-const MAX_DURATION: Duration = Duration::from_secs(5 * 365 * 86_400);
+const CLAIM_BATCH: NonZeroU32 = NonZeroU32::new(16).unwrap();
+const REAPER_BATCH: NonZeroU32 = NonZeroU32::new(100).unwrap();
 
 pub(crate) struct Config {
     pub worker_id: WorkerId,
     /// Served queues and their handler limits, in configuration order.
     pub queues: Vec<(QueueName, NonZeroUsize)>,
-    pub claim_batch_size: NonZeroUsize,
-    pub lease_duration: Duration,
+    pub claim_batch_size: NonZeroU32,
+    /// Set from the builder's unchecked setting by `build()`.
+    pub lease_duration: LeaseDuration,
     pub heartbeat_interval: Duration,
     pub max_poll_interval: Duration,
     pub base_retry_delay: Duration,
     pub max_retry_delay: Duration,
     pub retry_jitter: Duration,
     pub reaper_interval: Duration,
-    pub reaper_batch_size: NonZeroUsize,
+    pub reaper_batch_size: NonZeroU32,
     pub crash_retry_delay: Duration,
     pub retention: Retention,
     pub shutdown_timeout: Duration,
@@ -51,6 +50,8 @@ pub struct SchedulerBuilder<P: SchedulerPool> {
     pool: P,
     registry: Registry,
     config: Config,
+    /// The unchecked `lease_duration` setting; `build()` checks it into `config`.
+    lease_duration: Duration,
     /// `(T::NAME, T::QUEUE)` of typed registrations, for the unserved-queue warning.
     typed_queues: Vec<(&'static str, QueueName)>,
 }
@@ -70,9 +71,7 @@ macro_rules! setters {
 impl<P: SchedulerPool> SchedulerBuilder<P> {
     setters! {
         /// Most tasks taken per claim statement, per queue (default 16).
-        claim_batch_size: NonZeroUsize;
-        /// Lease granted by each claim and heartbeat, in PostgreSQL time (default 60 s).
-        lease_duration: Duration;
+        claim_batch_size: NonZeroU32;
         /// Heartbeat period; at most a third of `lease_duration` (default 20 s).
         heartbeat_interval: Duration;
         /// Longest idle wait between polls (default 1 s).
@@ -86,7 +85,7 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         /// Period of the reaper and retention cleanup (default 20 s).
         reaper_interval: Duration;
         /// Expired leases recovered per reaper statement (default 100).
-        reaper_batch_size: NonZeroUsize;
+        reaper_batch_size: NonZeroU32;
         /// Delay before a reaped task is due again (default 10 s).
         crash_retry_delay: Duration;
         /// Retention of terminal rows (default [`Retention::default`]).
@@ -98,6 +97,13 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
         /// Period of the worker's registry row refresh; the row reads as lost after 3 × this
         /// (default 15 s).
         registry_interval: Duration;
+    }
+
+    /// Lease granted by each claim and heartbeat, in PostgreSQL time; from 1 microsecond to
+    /// 5 years (default 60 s).
+    pub fn lease_duration(mut self, value: Duration) -> Self {
+        self.lease_duration = value;
+        self
     }
 
     /// The worker's name in the registry (default: the `HOSTNAME` environment variable when
@@ -154,9 +160,9 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
 
     /// Checks the configuration and makes the scheduler. Fails with
     /// [`SchedulerError::Config`] if no handler is registered, a duration is over 5 years,
-    /// an interval is zero, `heartbeat_interval` is over a third of `lease_duration`,
-    /// `base_retry_delay` exceeds `max_retry_delay`, or `done` or `dead` retention is
-    /// shorter than the idempotency horizon. Logs a warning for each registered
+    /// an interval is under 1 microsecond, a queue limit exceeds
+    /// [`tokio::sync::Semaphore::MAX_PERMITS`], `heartbeat_interval` is over a third of `lease_duration`,
+    /// or `base_retry_delay` exceeds `max_retry_delay`. Logs a warning for each registered
     /// [`Task`] whose `QUEUE` this worker does not serve.
     pub fn build(mut self) -> Result<Scheduler<P>, SchedulerError> {
         if self.config.queues.is_empty() {
@@ -171,10 +177,10 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
                 );
             }
         }
+        let lease = LeaseDuration::try_from(self.lease_duration)
+            .map_err(|e| SchedulerError::Config(e.to_string()))?;
         let c = &self.config;
-        let r = &c.retention;
         let durations = [
-            c.lease_duration,
             c.heartbeat_interval,
             c.max_poll_interval,
             c.base_retry_delay,
@@ -184,39 +190,39 @@ impl<P: SchedulerPool> SchedulerBuilder<P> {
             c.crash_retry_delay,
             c.shutdown_timeout,
             c.registry_interval,
-            r.done,
-            r.dead,
-            r.idempotency_horizon,
-            r.outbox_published,
         ];
+        c.retention.check()?;
         let invalid = if self.registry.is_empty() {
             Some("at least one handler must be registered")
         } else if durations.iter().any(|d| *d > MAX_DURATION) {
             Some("every duration must be at most 5 years")
         } else if [
-            c.lease_duration,
             c.heartbeat_interval,
             c.max_poll_interval,
             c.reaper_interval,
             c.registry_interval,
         ]
-        .contains(&Duration::ZERO)
+        .iter()
+        .any(|d| d.as_micros() == 0)
         {
-            Some("lease, heartbeat, poll, reaper and registry intervals must be greater than zero")
-        } else if c.heartbeat_interval.saturating_mul(3) > c.lease_duration {
+            Some("heartbeat, poll, reaper and registry intervals must be at least 1 microsecond")
+        } else if c
+            .queues
+            .iter()
+            .any(|(_, limit)| limit.get() > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            Some("a queue limit must be at most tokio::sync::Semaphore::MAX_PERMITS")
+        } else if c.heartbeat_interval.saturating_mul(3) > lease.get() {
             Some("heartbeat_interval must be at most a third of lease_duration")
         } else if c.base_retry_delay > c.max_retry_delay {
             Some("base_retry_delay must not exceed max_retry_delay")
-        } else if c.retention.done < c.retention.idempotency_horizon
-            || c.retention.dead < c.retention.idempotency_horizon
-        {
-            Some("done and dead retention must be at least the idempotency horizon")
         } else {
             None
         };
         if let Some(message) = invalid {
             return Err(SchedulerError::Config(message.into()));
         }
+        self.config.lease_duration = lease;
         let (health_tx, _) = tokio::sync::watch::channel(WorkerHealth::default());
         Ok(Scheduler {
             pool: self.pool,
@@ -244,18 +250,19 @@ impl<P: SchedulerPool> Scheduler<P> {
             pool,
             registry: Registry::new(),
             typed_queues: Vec::new(),
+            lease_duration: LeaseDuration::DEFAULT.get(),
             config: Config {
                 worker_id: WorkerId::generate(),
                 queues: Vec::new(),
-                claim_batch_size: SIXTEEN,
-                lease_duration: Duration::from_secs(60),
+                claim_batch_size: CLAIM_BATCH,
+                lease_duration: LeaseDuration::DEFAULT,
                 heartbeat_interval: Duration::from_secs(20),
                 max_poll_interval: Duration::from_secs(1),
                 base_retry_delay: Duration::from_secs(1),
                 max_retry_delay: Duration::from_secs(300),
                 retry_jitter: Duration::from_secs(1),
                 reaper_interval: Duration::from_secs(20),
-                reaper_batch_size: HUNDRED,
+                reaper_batch_size: REAPER_BATCH,
                 crash_retry_delay: Duration::from_secs(10),
                 retention: Retention::default(),
                 shutdown_timeout: Duration::from_secs(25),
@@ -405,21 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_retention_shorter_than_idempotency_horizon() {
-        let r = Retention::default();
-        let short = r.idempotency_horizon - secs(1);
-        assert!(rejected(
-            builder().retention(Retention { done: short, ..r })
-        ));
-        assert!(rejected(
-            builder().retention(Retention { dead: short, ..r })
-        ));
-        let at_horizon = Retention {
-            done: r.idempotency_horizon,
-            dead: r.idempotency_horizon,
-            ..r
-        };
-        assert!(builder().retention(at_horizon).build().is_ok());
+    fn build_stores_the_checked_lease() {
+        let s = builder().lease_duration(secs(90)).build().unwrap();
+        assert_eq!(s.config.lease_duration.get(), secs(90));
     }
 
     #[test]
@@ -435,13 +430,6 @@ mod tests {
     fn build_rejects_durations_over_5_years() {
         assert_eq!(MAX_DURATION, secs(157_680_000));
         let over = MAX_DURATION + secs(1);
-        let r = Retention::default();
-        let horizon = |d| Retention {
-            done: d,
-            dead: d,
-            idempotency_horizon: d,
-            ..r
-        };
         // Each setting, with any companion value its other rules need. heartbeat_interval is
         // absent: at most lease / 3, it can never reach the cap without the lease passing it.
         type Set = fn(SchedulerBuilder<FakePool>, Duration) -> SchedulerBuilder<FakePool>;
@@ -481,8 +469,6 @@ mod tests {
             );
             assert!(rejected(set(builder(), over)), "setting {i} over the cap");
         }
-        assert!(rejected(builder().retention(horizon(over))));
-        assert!(builder().retention(horizon(MAX_DURATION)).build().is_ok());
         assert!(rejected(builder().max_retry_delay(Duration::MAX)));
     }
 
@@ -497,5 +483,28 @@ mod tests {
     #[test]
     fn build_rejects_zero_registry_interval() {
         assert!(rejected(builder().registry_interval(Duration::ZERO)));
+    }
+
+    #[test]
+    fn build_rejects_intervals_below_one_microsecond() {
+        let ns = Duration::from_nanos;
+        assert!(rejected(
+            builder().lease_duration(ns(3)).heartbeat_interval(ns(1))
+        ));
+        assert!(rejected(builder().max_poll_interval(ns(999))));
+        assert!(
+            builder()
+                .max_poll_interval(Duration::from_micros(1))
+                .build()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn build_rejects_queue_limit_above_semaphore_max() {
+        let over = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).unwrap();
+        let max = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).unwrap();
+        assert!(rejected(builder().queue("default", over).unwrap()));
+        assert!(builder().queue("default", max).unwrap().build().is_ok());
     }
 }

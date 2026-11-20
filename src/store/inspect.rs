@@ -9,12 +9,17 @@ use crate::error::SchedulerError;
 use crate::ids::LockToken;
 use crate::ids::QueueName;
 use crate::ids::TaskId;
-use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::Attempt;
+use crate::models::AttemptNo;
+use crate::models::AttemptState;
+use crate::models::MaxAttempts;
 use crate::models::QueueDepth;
 use crate::models::QueueStats;
+use crate::models::StoredTaskKey;
+use crate::models::TaskPayload;
+use crate::models::TaskState;
 use crate::models::TaskView;
 use crate::models::interval_to_duration;
 
@@ -23,13 +28,13 @@ struct TaskRow {
     #[diesel(sql_type = sql_types::BigInt)]
     id: TaskId,
     #[diesel(sql_type = sql_types::Text)]
-    task_key: TaskKey,
+    task_key: String,
     #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Text)]
     queue: QueueName,
-    #[diesel(sql_type = sql_types::Jsonb)]
-    payload: serde_json::Value,
+    #[diesel(sql_type = sql_types::Text)]
+    payload: String,
     #[diesel(sql_type = sql_types::Text)]
     status: String,
     #[diesel(sql_type = sql_types::Integer)]
@@ -82,7 +87,7 @@ pub async fn task(
     id: TaskId,
 ) -> Result<Option<TaskView>, SchedulerError> {
     let row = diesel::sql_query(
-        "SELECT id, task_key, task_name, queue, payload, status, priority, due_at, attempts, \
+        "SELECT id, task_key::text AS task_key, task_name, queue, payload::text AS payload, status, priority, due_at, attempts, \
          max_attempts, locked_by, lock_token, locked_until, last_error, created_at, \
          updated_at, completed_at, admin_action_id FROM queue_tasks WHERE id = $1",
     )
@@ -93,25 +98,21 @@ pub async fn task(
     row.map(|r| {
         Ok(TaskView {
             id: r.id,
-            task_key: r.task_key,
+            task_key: StoredTaskKey::from_text(r.task_key),
             task_name: r.task_name,
             queue: r.queue,
-            payload: r.payload,
-            status: r
-                .status
-                .parse()
-                .map_err(|_| SchedulerError::Invariant("unknown task status"))?,
+            payload: TaskPayload::from_text(r.payload),
+            state: TaskState::from_columns(&r.status, r.locked_by, r.locked_until, r.completed_at)?,
             priority: r.priority,
             due_at: r.due_at,
-            attempts: r.attempts,
-            max_attempts: r.max_attempts,
-            locked_by: r.locked_by,
+            attempts: u32::try_from(r.attempts)
+                .map_err(|_| SchedulerError::Invariant("stored attempts is negative"))?,
+            max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
+                .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
             lock_token: r.lock_token,
-            locked_until: r.locked_until,
             last_error: r.last_error,
             created_at: r.created_at,
             updated_at: r.updated_at,
-            completed_at: r.completed_at,
             admin_action_id: r.admin_action_id,
         })
     })
@@ -133,16 +134,12 @@ pub async fn attempts(
     .into_iter()
     .map(|r| {
         Ok(Attempt {
-            attempt_no: r.attempt_no,
+            attempt_no: AttemptNo::from_db_i32(r.attempt_no)
+                .map_err(|_| SchedulerError::Invariant("stored attempt_no is not positive"))?,
             lock_token: r.lock_token,
             worker_id: r.worker_id,
             started_at: r.started_at,
-            finished_at: r.finished_at,
-            outcome: r
-                .outcome
-                .map(|o| o.parse())
-                .transpose()
-                .map_err(|_| SchedulerError::Invariant("unknown attempt outcome"))?,
+            state: AttemptState::from_columns(r.finished_at, r.outcome.as_deref())?,
             error: r.error,
         })
     })

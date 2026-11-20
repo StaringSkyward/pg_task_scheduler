@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -14,23 +14,29 @@ use crate::ids::TaskId;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
+use crate::models::AttemptNo;
 use crate::models::ClaimedTask;
+use crate::models::LeaseDuration;
+use crate::models::MaxAttempts;
 use crate::models::TaskLease;
 use crate::models::interval_to_duration;
 use crate::models::pg_interval;
+use crate::store::transitions::fail_owned;
 
 #[derive(diesel::QueryableByName)]
 struct ClaimedRow {
     #[diesel(sql_type = sql_types::BigInt)]
     id: TaskId,
+    /// Raw: see [`claim`] for why a bad key must not fail the decode.
     #[diesel(sql_type = sql_types::Text)]
-    task_key: TaskKey,
+    task_key: String,
     #[diesel(sql_type = sql_types::Text)]
     task_name: TaskName,
     #[diesel(sql_type = sql_types::Text)]
     queue: QueueName,
-    #[diesel(sql_type = sql_types::Jsonb)]
-    payload: serde_json::Value,
+    /// Raw text, parsed per row: see [`claim`].
+    #[diesel(sql_type = sql_types::Text)]
+    payload: String,
     #[diesel(sql_type = sql_types::Integer)]
     attempts: i32,
     #[diesel(sql_type = sql_types::Integer)]
@@ -61,7 +67,7 @@ const CLAIM: &str = r#"
             lock_token = q.lock_token + 1,
             locked_until = clock_timestamp() + $4::interval, updated_at = now()
         FROM candidate AS c WHERE q.id = c.id
-        RETURNING q.id, q.task_key, q.task_name, q.queue, q.payload, q.attempts, q.max_attempts,
+        RETURNING q.id, q.task_key, q.task_name, q.queue, q.payload::text AS payload, q.attempts, q.max_attempts,
                   q.lock_token, q.locked_until, q.due_at
     ), recorded AS (
         INSERT INTO queue_task_attempts (task_id, attempt_no, lock_token, worker_id)
@@ -73,44 +79,121 @@ const CLAIM: &str = r#"
     ORDER BY id
 "#;
 
+/// What one [`claim`] leased: the rows ready to run, and the rows it could not convert.
+#[derive(Debug, Clone)]
+pub struct ClaimBatch {
+    /// Leased rows that converted cleanly, ready for their handlers.
+    pub ready: Vec<ClaimedTask>,
+    /// Leased rows that failed conversion; [`dead_letter`] each one.
+    pub poisoned: Vec<PoisonedClaim>,
+}
+
+/// A row [`claim`] leased but could not turn into a [`ClaimedTask`]: a bad `task_key`, a
+/// payload `serde_json` rejects, or a stored count that is not positive. It is still
+/// `running` under this lease.
+#[derive(Debug, Clone)]
+pub struct PoisonedClaim {
+    /// The leased task.
+    pub task_id: TaskId,
+    /// The worker that holds the lease.
+    pub worker_id: WorkerId,
+    /// The lease's token.
+    pub lock_token: LockToken,
+    /// Why the row cannot run, recorded as its error when dead-lettered.
+    pub reason: String,
+}
+
 /// Atomically claim up to `limit` due tasks of `queue` whose name is in `task_names`,
 /// leasing each for `lease` of PostgreSQL time.
+///
+/// Rows that fail conversion come back in [`ClaimBatch::poisoned`], still leased and
+/// untouched, so the healthy rows are never held up behind them. Callers of `claim` itself
+/// should [`dead_letter`] each one after dispatching the ready rows; one they leave stays
+/// `running` until its lease expires, the reaper requeues it, and a later claim poisons it
+/// again until its attempts run out. [`Scheduler`](crate::Scheduler) dead-letters them for you, one batch at a time; rows
+/// claimed while it is busy are left to the reaper.
 pub async fn claim(
     conn: &mut AsyncPgConnection,
     worker: &WorkerId,
     queue: &QueueName,
-    task_names: &[String],
-    limit: NonZeroUsize,
-    lease: Duration,
-) -> Result<Vec<ClaimedTask>, SchedulerError> {
-    let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
+    task_names: &[TaskName],
+    limit: NonZeroU32,
+    lease: LeaseDuration,
+) -> Result<ClaimBatch, SchedulerError> {
     let rows = diesel::sql_query(CLAIM)
         .bind::<sql_types::Array<sql_types::Text>, _>(task_names)
-        .bind::<sql_types::BigInt, _>(limit)
+        .bind::<sql_types::BigInt, _>(i64::from(limit.get()))
         .bind::<sql_types::Text, _>(worker)
-        .bind::<sql_types::Interval, _>(pg_interval(lease))
+        .bind::<sql_types::Interval, _>(pg_interval(lease.get())?)
         .bind::<sql_types::Text, _>(queue)
         .get_results::<ClaimedRow>(conn)
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| ClaimedTask {
-            lease: TaskLease {
-                task_id: r.id,
-                worker_id: worker.clone(),
-                lock_token: r.lock_token,
-                attempt_no: r.attempts,
-            },
-            task_key: r.task_key,
-            task_name: r.task_name,
-            queue: r.queue,
-            payload: r.payload,
-            max_attempts: r.max_attempts,
-            due_at: r.due_at,
-            claimed_at: r.claimed_at,
-            locked_until: r.locked_until,
-        })
-        .collect())
+    let mut batch = ClaimBatch {
+        ready: Vec::with_capacity(rows.len()),
+        poisoned: Vec::new(),
+    };
+    for r in rows {
+        // The claim has already committed, so a row that fails conversion must not fail the call:
+        // that would strand the whole batch running until its leases expire. JSONB accepts numbers
+        // serde_json rejects, so a raw-SQL producer can store such rows; a bad task_key needs the
+        // identifier CHECK dropped by hand. Return that one row as poisoned, and the rest as ready.
+        match convert(r, worker) {
+            Ok(task) => batch.ready.push(task),
+            Err(poisoned) => batch.poisoned.push(poisoned),
+        }
+    }
+    Ok(batch)
+}
+
+fn convert(r: ClaimedRow, worker: &WorkerId) -> Result<ClaimedTask, PoisonedClaim> {
+    let poisoned = |reason: String| PoisonedClaim {
+        task_id: r.id,
+        worker_id: worker.clone(),
+        lock_token: r.lock_token,
+        reason,
+    };
+    // Unreachable through the schema (`attempts >= 0` and the claim increments it); kept as a
+    // row-local guard.
+    let attempt_no = AttemptNo::from_db_i32(r.attempts)
+        .map_err(|_| poisoned("invalid attempt_no: stored value is not positive".into()))?;
+    let task_key =
+        TaskKey::try_from(r.task_key).map_err(|e| poisoned(format!("invalid task_key: {e}")))?;
+    let payload =
+        serde_json::from_str(&r.payload).map_err(|e| poisoned(format!("invalid payload: {e}")))?;
+    let max_attempts = MaxAttempts::from_db_i32(r.max_attempts)
+        .map_err(|_| poisoned("invalid max_attempts: stored value is not positive".into()))?;
+    Ok(ClaimedTask {
+        lease: TaskLease {
+            task_id: r.id,
+            worker_id: worker.clone(),
+            lock_token: r.lock_token,
+            attempt_no,
+        },
+        task_key,
+        task_name: r.task_name,
+        queue: r.queue,
+        payload,
+        max_attempts,
+        due_at: r.due_at,
+        claimed_at: r.claimed_at,
+        locked_until: r.locked_until,
+    })
+}
+
+/// Fail a [`PoisonedClaim`] permanently (`dead`), with its reason as the error, while its
+/// lease still holds. [`SchedulerError::LostOwnership`] once the lease has expired or moved on.
+pub async fn dead_letter(
+    conn: &mut AsyncPgConnection,
+    claim: &PoisonedClaim,
+) -> Result<(), SchedulerError> {
+    fail_owned(
+        conn,
+        claim.task_id,
+        &claim.worker_id,
+        claim.lock_token,
+        &claim.reason,
+    )
+    .await
 }
 
 #[derive(diesel::QueryableByName)]
@@ -127,7 +210,7 @@ struct WaitRow {
 pub async fn next_due_in(
     conn: &mut AsyncPgConnection,
     queues: &[QueueName],
-    task_names: &[String],
+    task_names: &[TaskName],
 ) -> Result<Option<Duration>, SchedulerError> {
     let row = diesel::sql_query(
         "SELECT min(next.due_at) - now() AS wait \

@@ -22,6 +22,13 @@ Tests are cited as `file::test`, under `tests/` for the core crate and
 `admin/tests/` (or a `src` module) for the admin crate. "Spec §N" is a section
 of the design spec; a bare "§N.M" is an entry in this document.
 
+Reviews 01, 03 and 04 changed some of these decisions after they shipped. An
+entry a review changed is updated and says **Changed by review 01**, **Changed
+by review 03** or **Changed by review 04**; an entry it replaced says
+**Superseded** and is kept as history.
+Both link to the entry in [Review decisions](ReviewDecisions.md) that says what
+changed and why.
+
 **Contents**
 
 1. [Architecture and crates](#1-architecture-and-crates)
@@ -77,14 +84,17 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Decision:** The worker registry, the `cancelled` status, cancel, bulk
   actions, pause and the action audit live in the core crate, with no feature
   flag.
-- **Why:** Their running cost is one upsert per worker every 15 s and one
-  primary-key probe of a tiny table per claim. A standalone UI pointed at
+- **Why:** Their running cost is one registry write per worker every 15 s and
+  one primary-key probe of a tiny table per claim. A standalone UI pointed at
   workers that never opted in would report every queue as having no live
   worker. Cancel and pause are useful from code too.
-- **Expected behaviour:** Every user must apply migration `0003`, UI or not
-  (§9). The core API exposes `store::cancel`, `store::cancel_matching`,
+- **Expected behaviour:** Every user must apply migration `0003`, UI or not.
+  The core API exposes `store::cancel`, `store::cancel_matching`,
   `store::replay_matching`, `store::pause_queue`, `store::resume_queue`,
   `store::workers` and the bounded read APIs.
+- **Changed by review 01:** a registry write is now one transaction of five
+  statements, not one upsert
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 1.4 The JSON routes moved under `/api/` and take the operator from auth
 
@@ -102,9 +112,28 @@ of the design spec; a bare "§N.M" is an entry in this document.
   `task is not dead or cancelled, or does not exist`. Like the forms, it trims
   the reason and answers 400 `a reason is required` when it is blank
   (`api::replay_route_requires_reason`).
+- **Changed by review 01:** `GET /api/jobs` rows gain `task_name`. Their
+  `is_paused` field stays, derived from the new pause relation
+  ([Review decisions, entry 18](ReviewDecisions.md#18-the-admin-json-api-keeps-its-wire-fields)).
+- **Changed by review 03:** `GET /api/tasks/:id` gains `payload`, either
+  `{"json": ...}` or, for a stored payload that does not parse,
+  `{"unreadable": {"text", "error"}}`. `GET /api/jobs`
+  lists a schedule whose arguments do not parse
+  ([Review decisions, entries 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)
+  and [40](ReviewDecisions.md#40-schedule-reads-do-not-decode-arguments)).
+- **Changed by review 04:** `task_key` in `GET /api/tasks/:id` is tagged like
+  `payload`: `{"valid": "<key>"}`, or `{"invalid": {"text", "error"}}` for a
+  stored key that breaks the identifier rule. It was a string, and such a task
+  could not be read at all
+  ([Review decisions, entry 44](ReviewDecisions.md#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
 
 ### 1.5 `queue_admin_actions` replaces `queue_task_replays`
 
+- **Superseded by review 01:** the migrations were edited in place, so `0003`
+  creates `queue_admin_actions` and nothing else ever held replays; there is no
+  copy and no migration test
+  ([Review decisions, entry 17](ReviewDecisions.md#17-the-migrations-were-edited-in-place)).
+  The rest of this entry is history.
 - **Source:** spec §5.1.6 (call); Ledger ruling 1 (pre-flight).
 - **Decision:** `0003` creates `queue_admin_actions`, copies every
   `queue_task_replays` row into it as a `replay` action, then drops
@@ -480,7 +509,11 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Why:** Offsets and totals grow with the table.
 - **Expected behaviour:** A queue with 60 due tasks shows 50, and Next shows the
   other 10 (`pages::queued_page_lists_in_dequeue_order_with_next_link`). An
-  incomplete cursor is 400.
+  incomplete cursor is 400, and so is a forged Queued cursor whose position
+  would overflow (`invalid cursor`).
+- **Changed by review 01:** the page size is a `NonZeroU32`, and cursor
+  positions use checked arithmetic
+  ([Review decisions, entry 10](ReviewDecisions.md#10-limits-and-counts-have-types-that-fit-their-bounds)).
 
 ### 3.9 Overview statements see slightly different moments
 
@@ -498,14 +531,17 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Source:** spec §3, §5.1.7 (call: exact set left to the builder).
 - **Decision:** `0003` adds `queue_tasks_failed_idx` and
   `queue_tasks_failed_name_idx` (partial on `dead`/`cancelled`) and
-  `queue_admin_actions_task_idx`. It widens `queue_tasks_terminal_cleanup_idx` to
-  include `cancelled`. Nothing on queued or running rows, and nothing on
-  `queue_task_attempts` (§3.12).
+  `queue_admin_actions_task_idx`. `queue_tasks_terminal_cleanup_idx`, created by
+  `0001`, includes `cancelled`. Nothing on queued or running rows, and nothing
+  on `queue_task_attempts` (§3.12).
 - **Why:** Enqueue, claim and running→done must not maintain a new index.
-- **Expected behaviour:** Enqueue, claim and completion write exactly the
-  indexes they wrote before `0003`, and closing an attempt can stay a HOT update
+- **Expected behaviour:** Enqueue, claim and completion write only the indexes
+  `0001` creates, and closing an attempt can stay a HOT update
   (`performance::attempt_close_stays_hot_eligible`). The one extra hot-path work
   is the pause check in claims (§5.15).
+- **Changed by review 01:** `0001` used to create the cleanup index without
+  `cancelled`, and `0003` widened it
+  ([Review decisions, entry 17](ReviewDecisions.md#17-the-migrations-were-edited-in-place)).
 
 ### 3.11 Bulk cancel writes its status test as `OR`
 
@@ -896,8 +932,9 @@ of the design spec; a bare "§N.M" is an entry in this document.
      `id ≤ max_task_id`, `FOR UPDATE SKIP LOCKED`, the same transition as the
      single action, and `affected = affected + n` on the audit row;
   3. sends one `NOTIFY` after each non-empty replay batch;
-  4. stops when a batch is short (`more_remain = false`), or after a full batch
-     once the budget (10 s) has passed (`more_remain = true`).
+  4. stops when a batch is short (`BulkStop::ShortBatch`), or after a full
+     batch once the budget (10 s) has passed (`BulkStop::BudgetSpent`), and
+     returns which in `BulkOutcome::stopped`.
   The bulk cancel includes running tasks.
 - **Why:** The id bound makes a call finish even while producers keep enqueuing
   the name; storing it shows in the audit which tasks the action could cover.
@@ -910,10 +947,12 @@ of the design spec; a bare "§N.M" is an entry in this document.
   enqueued during the call are not touched; every row with this action has
   `id ≤ max_task_id`
   (`bulk::cancel_matching_ignores_tasks_enqueued_after_it_started`). With 1,200
-  tasks and a zero budget: 500 per call with `more_remain`, then a final short
+  tasks and a zero budget: 500 per call with `BudgetSpent`, then a final short
   batch (`bulk::bulk_stops_at_budget_and_continues`). Replay with error `x`
   leaves the `y` rows dead (`bulk::replay_matching_filters_by_last_error`).
   To stop new arrivals, pause the queue or fix the producer.
+- **Changed by review 01:** the outcome was a `more_remain` boolean
+  ([Review decisions, entry 12](ReviewDecisions.md#12-a-bulk-result-says-why-it-stopped)).
 
 ### 5.12 Concurrent and double-submitted bulk actions split the work
 
@@ -926,30 +965,42 @@ of the design spec; a bare "§N.M" is an entry in this document.
   values sum to 1,200, 1,200 rows are cancelled, two action rows exist, and
   neither call errors (`bulk::concurrent_bulk_cancels_split_the_work`).
 
-### 5.13 `more_remain = false` does not mean nothing is left
+### 5.13 A short batch does not mean nothing is left
 
 - **Source:** Ledger note (Task 4).
 - **Decision:** A batch shorter than 500 ends the call. A batch can be short
   because rows were locked elsewhere (`SKIP LOCKED`), or because a row changed
   between the batch's snapshot and its lock and no longer matched.
 - **Why:** Waiting for locked rows would make an admin action block workers.
-- **Expected behaviour:** After a bulk run reports no more, tasks held by a
-  `lock_owned` handler or a concurrent claim can still match. Open the confirm
-  page again to recount, and run it again if needed.
+- **Expected behaviour:** After a bulk run stops with `ShortBatch`, tasks held
+  by a `lock_owned` handler or a concurrent claim can still match
+  (`bulk::bulk_cancel_that_skips_a_locked_row_reports_short_batch`: one locked
+  row, nothing cancelled, `ShortBatch`). The result page says so and offers Run
+  again; or open the confirm page again to recount.
+- **Changed by review 01:** this case used to report `more_remain = false`,
+  which read as "nothing left", and the page offered no re-run
+  ([Review decisions, entry 12](ReviewDecisions.md#12-a-bulk-result-says-why-it-stopped)).
 
 ### 5.14 The bulk confirm step
 
 - **Source:** spec §5.4, §6.4 (call).
 - **Decision:** `GET {base}/bulk` shows the capped match count and asks for the
   task name typed again and a reason. `POST {base}/bulk` runs one budgeted call
-  and shows the count; if more remain, a Continue button re-posts the same
-  fields, which is a new action with its own audit row and id bound.
+  and shows the count, and always a button that re-posts the same fields, which
+  is a new action with its own audit row and id bound. After a spent budget the
+  button is Continue, with `More tasks may match.`; after a short batch it is
+  Run again, with `Finished, or some rows were locked by other work and
+  skipped; run again to catch them.`
 - **Why:** Bulk actions are hard to undo; typing the name prevents a slip.
 - **Expected behaviour:** A mismatched name is 400 `Type the task name to
   confirm.` and nothing changes (`actions::bulk_requires_typed_name`). Three
-  queued `a`: the confirm page shows `3`, the result `3 cancelled` with no
-  Continue (`actions::bulk_cancel_runs_and_offers_continue`). The name must match
+  queued `a`: the confirm page shows `3`, the result `3 cancelled` and Run
+  again, whose form carries the name, queue, error, typed name and reason
+  (`actions::bulk_cancel_runs_and_offers_rerun`). A spent budget shows Continue
+  (`actions::tests::budget_spent_result_offers_continue`). The name must match
   exactly, including case and spaces.
+- **Changed by review 01:** the button used to appear only when more remained
+  ([Review decisions, entry 12](ReviewDecisions.md#12-a-bulk-result-says-why-it-stopped)).
 
 ### 5.15 Pause: running tasks finish, nothing new or retried is claimed
 
@@ -999,27 +1050,36 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Source:** spec §5.2 (call).
 - **Decision:** One row per worker: `worker_id`, `label`, `started_at`,
   `last_seen_at`, `lost_after`, `status` (`starting`, `healthy`, `degraded` or
-  `stopping`, from the worker's health), `last_error`, `queues` (JSONB: name,
-  limit, in use, paused, last finished, in configuration order) and
-  `task_names`. `.label(..)` sets the label; it defaults to `HOSTNAME` when set
-  and non-empty, else NULL, and the UI shows the worker id instead.
+  `stopping`, from the worker's health) and `last_error`. Its queues (name,
+  limit, in use, last finished) are rows of `queue_worker_queues`, and its task
+  names rows of `queue_worker_task_names`; `store::workers` lists both in name
+  order, with each queue's `paused` read live (§6.6). `.label(..)` sets the
+  label; it defaults to `HOSTNAME` when set and non-empty, else NULL, and the UI
+  shows the worker id instead.
 - **Why:** These are what an operator needs to see which workers serve which
   queues and whether they keep up.
 - **Expected behaviour:** A worker with `.label("w1")`, queues `default`/2 and
   `bulk`/1 and two handlers has, within 1 s, label `w1`, status `starting` or
   `healthy`, both queues with limit, 0 in use, not paused, no last finish, both
   task names, and `lost = false`
-  (`registry::worker_registers_queues_and_task_names`).
+  (`registry::worker_registers_queues_and_task_names`). A worker that
+  re-registers with fewer queues loses the old queue rows
+  (`registry::reregistering_with_fewer_queues_drops_the_old_ones`).
+- **Changed by review 01:** queues were a JSONB column in configuration order,
+  and task names an array
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 6.3 `registry_interval`
 
 - **Source:** spec §5.2 (call: 15 s, validated like the other intervals).
-- **Decision:** A builder setting, default 15 s. `build()` rejects zero and
-  values over 5 years.
-- **Why:** Frequent enough for a live view, cheap enough to ignore: one upsert
-  per worker per interval.
+- **Decision:** A builder setting, default 15 s. `build()` rejects values
+  under 1 µs and over 5 years.
+- **Why:** Frequent enough for a live view, cheap enough to ignore: one
+  registry write (one transaction of five statements) per worker per interval.
 - **Expected behaviour:** `registry_interval(Duration::ZERO)` fails to build
   (`builder::tests::build_rejects_zero_registry_interval`).
+- **Changed by review 01:** the lower bound was zero
+  ([Review decisions, entry 9](ReviewDecisions.md#9-intervals-must-be-at-least-one-microsecond)).
 
 ### 6.4 `lost_after` is stored, so readers need no worker config
 
@@ -1044,14 +1104,20 @@ of the design spec; a bare "§N.M" is an entry in this document.
 - **Expected behaviour:** After a task finishes, `last_finished_at` is within 5 s
   of the database's `now()` (`registry::registry_reports_last_finished_and_paused`).
 
-### 6.6 `paused` is read inside the upsert
+### 6.6 `paused` is read when the workers are listed
 
-- **Source:** Plan ruling (Task 6).
-- **Decision:** Each queue entry's `paused` flag comes from `queue_pauses` in the
-  same statement that writes the row.
-- **Why:** The worker doesn't track pauses; the database already knows.
-- **Expected behaviour:** Within one `registry_interval` of a pause, the
-  worker's entry for that queue shows `paused = true` (same test).
+- **Source:** Plan ruling (Task 6); changed by review 01 (user).
+- **Decision:** The registry does not store whether a queue is paused.
+  `store::workers` reads each queue's `paused` flag from `queue_pauses` when it
+  lists the workers.
+- **Why:** The worker doesn't track pauses; the database already knows. A copy
+  in the registry was only as fresh as the worker's last write.
+- **Expected behaviour:** As soon as a pause commits, every worker serving the
+  queue shows `paused = true` (`registry::paused_is_read_when_listed`,
+  `registry::registry_reports_last_finished_and_paused`).
+- **Changed by review 01:** the upsert used to copy the flag into the row, so a
+  pause showed only after the worker's next write
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 6.7 Lifecycle: write, refresh, `stopping`, delete, prune
 
@@ -1208,6 +1274,14 @@ of the design spec; a bare "§N.M" is an entry in this document.
   attempt with outcome `retry` and a `cancel` action
   (`browse::task_detail_has_attempts_and_actions`). An unknown id is a 404 page
   (`pages::task_page_shows_attempts_and_404s`).
+- **Changed by review 03:** a payload that does not parse is shown as its
+  stored text, followed by `Unreadable payload:` and the parse error; before,
+  the whole page failed to load
+  ([Review decisions, entry 36](ReviewDecisions.md#36-producers-reject-payloads-the-worker-cannot-parse)).
+- **Changed by review 04:** a key that breaks the identifier rule is shown as
+  its stored text followed by `(invalid: <error>)`; before, the whole page
+  failed to load
+  ([Review decisions, entry 44](ReviewDecisions.md#44-a-dead-letter-with-an-invalid-task-key-can-be-opened)).
 
 ### 7.7 Mounted under a prefix
 
@@ -1368,7 +1442,16 @@ of the design spec; a bare "§N.M" is an entry in this document.
 
 ## 9. Upgrade
 
+**Superseded by review 01.** The migrations were edited in place before the
+first release, so no published version has an upgrade path, and a database
+built by an earlier version must be dropped and recreated
+([Review decisions, entry 17](ReviewDecisions.md#17-the-migrations-were-edited-in-place)).
+The entries below are history.
+
 ### 9.1 `0003` is required for everyone, and goes first
+
+- **Superseded:** every user still needs `0003`, but schema changes were edited
+  into `0001`–`0003`; there is no forward-only upgrade.
 
 - **Source:** spec §1, §3, §9 (call: a new migration the host adds to its own
   migrations).
@@ -1380,6 +1463,9 @@ of the design spec; a bare "§N.M" is an entry in this document.
   claim and report degraded. Old workers keep running against `0003` (§9.2).
 
 ### 9.2 What pre-upgrade workers do
+
+- **Superseded:** no published version ran without `0003`, so there are no
+  pre-upgrade workers.
 
 - **Source:** spec §9 (call).
 - **Decision:** Workers from before `0003` keep claiming and completing tasks
@@ -1397,6 +1483,9 @@ of the design spec; a bare "§N.M" is an entry in this document.
 
 ### 9.3 The migration takes locks
 
+- **Superseded:** `0003` no longer replaces CHECK constraints; it creates tables
+  and indexes, normally on a new database.
+
 - **Source:** the SQL of `0003`.
 - **Decision:** `0003` replaces CHECK constraints on `queue_tasks` and
   `queue_task_attempts` and builds its indexes without `CONCURRENTLY`.
@@ -1410,6 +1499,8 @@ of the design spec; a bare "§N.M" is an entry in this document.
   time.
 
 ### 9.4 Breaking changes
+
+- **Superseded:** these were changes between unreleased versions.
 
 - **Source:** spec §9.
 - **Expected behaviour:**
@@ -1434,7 +1525,8 @@ Found in review and deliberately left; none affects correctness of the queue.
   argon2 parameters; a real user hashed with other parameters takes a different
   time to verify.
 - The standalone config: `bind` takes an IP address, not a host name;
-  `pool_size = 0` and a negative `count_cap` are not rejected; `auth.header` is
+  `pool_size = 0` is not rejected (since review 01, a zero or negative
+  `count_cap` is); `auth.header` is
   checked only at startup; keys that don't apply to the chosen mode are ignored;
   a TOML parse error can quote a value of the wrong type, which may be a secret
   typed into the wrong key (§8.3).

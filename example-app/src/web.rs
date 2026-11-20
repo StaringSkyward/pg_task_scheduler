@@ -20,10 +20,10 @@ use pg_task_scheduler::CronExpression;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskKey;
-use pg_task_scheduler::TaskName;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::jobs;
 use pg_task_scheduler_admin::AdminConfig;
@@ -312,8 +312,8 @@ pub async fn run(
 ) -> Result<(), Box<dyn Error>> {
     // The digest job is created at startup. `ensure_job` is safe on every
     // restart: it never resurrects a job an operator paused.
-    let job = CreateJob::new(
-        TaskName::try_from(Digest::NAME)?,
+    let job = CreateJob::for_task::<Digest>(
+        ScheduleName::try_from("digest")?,
         CronExpression::parse("*/5 * * * *")?,
         MaxAttempts::try_from(3u32)?,
         JobLifecycle::Active,

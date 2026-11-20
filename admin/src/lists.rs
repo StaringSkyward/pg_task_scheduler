@@ -11,10 +11,14 @@ use axum::response::Response;
 use axum::routing::get;
 use chrono::DateTime;
 use chrono::Utc;
+use pg_task_scheduler::AttemptRun;
+use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::QueueName;
 use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::StoredTaskKey;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::store::FailedFilter;
 use pg_task_scheduler::store::FailedStatus;
 use pg_task_scheduler::store::FinishedCursor;
@@ -122,7 +126,12 @@ async fn workers<P: SchedulerPool>(State(state): State<AppState<P>>) -> Response
                     )
                 })
                 .collect(),
-            task_names: w.task_names.join(", "),
+            task_names: w
+                .task_names
+                .iter()
+                .map(TaskName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
         })
         .collect();
     render(
@@ -229,6 +238,10 @@ async fn queued<P: SchedulerPool>(
     };
     let limit = config.page_size;
     let start = after.as_ref().map_or(0, |c| c.position);
+    // A forged cursor at the top of the range cannot number the next page.
+    if start.checked_add(i64::from(limit.get())).is_none() {
+        return bad("invalid cursor");
+    }
     let r = db::read(&state.pool, config.statement_timeout, {
         let name = name.clone();
         move |c| Box::pin(async move { store::queued_page(c, &name, after.as_ref(), limit).await })
@@ -253,7 +266,7 @@ async fn queued<P: SchedulerPool>(
             } else {
                 format!("due in {}", span(now, t.due_at))
             },
-            attempts: format!("{} / {}", t.attempts, t.max_attempts),
+            attempts: format!("{} / {}", t.attempts, t.max_attempts.get()),
             last_error: t.last_error.clone().unwrap_or_default(),
         })
         .collect();
@@ -323,17 +336,23 @@ async fn running<P: SchedulerPool>(
     let rows = page
         .items
         .iter()
-        .map(|t| RunningRow {
-            id: t.id.0,
-            task_name: t.task_name.as_str().to_owned(),
-            queue: t.queue.as_str().to_owned(),
-            worker: t
-                .locked_by
-                .as_ref()
-                .map_or(String::new(), |w| w.as_str().to_owned()),
-            attempt: format!("{} / {}", t.attempts, t.max_attempts),
-            run_time: t.attempt_started_at.map_or("—".into(), |s| span(s, now)),
-            lease: t.locked_until.map_or("—".into(), ts),
+        .map(|t| {
+            let (worker, lease) = match &t.state {
+                TaskState::Running {
+                    locked_by,
+                    locked_until,
+                } => (locked_by.as_str().to_owned(), ts(*locked_until)),
+                _ => (String::new(), "—".into()),
+            };
+            RunningRow {
+                id: t.id.0,
+                task_name: t.task_name.as_str().to_owned(),
+                queue: t.queue.as_str().to_owned(),
+                worker,
+                attempt: format!("{} / {}", t.attempts, t.max_attempts.get()),
+                run_time: t.attempt.map_or("—".into(), |a| span(a.started_at, now)),
+                lease,
+            }
         })
         .collect();
     let next = page
@@ -385,14 +404,20 @@ fn finished_rows(items: &[TaskRow]) -> Vec<FinishedRow> {
     items
         .iter()
         .map(|t| {
-            let at = t.completed_at;
+            let at = match t.state {
+                TaskState::Finished { completed_at, .. } => Some(completed_at),
+                _ => None,
+            };
             FinishedRow {
                 id: t.id.0,
                 task_name: t.task_name.as_str().to_owned(),
                 queue: t.queue.as_str().to_owned(),
                 at: at.map_or("—".into(), ts),
-                last_run: match (t.attempt_started_at, t.attempt_finished_at) {
-                    (Some(s), Some(f)) => span(s, f),
+                last_run: match t.attempt {
+                    Some(AttemptRun {
+                        started_at,
+                        state: AttemptState::Closed { finished_at, .. },
+                    }) => span(started_at, finished_at),
                     _ => "—".into(),
                 },
                 total: at.map_or("—".into(), |c| span(t.created_at, c)),
@@ -506,7 +531,7 @@ fn finished_page(
 // ---- task detail ----
 
 struct AttemptRow {
-    no: i32,
+    no: u32,
     worker: String,
     started: String,
     finished: String,
@@ -530,10 +555,13 @@ struct TaskPage {
     refresh: u64,
     t: store::TaskDetail,
     status: &'static str,
+    key: String,
+    key_error: Option<String>,
     created: String,
     updated: String,
     due: String,
     completed: String,
+    locked_by: String,
     locked_until: String,
     payload: String,
     attempts: Vec<AttemptRow>,
@@ -562,28 +590,56 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
         Ok(Some(d)) => d,
     };
     let v = &d.task;
-    let opt = |t: Option<DateTime<Utc>>| t.map_or("—".into(), ts);
+    let none = || String::from("—");
+    let (key, key_error) = match &v.task_key {
+        StoredTaskKey::Valid(k) => (k.as_str().to_owned(), None),
+        StoredTaskKey::Invalid { text, error } => (text.clone(), Some(error.to_string())),
+    };
+    let (completed, locked_by, locked_until) = match &v.state {
+        TaskState::Queued => (none(), none(), none()),
+        TaskState::Running {
+            locked_by,
+            locked_until,
+        } => (none(), locked_by.as_str().to_owned(), ts(*locked_until)),
+        TaskState::Finished { completed_at, .. } => (ts(*completed_at), none(), none()),
+    };
     let page = TaskPage {
         base: config.base_path.clone(),
         refresh: config.refresh_seconds,
-        status: v.status.as_str(),
+        status: v.state.status().as_str(),
+        key,
+        key_error,
         created: ts(v.created_at),
         updated: ts(v.updated_at),
         due: ts(v.due_at),
-        completed: opt(v.completed_at),
-        locked_until: opt(v.locked_until),
-        payload: serde_json::to_string_pretty(&v.payload).unwrap_or_default(),
+        completed,
+        locked_by,
+        locked_until,
+        payload: payload_text(&v.payload),
         attempts: d
             .attempts
             .iter()
-            .map(|a| AttemptRow {
-                no: a.attempt_no,
-                worker: a.worker_id.as_str().to_owned(),
-                started: ts(a.started_at),
-                finished: opt(a.finished_at),
-                run_time: a.finished_at.map_or("—".into(), |f| span(a.started_at, f)),
-                outcome: a.outcome.map_or("—", |o| o.as_str()).to_owned(),
-                error: a.error.clone().unwrap_or_default(),
+            .map(|a| {
+                let (finished, run_time, outcome) = match a.state {
+                    AttemptState::Open => (none(), none(), none()),
+                    AttemptState::Closed {
+                        finished_at,
+                        outcome,
+                    } => (
+                        ts(finished_at),
+                        span(a.started_at, finished_at),
+                        outcome.as_str().to_owned(),
+                    ),
+                };
+                AttemptRow {
+                    no: a.attempt_no.get(),
+                    worker: a.worker_id.as_str().to_owned(),
+                    started: ts(a.started_at),
+                    finished,
+                    run_time,
+                    outcome,
+                    error: a.error.clone().unwrap_or_default(),
+                }
             })
             .collect(),
         actions: d
@@ -591,7 +647,7 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
             .iter()
             .map(|a| ActionRow {
                 at: ts(a.at),
-                action: a.action.as_str().to_owned(),
+                action: a.kind().as_str().to_owned(),
                 operator: a.operator.clone(),
                 reason: a.reason.clone(),
                 affected: a.affected,
@@ -600,4 +656,14 @@ async fn task<P: SchedulerPool>(State(state): State<AppState<P>>, Path(id): Path
         t: d,
     };
     render(page, StatusCode::OK)
+}
+
+/// Pretty JSON, or the raw text followed by why it does not parse.
+fn payload_text(p: &pg_task_scheduler::TaskPayload) -> String {
+    match p {
+        pg_task_scheduler::TaskPayload::Json(v) => format!("{v:#}"),
+        pg_task_scheduler::TaskPayload::Unreadable { text, error } => {
+            format!("{text}\n\nUnreadable payload: {error}")
+        }
+    }
 }

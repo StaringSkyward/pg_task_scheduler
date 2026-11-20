@@ -3,11 +3,18 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-/// Maximum length (in `char`s) of a [`TaskName`], [`TaskKey`], [`QueueName`] or [`WorkerId`].
+/// Task-key prefix reserved for schedule occurrences (see `schedule_task_key`).
+pub(crate) const SCHEDULE_KEY_PREFIX: &str = "schedule:";
+
+/// Maximum length (in `char`s) of an identifier (see [`validate_identifier`]).
 const MAX_IDENTIFIER_LEN: usize = 255;
 
-/// Why a string was rejected as a [`TaskName`], [`TaskKey`], [`QueueName`] or
-/// [`WorkerId`].
+/// Maximum length (in bytes) of a [`CommandKey`]: `queue_outbox.command_key` has a UNIQUE
+/// B-tree index, whose entries PostgreSQL limits to about 2704 bytes.
+const MAX_COMMAND_KEY_BYTES: usize = 2048;
+
+/// Why a string was rejected as an identifier, such as a [`TaskName`], [`QueueName`] or
+/// [`CommandKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IdentifierError {
     /// The string is empty.
@@ -22,6 +29,14 @@ pub enum IdentifierError {
     // interpolate a const into the `#[error(..)]` message).
     #[error("identifier must be at most 255 characters")]
     TooLong,
+    /// The string contains a NUL character, which PostgreSQL text cannot store.
+    #[error("identifier must not contain NUL")]
+    ContainsNul,
+    /// A command key is longer than 2048 bytes.
+    //
+    // The literal "2048" must track `MAX_COMMAND_KEY_BYTES`.
+    #[error("command key must be at most 2048 bytes")]
+    CommandKeyTooLong,
 }
 
 /// Absurd conversion so `TaskName` itself satisfies the `register` bound
@@ -32,21 +47,40 @@ impl From<std::convert::Infallible> for IdentifierError {
     }
 }
 
-/// The crate-owned identifier policy for [`TaskName`], [`TaskKey`], [`QueueName`] and [`WorkerId`].
+/// The crate-owned identifier policy for [`TaskName`], [`TaskKey`], [`QueueName`], [`WorkerId`],
+/// [`EffectName`], [`Topic`] and (with `cron`) `ScheduleName`.
 ///
-/// Non-empty, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
-/// The queue tables carry no SQL CHECKs for this: only validated identifiers are
-/// written by this crate, so a row edited directly in SQL can be loaded via
-/// `DieselNewType`'s `FromSql` without re-validation.
+/// Non-empty, no NUL, no leading/trailing whitespace (per `str::trim`), at most 255 chars.
+/// Every identifier column carries the same rule as a named SQL CHECK
+/// (`queue_is_identifier`, migration 0001), so a raw-SQL producer cannot store a breaking
+/// value. Database reads still re-validate (`#[diesel_newtype(try_from)]`): a row stored
+/// after the CHECK was dropped by hand is a decode error rather than a silently loaded value.
 fn validate_identifier(s: &str) -> Result<(), IdentifierError> {
     if s.is_empty() {
         return Err(IdentifierError::Empty);
+    }
+    if s.contains('\0') {
+        return Err(IdentifierError::ContainsNul);
     }
     if s.trim() != s {
         return Err(IdentifierError::SurroundingWhitespace);
     }
     if s.chars().count() > MAX_IDENTIFIER_LEN {
         return Err(IdentifierError::TooLong);
+    }
+    Ok(())
+}
+
+/// Policy for [`CommandKey`]: non-empty, NUL-free, at most 2048 bytes, whitespace allowed.
+fn validate_command_key(s: &str) -> Result<(), IdentifierError> {
+    if s.is_empty() {
+        return Err(IdentifierError::Empty);
+    }
+    if s.contains('\0') {
+        return Err(IdentifierError::ContainsNul);
+    }
+    if s.len() > MAX_COMMAND_KEY_BYTES {
+        return Err(IdentifierError::CommandKeyTooLong);
     }
     Ok(())
 }
@@ -66,9 +100,13 @@ pub struct JobId(pub Uuid);
 
 macro_rules! validated_string {
     ($(#[$meta:meta])* $name:ident) => {
+        validated_string!($(#[$meta])* $name, validate_identifier);
+    };
+    ($(#[$meta:meta])* $name:ident, $validate:path) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DieselNewType)]
         #[serde(try_from = "String")]
+        #[diesel_newtype(try_from)]
         pub struct $name(String);
 
         impl $name {
@@ -81,7 +119,7 @@ macro_rules! validated_string {
         impl TryFrom<&str> for $name {
             type Error = IdentifierError;
             fn try_from(s: &str) -> Result<Self, IdentifierError> {
-                validate_identifier(s)?;
+                $validate(s)?;
                 Ok($name(s.to_owned()))
             }
         }
@@ -89,7 +127,7 @@ macro_rules! validated_string {
         impl TryFrom<String> for $name {
             type Error = IdentifierError;
             fn try_from(s: String) -> Result<Self, IdentifierError> {
-                validate_identifier(&s)?;
+                $validate(&s)?;
                 Ok($name(s))
             }
         }
@@ -121,6 +159,29 @@ validated_string!(
     QueueName
 );
 
+validated_string!(
+    /// Name of an outbox effect (identifier policy).
+    EffectName
+);
+validated_string!(
+    /// Topic of an outbox command (identifier policy).
+    Topic
+);
+validated_string!(
+    /// Idempotency key of an outbox command: non-empty, no NUL, at most 2048 bytes (the
+    /// outbox's unique index cannot hold more). Hash a longer key, for example a hex SHA-256
+    /// of the `(task_key, effect_name)` tuple.
+    CommandKey,
+    validate_command_key
+);
+
+#[cfg(feature = "cron")]
+validated_string!(
+    /// Unique name of a recurring schedule (`scheduler_jobs.name`), distinct from the
+    /// task name its occurrences run.
+    ScheduleName
+);
+
 impl Default for QueueName {
     fn default() -> Self {
         Self("default".to_owned())
@@ -138,10 +199,13 @@ impl WorkerId {
 mod identifier_tests {
     use std::str::FromStr;
 
+    use super::CommandKey;
+    use super::EffectName;
     use super::IdentifierError;
     use super::QueueName;
     use super::TaskKey;
     use super::TaskName;
+    use super::Topic;
     use super::WorkerId;
 
     #[test]
@@ -232,5 +296,46 @@ mod identifier_tests {
         assert!(serde_json::from_str::<TaskName>("\"ok\"").is_ok());
         assert!(serde_json::from_str::<TaskName>("\"\"").is_err());
         assert!(serde_json::from_str::<WorkerId>("\" x\"").is_err());
+    }
+
+    #[test]
+    fn nul_is_rejected() {
+        assert_eq!(TaskKey::try_from("a\0b"), Err(IdentifierError::ContainsNul));
+        assert_eq!(
+            CommandKey::try_from("a\0b"),
+            Err(IdentifierError::ContainsNul)
+        );
+    }
+
+    #[test]
+    fn command_key_byte_limit() {
+        assert!(CommandKey::try_from("x".repeat(2048)).is_ok());
+        assert!(CommandKey::try_from("\u{1F600}".repeat(512)).is_ok());
+        assert_eq!(
+            CommandKey::try_from("x".repeat(2049)),
+            Err(IdentifierError::CommandKeyTooLong)
+        );
+        assert_eq!(
+            CommandKey::try_from("\u{1F600}".repeat(600)),
+            Err(IdentifierError::CommandKeyTooLong)
+        );
+    }
+
+    #[test]
+    fn command_key_allows_long_values_and_spaces() {
+        assert!(CommandKey::try_from(format!(" {} ", "x".repeat(1000))).is_ok());
+        assert_eq!(CommandKey::try_from(""), Err(IdentifierError::Empty));
+    }
+
+    #[test]
+    fn effect_name_and_topic_follow_the_identifier_policy() {
+        assert_eq!(
+            EffectName::try_from(" e"),
+            Err(IdentifierError::SurroundingWhitespace)
+        );
+        assert_eq!(
+            Topic::try_from("x".repeat(256)),
+            Err(IdentifierError::TooLong)
+        );
     }
 }

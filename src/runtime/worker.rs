@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -23,6 +23,8 @@ use tracing::Instrument;
 use crate::error::SchedulerError;
 use crate::error::TaskError;
 use crate::ids::QueueName;
+use crate::ids::TaskName;
+use crate::models::AttemptNo;
 use crate::models::ClaimedTask;
 use crate::models::RetryOutcome;
 use crate::models::TaskLease;
@@ -36,10 +38,15 @@ use crate::runtime::health::WorkerHealth;
 use crate::runtime::registry::Handler;
 use crate::runtime::registry::Registry;
 use crate::store;
+use crate::store::PoisonedClaim;
 
 /// Shortest idle wait before a task due soon (a due task the cycle could not claim waits
 /// `max_poll_interval` instead: another transaction holds it).
 const MIN_WAIT: Duration = Duration::from_millis(10);
+
+/// Pool connections dead-lettering may hold at once, per scheduler. Rows a claim poisons
+/// while all are in use stay `running`, and the reaper recovers them after the lease.
+const QUARANTINE_CONNECTIONS: usize = 1;
 
 /// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,7 +77,10 @@ impl<P: SchedulerPool> Scheduler<P> {
     /// Claim and run tasks until `cancel` fires. Then stop claiming and maintenance, cancel
     /// every handler's `ctx.cancellation`, and drain for up to `shutdown_timeout`. Handlers
     /// still running then are dropped and their tasks released; after 5 s more, whatever is
-    /// left is aborted and the reaper recovers those tasks after the lease.
+    /// left is aborted and the reaper recovers those tasks after the lease. After it returns,
+    /// each heartbeat still in flight may hold one pool connection, renewing nothing, until
+    /// its transaction ends; each of its statements is bounded by the lease it had left. Only
+    /// one that passed its cancellation check before its dispatch ended can still renew.
     pub async fn run_until_shutdown(self, cancel: CancellationToken) -> Result<(), SchedulerError> {
         let Scheduler {
             pool,
@@ -80,7 +90,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         } = self;
         let health = StoppedOnDrop(health_tx);
         let config = Arc::new(config);
-        let names = registry.names();
+        let names = registry.task_names();
         let queues: Vec<_> = config
             .queues
             .iter()
@@ -91,6 +101,7 @@ impl<P: SchedulerPool> Scheduler<P> {
             })
             .collect();
         let mut in_flight = JoinSet::new();
+        let quarantine = Arc::new(Semaphore::new(QUARANTINE_CONNECTIONS));
         let shutdown = Shutdown {
             begun: cancel.clone(),
             expired: CancellationToken::new(),
@@ -119,8 +130,11 @@ impl<P: SchedulerPool> Scheduler<P> {
         let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
         while !cancel.is_cancelled() {
-            // The wait below collects at most one finished dispatch per wake, and a full batch
-            // skips it entirely; collect them all here so the set stays bounded by the permits.
+            // The wait below collects at most one finished task per wake, and a full batch
+            // skips it entirely; collect them all here. Dispatches are bounded by the permits.
+            // At most QUARANTINE_CONNECTIONS dead-letter tasks run at once; rows poisoned while
+            // they all run are left to the reaper. Poisoned rows never make a batch full, so
+            // they never skip the wait on their own.
             while let Some(joined) = in_flight.try_join_next() {
                 log_join(joined);
             }
@@ -128,8 +142,8 @@ impl<P: SchedulerPool> Scheduler<P> {
             // past its bound. A claim cut off after it committed leaves its tasks `running`
             // until the reaper recovers them, as when a claim's response is lost.
             let step = async {
-                // At most once per `max_poll_interval`; the wait below wakes for it, so a due
-                // schedule is materialized within `max_poll_interval`.
+                // At most once per `max_poll_interval`; the wait below wakes for it. Each run
+                // is one bounded pass, so a backlog of due schedules takes several.
                 #[cfg(feature = "cron")]
                 let materialized_now = Instant::now() >= next_materialize;
                 #[cfg(feature = "cron")]
@@ -150,6 +164,7 @@ impl<P: SchedulerPool> Scheduler<P> {
                     &config,
                     &queues,
                     &mut in_flight,
+                    &quarantine,
                     &shutdown,
                 )
                 .await;
@@ -216,7 +231,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`. That bounds shutdown, not the
         // server: a periodic upsert cut off by `cancel`, or a `stopping` write that timed out,
         // may still execute after the delete below and re-create the row, which then reads
-        // live until its `lost_after` (AdminUI §6.11).
+        // live until its `lost_after` (docs/AdminUI.md §6.11).
         if let Err(error) = registration.await {
             tracing::error!(%error, "registry task panicked");
         }
@@ -244,6 +259,8 @@ async fn timed<T>(operation: &'static str, query: impl Future<Output = T>) -> T 
     out
 }
 
+/// A row count as `u64`, for metrics and for comparing with a `u32` batch size; no supported
+/// `usize` exceeds `u64`, so the saturation never applies.
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -330,13 +347,18 @@ async fn notified<C: DerefMut<Target = AsyncPgConnection>>(listener: &mut Option
 /// `min(its free permits, claim_batch_size)` of its due tasks and spawn a dispatch for each.
 /// `None` when any batch was full, else how long to wait: until the next due task in a queue
 /// that still has a free permit, within `MIN_WAIT..=max_poll_interval`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run loop's state, borrowed for one cycle"
+)]
 async fn claim_cycle<P: SchedulerPool>(
     pool: &P,
     registry: &Registry,
-    names: &[String],
+    names: &[TaskName],
     config: &Arc<Config>,
     queues: &[WorkerQueue],
     in_flight: &mut JoinSet<()>,
+    quarantine: &Arc<Semaphore>,
     shutdown: &Shutdown,
 ) -> Result<Option<Duration>, SchedulerError> {
     let mut conn = acquire(pool).await?;
@@ -346,11 +368,14 @@ async fn claim_cycle<P: SchedulerPool>(
             return Ok(Some(config.max_poll_interval));
         }
         let free = queue.permits.available_permits();
-        let Some(want) = NonZeroUsize::new(free.min(config.claim_batch_size.get())) else {
+        // Exact: the `min` with the `u32` batch size bounds the result, so a `free` beyond
+        // `u32` only means the batch size wins.
+        let want = u32::try_from(free).unwrap_or(u32::MAX);
+        let Some(want) = NonZeroU32::new(want.min(config.claim_batch_size.get())) else {
             continue;
         };
         let sent = Instant::now();
-        let claimed = timed(
+        let batch = timed(
             "claim",
             store::claim(
                 &mut conn,
@@ -362,9 +387,11 @@ async fn claim_cycle<P: SchedulerPool>(
             ),
         )
         .await?;
-        let full_batch = claimed.len() == want.get();
-        claimed_any |= !claimed.is_empty();
-        for task in claimed {
+        // Ready rows only: a poisoned row takes no permit, so counting it would loop at once
+        // and spawn a dead-letter task per batch of a poisoned backlog.
+        let full_batch = count(batch.ready.len()) == u64::from(want.get());
+        claimed_any |= !batch.ready.is_empty();
+        for task in batch.ready {
             let name = task.task_name.as_str().to_owned();
             let queue_label = queue.name.as_str().to_owned();
             let latency = (task.claimed_at - task.due_at).to_std().unwrap_or_default();
@@ -379,7 +406,7 @@ async fn claim_cycle<P: SchedulerPool>(
             let handler = registry
                 .get(&task.task_name)
                 .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
-            let deadline = sent + config.lease_duration;
+            let deadline = sent + config.lease_duration.get();
             let run = dispatch(
                 pool.clone(),
                 config.clone(),
@@ -395,6 +422,21 @@ async fn claim_cycle<P: SchedulerPool>(
                 *last_finished.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(Instant::now());
             });
+        }
+        // After the dispatches, and never awaited here: a slow dead-letter must not use up the
+        // healthy rows' leases. In `in_flight`, so shutdown drains it like a dispatch. Never
+        // waits for the permit either: that would hold these leases, unbounded.
+        if !batch.poisoned.is_empty() {
+            match quarantine.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    in_flight.spawn(dead_letter(pool.clone(), batch.poisoned, permit));
+                }
+                Err(_) => {
+                    for claim in &batch.poisoned {
+                        tracing::warn!(task_id = claim.task_id.0, reason = %claim.reason, "dead-lettering is busy; the reaper recovers the task after its lease");
+                    }
+                }
+            }
         }
         // A full batch only means "loop now" if this queue can still take more.
         full |= full_batch && queue.permits.available_permits() > 0;
@@ -419,6 +461,31 @@ async fn claim_cycle<P: SchedulerPool>(
         Some(Duration::ZERO) if !claimed_any => max,
         next => next.unwrap_or(max).max(MIN_WAIT).min(max),
     }))
+}
+
+/// Dead-letter rows the claim could not convert, on a connection of their own, holding
+/// `_permit` until done. A row this misses stays `running` until the reaper requeues it, and
+/// the next claim poisons it again.
+async fn dead_letter<P: SchedulerPool>(
+    pool: P,
+    poisoned: Vec<PoisonedClaim>,
+    _permit: OwnedSemaphorePermit,
+) {
+    for claim in &poisoned {
+        tracing::error!(task_id = claim.task_id.0, reason = %claim.reason, "claimed task is unusable; marking it dead");
+    }
+    let mut conn = match acquire(&pool).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::error!(%error, "could not dead-letter the tasks; skipping them");
+            return;
+        }
+    };
+    for claim in &poisoned {
+        if let Err(error) = timed("fail", store::dead_letter(&mut conn, claim)).await {
+            tracing::error!(task_id = claim.task_id.0, %error, "could not dead-letter the task; skipping it");
+        }
+    }
 }
 
 /// Publish health. `fresh` is whether `error` happened in this cycle; a standing error
@@ -473,13 +540,26 @@ fn dispatch<P: SchedulerPool>(
         task_key = task.task_key.as_str(),
         task_name = task.task_name.as_str(),
         queue = task.queue.as_str(),
-        attempt_no = task.lease.attempt_no,
+        attempt_no = task.lease.attempt_no.get(),
         worker_id = config.worker_id.as_str(),
         lock_token = task.lease.lock_token.0,
     );
     async move {
         let _permit = permit;
         let name = task.task_name.as_str().to_owned();
+        // A slow claim response can arrive after the lease it claimed; never start external
+        // work on it. The reaper recovers the task.
+        if Instant::now() >= deadline {
+            metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
+                .increment(1);
+            tracing::warn!("claim arrived after its lease; handler not started");
+            return;
+        }
+        // Cancelled when the lease keeper gives up, and by the guard however dispatch ends
+        // (finished, released, or dropped with the scheduler), so a heartbeat still in flight
+        // renews nothing. Not a child of `shutdown.begun`: draining handlers keep their leases.
+        let lease_stop = CancellationToken::new();
+        let _stop_heartbeats = lease_stop.clone().drop_guard();
         // Cancelled when shutdown begins, and by the guard however dispatch ends: lease lost,
         // finished, released, or aborted.
         let cancellation = shutdown.begun.child_token();
@@ -495,23 +575,13 @@ fn dispatch<P: SchedulerPool>(
         let started = Instant::now();
         // The lease keeper is its own future, not a select! arm body: a DB-contained
         // handler holding the row lock must keep being polled while a heartbeat waits.
+        // It is polled before the handler (and so is forced-shutdown expiry): a handler
+        // suspended past the local deadline must be dropped, not resumed for one more segment.
         let result = tokio::select! {
             biased;
-            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
-                Ok(result) => result,
-                // Not finalized: the attempt stays open and the reaper recovers the task.
-                Err(panic) => {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("non-string panic payload");
-                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
-                    return;
-                }
-            },
-            () = keep_lease(&pool, &task.lease, &config, &name, deadline) => {
+            () = keep_lease(&pool, &task.lease, &config, &name, deadline, &lease_stop) => {
                 drop(cancel_on_drop); // cancel now, not after the check below
+                lease_stop.cancel(); // and end any heartbeat still in flight
                 // A DB-contained handler may have committed its own completion while a
                 // heartbeat waited on the row lock, or an operator cancelled the task; the
                 // heartbeat then matches no row. Bounded, so a database outage cannot hold
@@ -533,6 +603,19 @@ fn dispatch<P: SchedulerPool>(
                 release(&pool, &task.lease, name).await;
                 return;
             }
+            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
+                Ok(result) => result,
+                // Not finalized: the attempt stays open and the reaper recovers the task.
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
+                    return;
+                }
+            },
         };
         metrics::histogram!("pg_task_scheduler_task_duration_seconds", "task_name" => name.clone())
             .record(started.elapsed());
@@ -545,36 +628,53 @@ fn dispatch<P: SchedulerPool>(
 /// Heartbeat every `heartbeat_interval`; returns only once ownership is lost: a heartbeat
 /// matched no row, or the local deadline (claim send + lease, advanced by each successful
 /// heartbeat) passed. The deadline only gives up early; PostgreSQL decides validity.
+/// `stop` is the dispatch's: a heartbeat spawned before the dispatch ended renews nothing.
 async fn keep_lease<P: SchedulerPool>(
     pool: &P,
     lease: &TaskLease,
     config: &Config,
     name: &str,
     mut deadline: Instant,
+    stop: &CancellationToken,
 ) {
     loop {
         tokio::time::sleep_until((Instant::now() + config.heartbeat_interval).min(deadline)).await;
         let sent = Instant::now();
+        // A beat started now could not be awaited, and could renew after this keeper is gone.
+        if sent >= deadline {
+            return;
+        }
         let beat = tokio::time::timeout_at(deadline, async {
             let mut conn = acquire(pool).await?;
-            timed(
-                "heartbeat",
-                store::heartbeat(&mut conn, lease, config.lease_duration),
-            )
+            // The pool wait may have used up the lease; never spawn a beat with no time left.
+            let Some(lock_wait) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                return Ok(None);
+            };
+            // Only the transaction is spawned, so a dropped keep_lease (handler finished,
+            // deadline, scheduler dropped) cannot abandon it mid-flight holding the row lock:
+            // dropping a JoinHandle does not cancel the task. Each of its statements runs for
+            // at most `lock_wait`, and it renews nothing once `stop` fires.
+            let (lease, duration, stop) = (lease.clone(), config.lease_duration, stop.clone());
+            tokio::spawn(async move {
+                let query = store::heartbeat_bounded(&mut conn, &lease, duration, lock_wait, &stop);
+                timed("heartbeat", query).await
+            })
             .await
+            .map_err(|_| SchedulerError::Invariant("heartbeat task panicked"))?
+            .map(Some)
         })
         .await;
         match beat {
-            Ok(Ok(_)) => deadline = sent + config.lease_duration,
-            Ok(Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
+            Ok(Ok(Some(_))) => deadline = sent + config.lease_duration.get(),
+            Ok(Ok(None) | Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
             Ok(Err(error)) => {
                 metrics::counter!("pg_task_scheduler_heartbeat_failures_total", "task_name" => name.to_owned())
                     .increment(1);
                 tracing::warn!(%error, "heartbeat failed");
             }
-        }
-        if Instant::now() >= deadline {
-            return;
         }
     }
 }
@@ -730,7 +830,7 @@ async fn maintenance_pass<P: SchedulerPool>(
     if let Err(error) = store::prune_workers(&mut conn).await {
         registry_failed(&error);
     }
-    let batch = config.retention.batch_size.get();
+    let batch = u64::from(config.retention.batch_size.get());
     let mut cleaning = true;
     loop {
         let reaped = timed(
@@ -750,22 +850,22 @@ async fn maintenance_pass<P: SchedulerPool>(
                 .increment(count(deleted.tasks));
             metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "outbox")
                 .increment(count(deleted.outbox));
-            cleaning = deleted.tasks >= batch || deleted.outbox >= batch;
+            cleaning = count(deleted.tasks) >= batch || count(deleted.outbox) >= batch;
         }
-        if n < config.reaper_batch_size.get() && !cleaning {
+        if count(n) < u64::from(config.reaper_batch_size.get()) && !cleaning {
             return Ok(());
         }
     }
 }
 
-/// Keep this worker's display-only registry row (§5.2): upsert at once and every
+/// Keep this worker's display-only registry row (docs/AdminUI.md §6.7): upsert at once and every
 /// `registry_interval`. When `cancel` fires, write `stopping` once, within
 /// `REGISTRY_SHUTDOWN_TIMEOUT`, and return. Every other await races `cancel`, so a stalled
 /// pool never holds shutdown.
 async fn keep_registered<P: SchedulerPool>(
     pool: P,
     config: Arc<Config>,
-    task_names: Vec<String>,
+    task_names: Vec<TaskName>,
     queues: Vec<WorkerQueue>,
     health: watch::Receiver<WorkerHealth>,
     cancel: CancellationToken,
@@ -835,22 +935,24 @@ fn registry_failed(error: &dyn std::fmt::Display) {
     tracing::warn!(%error, "worker registry write failed");
 }
 
-/// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)` (§11.2). Saturates
-/// rather than overflowing for any `attempt_no`.
+/// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)`, computed exactly for
+/// any `attempt_no`.
 pub(crate) fn retry_delay(
-    attempt_no: i32,
+    attempt_no: AttemptNo,
     base: Duration,
     max: Duration,
     jitter: Duration,
     random: u64,
 ) -> Duration {
-    let doublings = attempt_no.saturating_sub(1).clamp(0, 31).unsigned_abs();
+    // 2^127 ns exceeds the 5-year duration cap, so clamping the count never changes the
+    // capped result; saturation is likewise absorbed by the `max` cap.
+    let doublings = (attempt_no.get() - 1).min(127);
+    let nanos = base.as_nanos().saturating_mul(1u128 << doublings);
+    let nanos = nanos.min(max.as_nanos());
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
-    base.saturating_mul(1 << doublings)
-        .min(max)
-        .saturating_add(Duration::from_nanos(
-            random % jitter_nanos.saturating_add(1),
-        ))
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).saturating_add(
+        Duration::from_nanos(random % jitter_nanos.saturating_add(1)),
+    )
 }
 
 #[cfg(test)]
@@ -858,27 +960,56 @@ mod tests {
     use std::time::Duration;
 
     use super::retry_delay;
+    use crate::AttemptNo;
+
+    fn n(v: u32) -> AttemptNo {
+        AttemptNo::try_from(v).unwrap()
+    }
 
     const BASE: Duration = Duration::from_secs(1);
     const MAX: Duration = Duration::from_secs(300);
 
     #[test]
     fn retry_delay_doubles_from_base() {
-        assert_eq!(retry_delay(1, BASE, MAX, Duration::ZERO, 0), BASE);
-        assert_eq!(retry_delay(3, BASE, MAX, Duration::ZERO, 0), 4 * BASE);
+        assert_eq!(retry_delay(n(1), BASE, MAX, Duration::ZERO, 0), BASE);
+        assert_eq!(retry_delay(n(3), BASE, MAX, Duration::ZERO, 0), 4 * BASE);
+    }
+
+    #[test]
+    fn retry_delay_first_attempt_is_base() {
+        assert_eq!(
+            retry_delay(AttemptNo::FIRST, BASE, MAX, Duration::ZERO, 0),
+            BASE
+        );
     }
 
     #[test]
     fn retry_delay_saturates_at_max() {
-        assert_eq!(retry_delay(i32::MAX, BASE, MAX, Duration::ZERO, 0), MAX);
-        assert_eq!(retry_delay(0, BASE, MAX, Duration::ZERO, 0), BASE);
+        assert_eq!(
+            retry_delay(n(i32::MAX.unsigned_abs()), BASE, MAX, Duration::ZERO, 0),
+            MAX
+        );
+    }
+
+    #[test]
+    fn retry_delay_keeps_doubling_past_attempt_32() {
+        let ns = Duration::from_nanos(1);
+        assert_eq!(
+            retry_delay(n(34), ns, MAX, Duration::ZERO, 0),
+            Duration::from_nanos(1 << 33)
+        );
+        assert_eq!(retry_delay(n(40), ns, MAX, Duration::ZERO, 0), MAX);
+        assert_eq!(
+            retry_delay(n(i32::MAX.unsigned_abs()), ns, MAX, Duration::ZERO, 0),
+            MAX
+        );
     }
 
     #[test]
     fn retry_delay_jitter_is_bounded() {
         let jitter = Duration::from_millis(500);
-        let d = retry_delay(1, BASE, MAX, jitter, u64::MAX);
+        let d = retry_delay(n(1), BASE, MAX, jitter, u64::MAX);
         assert!((BASE..=BASE + jitter).contains(&d), "{d:?}");
-        assert_eq!(retry_delay(1, BASE, MAX, jitter, 0), BASE);
+        assert_eq!(retry_delay(n(1), BASE, MAX, jitter, 0), BASE);
     }
 }

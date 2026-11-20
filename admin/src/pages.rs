@@ -302,7 +302,7 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
             .map(|a| ActionRow {
                 at: a.at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
                 operator: a.operator.clone(),
-                action: format!("{:?}", a.action).to_lowercase(),
+                action: a.kind().as_str().to_owned(),
                 affected: a.affected,
                 reason: a.reason.clone(),
             })

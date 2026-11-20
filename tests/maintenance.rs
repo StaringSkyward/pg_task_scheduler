@@ -1,12 +1,13 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::TestDb;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use pg_task_scheduler::AttemptNo;
 use pg_task_scheduler::AttemptOutcome;
 use pg_task_scheduler::ClaimedTask;
 use pg_task_scheduler::EnqueueOptions;
@@ -30,8 +31,8 @@ impl Task for Email {
     type Args = serde_json::Value;
 }
 
-fn nz(n: usize) -> NonZeroUsize {
-    NonZeroUsize::new(n).unwrap()
+fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).unwrap()
 }
 
 async fn exec(conn: &mut AsyncPgConnection, sql: &str) {
@@ -54,12 +55,13 @@ async fn claim_lease(conn: &mut AsyncPgConnection, lease: Duration) -> Option<Cl
         conn,
         &WorkerId::generate(),
         &pg_task_scheduler::QueueName::default(),
-        &["email".to_owned()],
+        &[pg_task_scheduler::TaskName::try_from("email").unwrap()],
         nz(1),
-        lease,
+        common::lease(lease),
     )
     .await
     .unwrap()
+    .ready
     .pop()
 }
 
@@ -94,10 +96,9 @@ async fn reaper_requeues_with_crash_retry_delay() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.last_error.as_deref(), Some("worker lease expired"));
     assert_eq!(t.lock_token, c.lease.lock_token);
-    assert_eq!(t.locked_by, None);
     let ok = db
         .scalar(&format!(
             "SELECT count(*) AS n FROM queue_tasks WHERE id = {} \
@@ -108,8 +109,7 @@ async fn reaper_requeues_with_crash_retry_delay() {
     assert_eq!(ok, 1);
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
     assert_eq!(a.len(), 1);
-    assert_eq!(a[0].outcome, Some(AttemptOutcome::LeaseExpired));
-    assert!(a[0].finished_at.is_some());
+    assert_eq!(common::outcome(&a[0]), Some(AttemptOutcome::LeaseExpired));
     db.cleanup().await;
 }
 
@@ -133,8 +133,7 @@ async fn reaper_kills_exhausted_task() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Dead);
-    assert!(t.completed_at.is_some());
+    assert_eq!(t.state.status(), TaskStatus::Dead); // Finished carries completed_at
     db.cleanup().await;
 }
 
@@ -284,6 +283,22 @@ async fn cleanup_deletes_only_eligible_terminal_rows_in_batches() {
 }
 
 #[tokio::test]
+async fn cleanup_rejects_retention_it_cannot_apply_before_deleting() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    insert_terminal(&mut conn, "done-old", "done", "31 days").await;
+    let r = Retention {
+        done: Duration::ZERO,
+        dead: Duration::from_micros(u64::try_from(i64::MAX).unwrap()),
+        ..Default::default()
+    };
+    let err = store::cleanup(&mut conn, &r).await.unwrap_err();
+    assert!(matches!(err, SchedulerError::Config(_)), "{err:?}");
+    assert_eq!(db.scalar("SELECT count(*) AS n FROM queue_tasks").await, 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn cleanup_deletes_published_outbox_rows_only() {
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
@@ -320,11 +335,10 @@ async fn replay_requeues_dead_task_and_audits() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(t.status, TaskStatus::Queued);
+    assert_eq!(t.state.status(), TaskStatus::Queued);
     assert_eq!(t.attempts, 0);
     assert_eq!(t.lock_token, LockToken(c.lease.lock_token.0 + 1));
     assert_eq!(t.last_error, None);
-    assert_eq!(t.completed_at, None);
     let n = db
         .scalar(&format!(
             "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'replay' AND task_id = {} \
@@ -375,11 +389,11 @@ async fn replayed_task_is_claimable_and_records_new_attempt() {
         .unwrap();
     assert!(replay(&mut conn, c.lease.task_id, "op", "r").await.unwrap());
     let again = claim_one(&mut conn).await.unwrap();
-    assert_eq!(again.lease.attempt_no, 1);
+    assert_eq!(again.lease.attempt_no, AttemptNo::FIRST);
     assert_eq!(again.lease.lock_token, LockToken(3));
     let a = store::attempts(&mut conn, c.lease.task_id).await.unwrap();
     assert_eq!(a.len(), 2);
-    assert!(a.iter().all(|x| x.attempt_no == 1));
+    assert!(a.iter().all(|x| x.attempt_no == AttemptNo::FIRST));
     db.cleanup().await;
 }
 
