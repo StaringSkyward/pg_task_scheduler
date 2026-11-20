@@ -377,8 +377,8 @@ inserted with `task_key = "schedule:{id}:{next_run_at}"` (microsecond RFC 3339)
 and `ON CONFLICT DO NOTHING`, and `next_run_at` moves to the next future
 occurrence, in the same transaction. The insert copies `job_args` from the
 schedule row in SQL (`INSERT … SELECT`), so the materializer never decodes them,
-and the `queue_timestamptz` domain keeps `next_run_at` decodable. After downtime, one occurrence is
-created for the missed slot.
+and the `queue_timestamptz` domain keeps `next_run_at` decodable. After
+downtime, one occurrence is created for the missed slot.
 
 The pause re-check needs READ COMMITTED. A pause does not change the job row, so
 locking the row raises no serialization error, and under REPEATABLE READ the

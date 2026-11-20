@@ -53,7 +53,7 @@ pub enum SchedulerError {
     /// normalizes a number (`1e18` reads back as an integer). Nothing is written.
     #[error("task arguments change meaning when stored as JSON")]
     PayloadNotPreserved,
-    /// The same `task_key` was enqueued with a different task name or payload.
+    /// The same `task_key` was enqueued with a different task name or different arguments.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),
     /// The task key starts with the prefix reserved for schedule occurrences.

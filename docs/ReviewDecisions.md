@@ -1465,7 +1465,8 @@ and recreated.
     decodes the serialized value when it is built, so a NaN fails there, as in
     entry 36.
   - **Idempotency** compares the canonical JSONB text (see the ruling
-    below), not JSONB equality.
+    below), not JSONB equality. **Changed by entry 54:** a typed retry
+    compares decoded arguments by `PartialEq`.
   - **Cost:** one more query per typed `enqueue`, and per `create` or
     `ensure_job` of a `for_task` spec.
   - Ruling: when the stored form parses to a `Value` equal to the payload, the
@@ -1489,7 +1490,7 @@ and recreated.
     (`enqueue::idempotency_distinguishes_payloads_that_decode_differently`,
     `enqueue::idempotency_ignores_payload_key_order`). The same rule applies
     to the outbox (entry on `complete_with_outbox`): receivers decode payloads.
-    Changed by entry 54: a typed retry now compares decoded arguments, and
+    **Changed by entry 54:** a typed retry now compares decoded arguments, and
     `Count(1)` then `Ratio(1.0)` still conflict.
   - Caveat: `Value` equality treats `-0.0` and `0.0` as equal and JSONB stores
     `0.0`, so a negative zero is accepted and the worker decodes `+0.0`.
@@ -2011,9 +2012,10 @@ and recreated.
 - **Source:** call (the reviewer's fix).
 - **Decision:** the arms are ordered `keep_lease`, `shutdown.expired`, then the
   handler; the arm bodies are unchanged. A handler suspended past the local
-  deadline is dropped when it would next resume. A segment already running at
-  the deadline is not preempted, and a result returned in the same poll as the
-  deadline is dropped as a lost lease, which the reaper retries.
+  deadline, once the runtime has observed it, is dropped when it would next
+  resume. A segment already running at the deadline is not preempted, and a
+  result returned in the same poll as the deadline is dropped as a lost lease,
+  which the reaper recovers: a retry, or `dead` on its last attempt.
 - **Why:** the database fences worker transitions but cannot fence an effect
   started outside PostgreSQL. This matches the rule that no handler starts on an
   expired lease.

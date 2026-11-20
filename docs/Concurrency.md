@@ -122,11 +122,12 @@ future when either:
   or hang, for example during a database outage.
 
 The dispatch polls the lease keeper and forced-shutdown expiry before the
-handler, so a handler suspended past its local deadline is dropped when it would
-next resume, not resumed. A segment already running when the deadline passes is
-not preempted and runs to its next await. A result the handler returns in the
-same poll as the deadline is dropped as a lost lease, and the reaper retries the
-task.
+handler, so once the runtime has observed the deadline, a handler suspended
+past it is dropped when it would next resume, not resumed. A segment already
+running when the deadline passes is not preempted and runs to its next await. A
+result the handler returns in the same poll as the deadline is dropped as a
+lost lease, and the reaper recovers the task: a retry, or `dead` on its last
+attempt.
 
 The local deadline only makes the worker give up early. It never extends
 ownership, and host clocks never decide validity. A claim whose response

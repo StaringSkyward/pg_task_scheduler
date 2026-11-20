@@ -108,7 +108,7 @@ impl EnqueueOptions {
 }
 
 /// Result of [`enqueue`]. `inserted` is false when the key already existed with
-/// the same task name and payload (the existing task is returned).
+/// the same task name and equal arguments (the existing task is returned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Enqueued {
     /// The task's id.
@@ -181,8 +181,8 @@ const EXISTING: &str = r#"
 /// the existing task: the stored payload, decoded as `T::Args` the way the worker decodes it,
 /// must equal `args` by `PartialEq` (equal `HashSet`s match whatever order they serialize in).
 /// Anything else, including a stored payload that does not decode, is an
-/// `IdempotencyConflict`. The queue
-/// (`options.queue`, else `T::QUEUE`) is not part of that comparison, like priority.
+/// `IdempotencyConflict`. The queue (`options.queue`, else `T::QUEUE`) is not part of
+/// that comparison, like priority.
 /// `T::Args` must be `PartialEq`: the arguments are stored only if they decode back equal to
 /// the caller's value, both from the JSON sent and from what PostgreSQL stores. JSON cannot
 /// represent every value (`Some(f64::INFINITY)` is written as `null` and decodes as `None`), and
