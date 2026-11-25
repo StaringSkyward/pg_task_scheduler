@@ -16,6 +16,8 @@ use chrono::DateTime;
 use chrono::Utc;
 use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::store::Count;
+use pg_task_scheduler::store::ErrorFilter;
+use pg_task_scheduler::store::FailureGroup;
 use pg_task_scheduler::store::Overview;
 use pg_task_scheduler::store::QueueOverview;
 use pg_task_scheduler::store::WorkerView;
@@ -83,7 +85,7 @@ struct ActionRow {
     at: String,
     operator: String,
     action: String,
-    affected: i64,
+    affected: String,
     reason: String,
 }
 
@@ -116,7 +118,7 @@ pub(crate) struct ErrorPage {
     pub error: String,
 }
 
-fn count(c: Count) -> String {
+pub(crate) fn count(c: Count) -> String {
     let digits = c.value.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
@@ -129,6 +131,52 @@ fn count(c: Count) -> String {
         out.push('+');
     }
     out
+}
+
+/// The `error_filter` and `error` query fields as the filter they name. An absent mode is
+/// `any`. `error` is only for `exact`, which needs it (an empty one matches only `''`); with any
+/// other mode it is an error, so a link from before `error_filter` cannot widen to `any`.
+pub(crate) fn error_filter(
+    mode: Option<&str>,
+    error: Option<&str>,
+) -> Result<ErrorFilter, &'static str> {
+    match (mode, error) {
+        (Some("exact"), Some(e)) => Ok(ErrorFilter::Exact(e.to_owned())),
+        (Some("exact"), None) => Err("An exact error filter needs an error."),
+        (None | Some("any" | "missing"), Some(_)) => Err("error is only for error_filter=exact."),
+        (None | Some("any"), None) => Ok(ErrorFilter::Any),
+        (Some("missing"), None) => Ok(ErrorFilter::Missing),
+        _ => Err("Unknown error filter."),
+    }
+}
+
+/// The query fields [`error_filter`] reads back as `f`.
+pub(crate) fn error_query(f: &ErrorFilter) -> Vec<(&'static str, &str)> {
+    match f {
+        ErrorFilter::Any => vec![],
+        ErrorFilter::Missing => vec![("error_filter", "missing")],
+        ErrorFilter::Exact(e) => vec![("error_filter", "exact"), ("error", e)],
+    }
+}
+
+/// A failure group's row; its links name exactly its error: `missing` for none, else `exact`
+/// with the text, even when empty.
+fn group(base: &str, g: &FailureGroup) -> Group {
+    let error = match &g.error {
+        None => ErrorFilter::Missing,
+        Some(e) => ErrorFilter::Exact(e.clone()),
+    };
+    let mut pairs = vec![("task_name", g.task_name.as_str())];
+    pairs.extend(error_query(&error));
+    let query = serde_urlencoded::to_string(&pairs).unwrap_or_default();
+    Group {
+        link: format!("{base}/failed?{query}"),
+        replay_link: format!("{base}/bulk?action=replay&{query}"),
+        task_name: g.task_name.as_str().into(),
+        error: g.error.clone().unwrap_or_else(|| "—".into()),
+        dead: count(g.dead),
+        attempts: count(g.failed_attempts),
+    }
 }
 
 fn windowed_header(
@@ -262,31 +310,7 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
         groups: o
             .failure_groups
             .iter()
-            .map(|g| Group {
-                link: format!(
-                    "{}/failed?{}",
-                    config.base_path,
-                    serde_urlencoded::to_string([
-                        ("task_name", g.task_name.as_str()),
-                        ("error", g.error.as_str())
-                    ])
-                    .unwrap_or_default()
-                ),
-                replay_link: format!(
-                    "{}/bulk?{}",
-                    config.base_path,
-                    serde_urlencoded::to_string([
-                        ("action", "replay"),
-                        ("task_name", g.task_name.as_str()),
-                        ("error", g.error.as_str())
-                    ])
-                    .unwrap_or_default()
-                ),
-                task_name: g.task_name.as_str().into(),
-                error: g.error.clone(),
-                dead: count(g.dead),
-                attempts: count(g.failed_attempts),
-            })
+            .map(|g| group(&config.base_path, g))
             .collect(),
         no_handler: o
             .no_handler
@@ -302,8 +326,8 @@ fn build(o: &Overview, config: &crate::AdminConfig) -> OverviewPage {
             .map(|a| ActionRow {
                 at: a.at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
                 operator: a.operator.clone(),
-                action: format!("{:?}", a.action).to_lowercase(),
-                affected: a.affected,
+                action: a.kind().as_str().to_owned(),
+                affected: count(a.affected),
                 reason: a.reason.clone(),
             })
             .collect(),
@@ -374,6 +398,58 @@ mod tests {
         assert_eq!(count(c(999, false)), "999");
         assert_eq!(count(c(1234, false)), "1,234");
         assert_eq!(count(c(10_000, true)), "10,000+");
+    }
+
+    #[test]
+    fn group_links_name_exactly_their_error() {
+        let g = |error: Option<&str>| {
+            group(
+                "/admin",
+                &FailureGroup {
+                    task_name: pg_task_scheduler::TaskName::try_from("send").unwrap(),
+                    error: error.map(str::to_owned),
+                    dead: c(1, false),
+                    failed_attempts: c(0, false),
+                },
+            )
+        };
+        let none = g(None);
+        assert_eq!(
+            none.link,
+            "/admin/failed?task_name=send&error_filter=missing"
+        );
+        assert_eq!(
+            none.replay_link,
+            "/admin/bulk?action=replay&task_name=send&error_filter=missing"
+        );
+        let empty = g(Some(""));
+        assert_eq!(
+            empty.link,
+            "/admin/failed?task_name=send&error_filter=exact&error="
+        );
+        assert_eq!(
+            empty.replay_link,
+            "/admin/bulk?action=replay&task_name=send&error_filter=exact&error="
+        );
+    }
+
+    /// An `error` field without `exact` is a 400, so an old link cannot widen to `any`.
+    #[test]
+    fn error_is_only_for_an_exact_filter() {
+        let only = Err("error is only for error_filter=exact.");
+        for mode in [None, Some("any"), Some("missing")] {
+            assert_eq!(error_filter(mode, Some("x")), only, "{mode:?}");
+            assert_eq!(error_filter(mode, Some("")), only, "{mode:?}");
+        }
+        assert_eq!(error_filter(None, None), Ok(ErrorFilter::Any));
+        assert_eq!(
+            error_filter(Some("missing"), None),
+            Ok(ErrorFilter::Missing)
+        );
+        assert_eq!(
+            error_filter(Some("exact"), Some("x")),
+            Ok(ErrorFilter::Exact("x".into()))
+        );
     }
 
     #[test]

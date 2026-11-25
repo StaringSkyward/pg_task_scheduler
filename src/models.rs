@@ -1,5 +1,5 @@
 use std::num::NonZeroI32;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -10,15 +10,20 @@ use diesel::prelude::*;
 
 #[cfg(feature = "cron")]
 use crate::cron::CronExpression;
-#[cfg(feature = "cron")]
 use crate::error::SchedulerError;
+use crate::ids::CommandKey;
+use crate::ids::EffectName;
+use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
 use crate::ids::JobId;
 use crate::ids::LockToken;
 use crate::ids::QueueName;
+#[cfg(feature = "cron")]
+use crate::ids::ScheduleName;
 use crate::ids::TaskId;
 use crate::ids::TaskKey;
 use crate::ids::TaskName;
+use crate::ids::Topic;
 use crate::ids::WorkerId;
 #[cfg(feature = "cron")]
 use crate::schema::scheduler_jobs;
@@ -94,6 +99,139 @@ text_enum!(AttemptOutcome, "attempt outcome", {
     Released => "released", Cancelled => "cancelled",
 });
 
+/// How a finished task ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalStatus {
+    /// The handler succeeded.
+    Done,
+    /// Failed permanently or used up its attempts; replayable.
+    Dead,
+    /// Cancelled by an operator; replayable.
+    Cancelled,
+}
+
+/// A task's lifecycle state with the columns that state carries: an owner and lease
+/// while running, a completion time once finished. Mirrors the `queue_tasks` CHECKs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskState {
+    /// Waiting for its `due_at` and a worker that serves its queue and name.
+    Queued,
+    /// Claimed; a worker holds its lease.
+    Running {
+        /// The worker holding the lease.
+        locked_by: WorkerId,
+        /// Lease expiry.
+        locked_until: DateTime<Utc>,
+    },
+    /// Done, dead or cancelled.
+    Finished {
+        /// How it ended.
+        status: TerminalStatus,
+        /// When it finished. Retention counts from here.
+        completed_at: DateTime<Utc>,
+    },
+}
+
+impl TaskState {
+    /// The stored status.
+    pub fn status(&self) -> TaskStatus {
+        match self {
+            Self::Queued => TaskStatus::Queued,
+            Self::Running { .. } => TaskStatus::Running,
+            Self::Finished { status, .. } => match status {
+                TerminalStatus::Done => TaskStatus::Done,
+                TerminalStatus::Dead => TaskStatus::Dead,
+                TerminalStatus::Cancelled => TaskStatus::Cancelled,
+            },
+        }
+    }
+
+    /// Read boundary: every shape the `queue_tasks` CHECKs forbid is an `Invariant`.
+    pub(crate) fn from_columns(
+        status: &str,
+        locked_by: Option<WorkerId>,
+        locked_until: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, SchedulerError> {
+        let status: TaskStatus = status
+            .parse()
+            .map_err(|_| SchedulerError::Invariant("unknown task status"))?;
+        let finished = |status, completed_at| Self::Finished {
+            status,
+            completed_at,
+        };
+        Ok(match (status, locked_by, locked_until, completed_at) {
+            (TaskStatus::Queued, None, None, None) => Self::Queued,
+            (TaskStatus::Running, Some(locked_by), Some(locked_until), None) => Self::Running {
+                locked_by,
+                locked_until,
+            },
+            (TaskStatus::Done, None, None, Some(at)) => finished(TerminalStatus::Done, at),
+            (TaskStatus::Dead, None, None, Some(at)) => finished(TerminalStatus::Dead, at),
+            (TaskStatus::Cancelled, None, None, Some(at)) => {
+                finished(TerminalStatus::Cancelled, at)
+            }
+            _ => {
+                return Err(SchedulerError::Invariant(
+                    "task lock or completion columns do not match its status",
+                ));
+            }
+        })
+    }
+}
+
+/// Whether an attempt is still running. Mirrors the `queue_task_attempts` CHECKs that
+/// `finished_at` and `outcome` are set together and that only a failed close has an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptState {
+    /// Still running.
+    Open,
+    /// Closed.
+    Closed {
+        /// When it closed.
+        finished_at: DateTime<Utc>,
+        /// How it closed.
+        outcome: AttemptOutcome,
+        /// The failure message, for an outcome that records one.
+        error: Option<String>,
+    },
+}
+
+impl AttemptState {
+    /// Read boundary: an unknown outcome, or only one of the pair set, is an `Invariant`.
+    pub(crate) fn from_columns(
+        finished_at: Option<DateTime<Utc>>,
+        outcome: Option<&str>,
+        error: Option<String>,
+    ) -> Result<Self, SchedulerError> {
+        match (finished_at, outcome) {
+            (None, None) if error.is_some() => {
+                Err(SchedulerError::Invariant("an open attempt has an error"))
+            }
+            (None, None) => Ok(Self::Open),
+            (Some(finished_at), Some(outcome)) => Ok(Self::Closed {
+                error,
+                finished_at,
+                outcome: outcome
+                    .parse()
+                    .map_err(|_| SchedulerError::Invariant("unknown attempt outcome"))?,
+            }),
+            _ => Err(SchedulerError::Invariant(
+                "attempt finished_at and outcome are not set together",
+            )),
+        }
+    }
+}
+
+/// A task's current attempt (the one whose `lock_token` is the task's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRun {
+    /// When it was claimed.
+    pub started_at: DateTime<Utc>,
+    /// Open or closed.
+    pub state: AttemptState,
+}
+
 /// A task handed to a worker by `store::claim`.
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {
@@ -108,7 +246,7 @@ pub struct ClaimedTask {
     /// The task's arguments as JSON.
     pub payload: serde_json::Value,
     /// Attempts allowed in total.
-    pub max_attempts: i32,
+    pub max_attempts: MaxAttempts,
     /// When the task became due.
     pub due_at: DateTime<Utc>,
     /// Database time of the claim.
@@ -134,14 +272,83 @@ pub enum RetryOutcome {
 pub struct OutboxCommand {
     /// Names the effect, for example `"order-shipped"`. A task records each effect at
     /// most once: the row is unique on `(task_key, effect_name)`.
-    pub effect_name: String,
+    pub effect_name: EffectName,
     /// Unique across the outbox. Receivers deduplicate by it, so derive it from the
     /// `task_key` and `effect_name`.
-    pub command_key: String,
+    pub command_key: CommandKey,
     /// Where the application's relay publishes the command.
-    pub topic: String,
+    pub topic: Topic,
     /// The command body.
     pub payload: serde_json::Value,
+}
+
+/// What `store::complete_with_outbox` did with the outbox row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxWrite {
+    /// A new outbox row was written.
+    Inserted,
+    /// The task already had this effect with identical content; nothing was written.
+    AlreadyPresent,
+}
+
+/// A stored payload as read back: PostgreSQL accepts JSONB that `serde_json`
+/// cannot parse (for example `1e500`), so reading must not fail on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskPayload {
+    /// The payload parsed.
+    Json(serde_json::Value),
+    /// The payload did not parse.
+    Unreadable {
+        /// The stored text, as PostgreSQL prints it.
+        text: String,
+        /// Why `serde_json` rejected it.
+        error: String,
+    },
+}
+
+impl TaskPayload {
+    pub(crate) fn from_text(text: String) -> Self {
+        match serde_json::from_str(&text) {
+            Ok(v) => TaskPayload::Json(v),
+            Err(e) => TaskPayload::Unreadable {
+                error: e.to_string(),
+                text,
+            },
+        }
+    }
+}
+
+/// A stored task key as read back. `queue_tasks.task_key`'s identifier CHECK keeps out keys
+/// that [`TaskKey`] rejects, but a database whose CHECK was dropped by hand can hold one, and
+/// reading must not fail on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoredTaskKey {
+    /// The key satisfies the identifier policy.
+    Valid(TaskKey),
+    /// The key does not.
+    Invalid {
+        /// The stored text.
+        text: String,
+        /// Why [`TaskKey`] rejected it.
+        error: IdentifierError,
+    },
+}
+
+impl StoredTaskKey {
+    pub(crate) fn from_text(text: String) -> Self {
+        match TaskKey::try_from(text.as_str()) {
+            Ok(k) => StoredTaskKey::Valid(k),
+            Err(error) => StoredTaskKey::Invalid { text, error },
+        }
+    }
+
+    /// The key, or the raw text when it is invalid.
+    pub fn as_str(&self) -> &str {
+        match self {
+            StoredTaskKey::Valid(k) => k.as_str(),
+            StoredTaskKey::Invalid { text, .. } => text,
+        }
+    }
 }
 
 /// Every `queue_tasks` column as a domain type.
@@ -150,58 +357,46 @@ pub struct TaskView {
     /// Row id.
     pub id: TaskId,
     /// The producer's idempotency key.
-    pub task_key: TaskKey,
+    pub task_key: StoredTaskKey,
     /// Selects the handler.
     pub task_name: TaskName,
     /// The queue it runs in.
     pub queue: QueueName,
-    /// The task's arguments as JSON.
-    pub payload: serde_json::Value,
-    /// Lifecycle state.
-    pub status: TaskStatus,
+    /// The task's arguments, or the raw text when it does not parse.
+    pub payload: TaskPayload,
+    /// Lifecycle state, with the lease while running and the completion time once finished.
+    pub state: TaskState,
     /// Higher is claimed first, within its queue.
     pub priority: i32,
     /// Earliest time a worker may claim it.
     pub due_at: DateTime<Utc>,
     /// Attempts counted so far.
-    pub attempts: i32,
+    pub attempts: u32,
     /// Attempts allowed in total.
-    pub max_attempts: i32,
-    /// The worker holding the lease, while `running`.
-    pub locked_by: Option<WorkerId>,
+    pub max_attempts: MaxAttempts,
     /// Fencing token of the latest claim.
     pub lock_token: LockToken,
-    /// Lease expiry, while `running`.
-    pub locked_until: Option<DateTime<Utc>>,
     /// Message of the latest failure.
     pub last_error: Option<String>,
     /// When it was enqueued.
     pub created_at: DateTime<Utc>,
     /// When the row last changed.
     pub updated_at: DateTime<Utc>,
-    /// When it became `done`, `dead` or `cancelled`. Retention counts from here.
-    pub completed_at: Option<DateTime<Utc>>,
-    /// The admin action that last cancelled or replayed this task.
-    pub admin_action_id: Option<i64>,
 }
 
 /// One `queue_task_attempts` row.
 #[derive(Debug, Clone)]
 pub struct Attempt {
     /// 1 for the first attempt.
-    pub attempt_no: i32,
+    pub attempt_no: AttemptNo,
     /// Fencing token of the claim that started it.
     pub lock_token: LockToken,
     /// The worker that ran it.
     pub worker_id: WorkerId,
     /// When it was claimed.
     pub started_at: DateTime<Utc>,
-    /// When it closed; `None` while it runs.
-    pub finished_at: Option<DateTime<Utc>>,
-    /// How it closed; `None` while it runs.
-    pub outcome: Option<AttemptOutcome>,
-    /// The failure message, if it failed.
-    pub error: Option<String>,
+    /// Open, or when and how it closed.
+    pub state: AttemptState,
 }
 
 /// Proof of ownership of one claimed attempt; every worker-owned mutation is
@@ -215,7 +410,7 @@ pub struct TaskLease {
     /// The claim's fencing token.
     pub lock_token: LockToken,
     /// Which attempt this is, from 1.
-    pub attempt_no: i32,
+    pub attempt_no: AttemptNo,
 }
 
 /// What one `store::reap_expired` pass did.
@@ -230,28 +425,50 @@ pub struct ReapSummary {
 /// Rows deleted by one `store::cleanup` pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupSummary {
-    /// `done`, `dead` and `cancelled` task rows deleted, with their attempts.
-    pub tasks: usize,
+    /// `done` task rows deleted, with their attempts.
+    pub done: usize,
+    /// `dead` task rows deleted, with their attempts.
+    pub dead: usize,
+    /// `cancelled` task rows deleted, with their attempts.
+    pub cancelled: usize,
     /// Published outbox rows deleted.
     pub outbox: usize,
 }
 
-const DEFAULT_CLEANUP_BATCH: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+impl CleanupSummary {
+    /// Task rows deleted, over all three terminal statuses.
+    #[must_use]
+    pub fn tasks(&self) -> usize {
+        self.done + self.dead + self.cancelled
+    }
+
+    /// Whether any status, or the outbox, deleted a full `batch`, so more may remain.
+    #[must_use]
+    pub fn any_full(&self, batch: NonZeroU32) -> bool {
+        let full = |n: usize| u32::try_from(n).map_or(true, |n| n >= batch.get());
+        full(self.done) || full(self.dead) || full(self.cancelled) || full(self.outbox)
+    }
+}
+
+const DEFAULT_CLEANUP_BATCH: NonZeroU32 = NonZeroU32::new(1000).unwrap();
 
 /// How long terminal rows are kept; `batch_size` bounds each delete statement.
+///
+/// Maintenance covers the whole schema: every scheduler on it deletes from the same tables. So
+/// schedulers sharing a schema must use the same retention, and the shortest one sets every
+/// producer's idempotency horizon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
-    /// How long `done` tasks are kept after completion. Default 30 days.
+    /// How long `done` tasks are kept after completion; their `task_key` stays reserved for
+    /// this long. Default 30 days.
     pub done: Duration,
-    /// How long `dead` and `cancelled` tasks are kept after completion. Default 30 days.
+    /// How long `dead` and `cancelled` tasks are kept after completion; their `task_key`
+    /// stays reserved for this long. Default 30 days.
     pub dead: Duration,
-    /// How long a `task_key` stays reserved. `done` and `dead` must be at least this,
-    /// or [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) fails. Default 7 days.
-    pub idempotency_horizon: Duration,
     /// How long published outbox rows are kept after `published_at`. Default 7 days.
     pub outbox_published: Duration,
     /// Most rows one delete statement removes. Default 1000.
-    pub batch_size: NonZeroUsize,
+    pub batch_size: NonZeroU32,
 }
 
 impl Default for Retention {
@@ -260,10 +477,24 @@ impl Default for Retention {
         Self {
             done: Duration::from_secs(30 * DAY),
             dead: Duration::from_secs(30 * DAY),
-            idempotency_horizon: Duration::from_secs(7 * DAY),
             outbox_published: Duration::from_secs(7 * DAY),
             batch_size: DEFAULT_CLEANUP_BATCH,
         }
+    }
+}
+
+impl Retention {
+    /// Rejects a retention PostgreSQL cannot subtract from `now()`.
+    pub(crate) fn check(&self) -> Result<(), SchedulerError> {
+        if [self.done, self.dead, self.outbox_published]
+            .iter()
+            .any(|d| *d > MAX_DURATION)
+        {
+            return Err(SchedulerError::Config(
+                "every retention duration must be at most 5 years".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -307,9 +538,13 @@ pub struct QueueStats {
     pub oldest_unpublished_age: Option<Duration>,
 }
 
-/// `Duration` to a pure-microsecond PG interval, saturating at `i64::MAX`.
-pub(crate) fn pg_interval(d: Duration) -> PgInterval {
-    PgInterval::from_microseconds(i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+/// `Duration` to a pure-microsecond PG interval, rounding a sub-microsecond part up so a
+/// positive delay is never zero (zero stays zero). Fails on more than `i64::MAX`
+/// microseconds, which no interval holds.
+pub(crate) fn pg_interval(d: Duration) -> Result<PgInterval, SchedulerError> {
+    i64::try_from(d.as_nanos().div_ceil(1000))
+        .map(PgInterval::from_microseconds)
+        .map_err(|_| SchedulerError::Config("duration too large for a PostgreSQL interval".into()))
 }
 
 /// PG interval to `Duration` (days count as 86 400 s); negative becomes zero.
@@ -322,6 +557,68 @@ pub(crate) fn interval_to_duration(iv: PgInterval) -> Duration {
 // ---------------------------------------------------------------------------
 // Validated config types (input boundary)
 // ---------------------------------------------------------------------------
+
+/// Longest duration the scheduler accepts for any setting: 5 years (5 × 365 days). Every
+/// duration becomes a PostgreSQL interval added to or subtracted from `now()`, and a far
+/// larger one (such as `Duration::MAX`) fails each such statement with
+/// "timestamp out of range".
+pub(crate) const MAX_DURATION: Duration = Duration::from_secs(5 * 365 * 86_400);
+
+/// How long a claim or heartbeat leases a task, in PostgreSQL time: from 1 microsecond to
+/// 5 years, truncated to whole microseconds. Build one with `LeaseDuration::try_from(Duration::from_secs(60))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseDuration(Duration);
+
+/// Why a `Duration` was rejected as a [`LeaseDuration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LeaseDurationError {
+    /// Under 1 microsecond, which a PostgreSQL interval truncates to zero.
+    #[error("lease_duration must be at least 1 microsecond")]
+    BelowOneMicrosecond,
+    /// Over 5 years.
+    #[error("lease_duration must be at most 5 years")]
+    AboveFiveYears,
+}
+
+impl TryFrom<Duration> for LeaseDuration {
+    type Error = LeaseDurationError;
+    fn try_from(d: Duration) -> Result<Self, LeaseDurationError> {
+        if d.as_micros() == 0 {
+            Err(LeaseDurationError::BelowOneMicrosecond)
+        } else if d > MAX_DURATION {
+            Err(LeaseDurationError::AboveFiveYears)
+        } else {
+            Ok(Self(Duration::new(d.as_secs(), d.subsec_micros() * 1000)))
+        }
+    }
+}
+
+/// Rounds `t` up to the next whole microsecond (PostgreSQL's `timestamptz` resolution), so
+/// a stored due time is never earlier than the instant given. A whole microsecond is
+/// returned unchanged. A leap-second instant (`:60.f`) is stored as the same fraction of
+/// the following second, which is later and never earlier.
+pub(crate) fn round_up_to_micros(t: DateTime<Utc>) -> Result<DateTime<Utc>, SchedulerError> {
+    let rem = t.timestamp_subsec_nanos() % 1000;
+    if rem == 0 {
+        return Ok(t);
+    }
+    t.checked_add_signed(chrono::TimeDelta::nanoseconds(i64::from(1000 - rem)))
+        .ok_or_else(|| {
+            SchedulerError::Config(
+                "instant is past the last whole microsecond chrono can hold".into(),
+            )
+        })
+}
+
+impl LeaseDuration {
+    /// 60 seconds, the builder's default.
+    pub(crate) const DEFAULT: Self = Self(Duration::from_secs(60));
+
+    /// The lease length.
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
 
 /// How many attempts a task gets before it is marked `dead`; at least 1. Build one
 /// with `MaxAttempts::try_from(5u32)`. The default is 3.
@@ -351,12 +648,68 @@ impl TryFrom<u32> for MaxAttempts {
     }
 }
 
+/// Which attempt of a task this is, counted from 1.
+//
+// Private `NonZeroI32` with the invariant `>= 1`, like [`MaxAttempts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptNo(NonZeroI32);
+
+/// Why a value was rejected as an [`AttemptNo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AttemptNoError {
+    /// Zero, or a stored value that is not positive.
+    #[error("attempt_no must be greater than zero")]
+    NonPositive,
+    /// Above `i32::MAX`, the largest value the database column holds.
+    #[error("attempt_no exceeds i32::MAX")]
+    TooLarge,
+}
+
+impl TryFrom<u32> for AttemptNo {
+    type Error = AttemptNoError;
+    fn try_from(v: u32) -> Result<Self, AttemptNoError> {
+        let i = i32::try_from(v).map_err(|_| AttemptNoError::TooLarge)?;
+        NonZeroI32::new(i)
+            .map(AttemptNo)
+            .ok_or(AttemptNoError::NonPositive)
+    }
+}
+
+impl AttemptNo {
+    /// The first attempt.
+    pub const FIRST: AttemptNo = AttemptNo(NonZeroI32::new(1).unwrap());
+
+    /// Read boundary: parse the stored signed number. Rejects `<= 0`.
+    pub(crate) fn from_db_i32(i: i32) -> Result<Self, AttemptNoError> {
+        NonZeroI32::new(i)
+            .filter(|n| n.get() > 0)
+            .map(AttemptNo)
+            .ok_or(AttemptNoError::NonPositive)
+    }
+
+    /// Total: the invariant guarantees `1..=i32::MAX`.
+    #[cfg(test)]
+    pub(crate) fn to_i32(self) -> i32 {
+        self.0.get()
+    }
+
+    /// The attempt number, from 1.
+    pub fn get(self) -> u32 {
+        self.0.get().unsigned_abs()
+    }
+}
+
+impl std::fmt::Display for AttemptNo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
 impl MaxAttempts {
     pub(crate) const fn default_value() -> Self {
         Self(NonZeroI32::new(3).unwrap())
     }
     /// Read boundary: parse the stored signed count. Rejects `<= 0`.
-    #[cfg_attr(not(feature = "cron"), allow(dead_code))]
     pub(crate) fn from_db_i32(i: i32) -> Result<Self, MaxAttemptsError> {
         NonZeroI32::new(i)
             .filter(|n| n.get() > 0)
@@ -416,16 +769,132 @@ mod task_enum_tests {
     #[test]
     fn interval_conversions() {
         assert_eq!(
-            interval_to_duration(pg_interval(Duration::from_millis(1500))),
+            interval_to_duration(pg_interval(Duration::from_millis(1500)).unwrap()),
             Duration::from_millis(1500)
         );
-        assert_eq!(pg_interval(Duration::MAX).microseconds, i64::MAX);
         assert_eq!(
             interval_to_duration(PgInterval::from_microseconds(-5)),
             Duration::ZERO
         );
         let day = PgInterval::new(0, 1, 0);
         assert_eq!(interval_to_duration(day), Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn lease_duration_bounds() {
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_nanos(999)),
+            Err(LeaseDurationError::BelowOneMicrosecond)
+        );
+        assert!(LeaseDuration::try_from(Duration::from_micros(1)).is_ok());
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_secs(157_680_001)),
+            Err(LeaseDurationError::AboveFiveYears)
+        );
+    }
+
+    #[test]
+    fn round_up_to_micros_moves_forward_only() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let want = t("2030-01-01T00:00:00.000001Z");
+        assert_eq!(round_up_to_micros(want).unwrap(), want);
+        assert_eq!(
+            round_up_to_micros(t("2030-01-01T00:00:00.000000001Z")).unwrap(),
+            want
+        );
+        assert_eq!(
+            round_up_to_micros(t("2030-01-01T00:00:00.000000999Z")).unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn lease_duration_truncates_to_whole_microseconds() {
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_nanos(1_500))
+                .unwrap()
+                .get(),
+            Duration::from_micros(1)
+        );
+        assert_eq!(
+            LeaseDuration::try_from(Duration::from_micros(1))
+                .unwrap()
+                .get(),
+            Duration::from_micros(1)
+        );
+    }
+
+    #[test]
+    fn pg_interval_rounds_up_to_the_microsecond() {
+        for (ns, us) in [(0, 0), (1, 1), (1000, 1), (1001, 2)] {
+            assert_eq!(
+                pg_interval(Duration::from_nanos(ns)).unwrap().microseconds,
+                us
+            );
+        }
+    }
+
+    #[test]
+    fn pg_interval_rejects_what_it_cannot_represent() {
+        assert!(pg_interval(Duration::MAX).is_err());
+        assert_eq!(
+            pg_interval(Duration::from_millis(1500))
+                .unwrap()
+                .microseconds,
+            1_500_000
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn task_state_accepts_each_checked_shape() {
+        let w = WorkerId::try_from("w").unwrap();
+        let t = Utc::now();
+        assert_eq!(
+            TaskState::from_columns("queued", None, None, None).unwrap(),
+            TaskState::Queued
+        );
+        assert!(matches!(
+            TaskState::from_columns("running", Some(w), Some(t), None).unwrap(),
+            TaskState::Running { .. }
+        ));
+        assert_eq!(
+            TaskState::from_columns("cancelled", None, None, Some(t)).unwrap(),
+            TaskState::Finished {
+                status: TerminalStatus::Cancelled,
+                completed_at: t
+            }
+        );
+    }
+
+    #[test]
+    fn task_state_rejects_shapes_the_checks_forbid() {
+        let t = Utc::now();
+        for (s, by, until, done) in [
+            ("running", None, Some(t), None),
+            ("queued", None, None, Some(t)),
+            ("done", None, None, None),
+            ("pending", None, None, None),
+        ] {
+            let r = TaskState::from_columns(s, by, until, done);
+            assert!(matches!(r, Err(SchedulerError::Invariant(_))), "{s}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn attempt_state_pairs_finish_and_outcome() {
+        let t = Utc::now();
+        assert_eq!(
+            AttemptState::from_columns(None, None, None).unwrap(),
+            AttemptState::Open
+        );
+        assert!(AttemptState::from_columns(Some(t), None, None).is_err());
+        assert!(AttemptState::from_columns(None, Some("done"), None).is_err());
+        assert!(AttemptState::from_columns(None, None, Some("x".into())).is_err());
     }
 }
 
@@ -480,11 +949,24 @@ mod max_attempts_tests {
     fn get_returns_u32() {
         assert_eq!(MaxAttempts::try_from(3u32).unwrap().get(), 3);
     }
+
+    #[test]
+    fn attempt_no_rejects_zero_and_above_i32_max() {
+        use super::AttemptNo;
+        use super::AttemptNoError;
+        assert_eq!(AttemptNo::try_from(0u32), Err(AttemptNoError::NonPositive));
+        assert_eq!(AttemptNo::try_from(u32::MAX), Err(AttemptNoError::TooLarge));
+        assert_eq!(AttemptNo::from_db_i32(0), Err(AttemptNoError::NonPositive));
+        assert_eq!(AttemptNo::from_db_i32(-1), Err(AttemptNoError::NonPositive));
+        assert_eq!(AttemptNo::from_db_i32(2).unwrap().get(), 2);
+        assert_eq!(AttemptNo::FIRST.get(), 1);
+        assert_eq!(AttemptNo::try_from(7u32).unwrap().to_i32(), 7);
+    }
 }
 
 #[cfg(feature = "cron")]
-/// A job's lifecycle state. Used at both the creation and read boundaries; the
-/// stored `is_paused` boolean never escapes the row mapping.
+/// A job's lifecycle state. Used at both the creation and read boundaries; it is
+/// `Paused` exactly when the job has a `scheduler_job_pauses` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobLifecycle {
     /// Creates a task for each occurrence.
@@ -494,33 +976,18 @@ pub enum JobLifecycle {
 }
 
 #[cfg(feature = "cron")]
-impl JobLifecycle {
-    /// Boundary helper for the `is_paused` column. `pub(crate)` because `jobs`
-    /// (a sibling module) calls it — a plain `fn` is private to `models`.
-    pub(crate) fn is_paused(self) -> bool {
-        matches!(self, JobLifecycle::Paused)
-    }
-
-    pub(crate) fn from_paused(paused: bool) -> Self {
-        if paused {
-            JobLifecycle::Paused
-        } else {
-            JobLifecycle::Active
-        }
-    }
-}
-
-#[cfg(feature = "cron")]
-/// Public domain projection of a `scheduler_jobs` row. Every field is a domain
-/// type; `job_args` is intentionally omitted (reading is untyped — the handler
-/// argument type is not recoverable from a runtime `TaskName`). Not `Serialize`:
-/// it must not become an accidental wire contract.
+/// Public domain projection of a `scheduler_jobs` row, its cursor and its pause state. Every
+/// field is a domain type; `job_args` is intentionally omitted (reading is untyped —
+/// the handler argument type is not recoverable from a runtime `TaskName`). Not
+/// `Serialize`: it must not become an accidental wire contract.
 #[derive(Debug, Clone)]
 pub struct Job {
     /// Row id.
     pub id: JobId,
-    /// The task name each occurrence runs; also the schedule's unique name.
-    pub name: TaskName,
+    /// The schedule's unique name.
+    pub name: ScheduleName,
+    /// The task each occurrence runs; many schedules may share one.
+    pub task_name: TaskName,
     /// When it fires.
     pub cron: CronExpression,
     /// Attempts each task it creates gets.
@@ -529,18 +996,23 @@ pub struct Job {
     pub queue: QueueName,
     /// Active or paused.
     pub lifecycle: JobLifecycle,
-    /// The next occurrence to turn into a task.
+    /// The next occurrence to turn into a task: the job's cursor, in `scheduler_job_cursors`.
     pub next_run_at: DateTime<Utc>,
     /// When it was created.
     pub created_at: DateTime<Utc>,
-    /// When the row last changed.
+    /// Changed by `ensure_job` (on every call, even one that changes nothing) and definition
+    /// updates, never by the materializer, `reschedule`, pausing or resuming.
     pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(feature = "cron")]
-impl TryFrom<SchedulerJob> for Job {
-    type Error = SchedulerError;
-    fn try_from(row: SchedulerJob) -> Result<Self, SchedulerError> {
+impl Job {
+    /// Project a row whose cursor and pause state the caller read alongside it.
+    pub(crate) fn from_row(
+        row: SchedulerJob,
+        next_run_at: DateTime<Utc>,
+        lifecycle: JobLifecycle,
+    ) -> Result<Self, SchedulerError> {
         let job_id = row.id;
         let cron = CronExpression::parse_stored(job_id, &row.cron_expression)?;
         let max_attempts =
@@ -551,11 +1023,12 @@ impl TryFrom<SchedulerJob> for Job {
         Ok(Job {
             id: job_id,
             name: row.name,
+            task_name: row.task_name,
             cron,
             max_attempts,
             queue: row.queue,
-            lifecycle: JobLifecycle::from_paused(row.is_paused),
-            next_run_at: row.next_run_at,
+            lifecycle,
+            next_run_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -563,45 +1036,17 @@ impl TryFrom<SchedulerJob> for Job {
 }
 
 #[cfg(feature = "cron")]
-/// Faithful `scheduler_jobs` row.
+/// `scheduler_jobs` row as read: `job_args` is omitted so an unreadable value cannot break reads.
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
 #[diesel(table_name = scheduler_jobs)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct SchedulerJob {
     pub id: JobId,
-    pub name: TaskName,
+    pub name: ScheduleName,
+    pub task_name: TaskName,
     pub cron_expression: String,
-    pub job_args: serde_json::Value,
-    pub next_run_at: DateTime<Utc>,
     pub max_attempts: i32,
     pub queue: QueueName,
-    pub is_paused: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-#[cfg(feature = "cron")]
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = scheduler_jobs)]
-pub struct NewJob {
-    pub name: TaskName,
-    pub cron_expression: String,
-    pub job_args: serde_json::Value,
-    pub next_run_at: DateTime<Utc>,
-    pub max_attempts: i32,
-    pub queue: QueueName,
-    pub is_paused: bool,
-}
-
-#[cfg(all(test, feature = "cron"))]
-mod job_lifecycle_tests {
-    use super::JobLifecycle;
-
-    #[test]
-    fn from_paused_round_trips() {
-        assert_eq!(JobLifecycle::from_paused(true), JobLifecycle::Paused);
-        assert_eq!(JobLifecycle::from_paused(false), JobLifecycle::Active);
-        assert!(JobLifecycle::Paused.is_paused());
-        assert!(!JobLifecycle::Active.is_paused());
-    }
 }

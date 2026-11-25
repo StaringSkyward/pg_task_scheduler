@@ -8,12 +8,16 @@ use diesel::sql_types::Integer;
 use diesel::sql_types::Text;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
+use pg_task_scheduler::AttemptNo;
+use pg_task_scheduler::CommandKey;
+use pg_task_scheduler::EffectName;
 use pg_task_scheduler::OutboxCommand;
 use pg_task_scheduler::Scheduler;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskContext;
 use pg_task_scheduler::TaskError;
+use pg_task_scheduler::Topic;
 use pg_task_scheduler::store;
 use serde::Deserialize;
 use serde::Serialize;
@@ -23,7 +27,7 @@ use crate::Pool;
 
 pub struct SendEmail;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct EmailArgs {
     pub to: String,
     pub subject: String,
@@ -36,7 +40,7 @@ impl Task for SendEmail {
 
 pub struct BulkImport;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct BulkImportArgs {
     pub rows: u32,
 }
@@ -51,7 +55,7 @@ impl Task for BulkImport {
 /// leaves one dead.
 pub struct FlakyDemo;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct FlakyArgs {}
 
 impl Task for FlakyDemo {
@@ -61,7 +65,7 @@ impl Task for FlakyDemo {
 
 pub struct Digest;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct DigestArgs {}
 
 impl Task for Digest {
@@ -71,7 +75,7 @@ impl Task for Digest {
 
 pub struct PlaceOrder;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct OrderArgs {
     pub amount_cents: i32,
 }
@@ -79,6 +83,13 @@ pub struct OrderArgs {
 impl Task for PlaceOrder {
     const NAME: &'static str = "place-order";
     type Args = OrderArgs;
+}
+
+/// The outbox payload `place_order` writes and the relay reads.
+#[derive(Serialize, Deserialize)]
+pub struct OrderPlaced {
+    pub order_id: i64,
+    pub amount_cents: i32,
 }
 
 /// A number in `min..=max`, from a v4 UUID's random bits.
@@ -162,6 +173,8 @@ enum PlaceOrderError {
     Scheduler(#[from] SchedulerError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Identifier(#[from] pg_task_scheduler::IdentifierError),
 }
 
 #[derive(diesel::QueryableByName)]
@@ -192,24 +205,51 @@ async fn place_order(pool: Pool, ctx: TaskContext, args: OrderArgs) -> Result<()
         .bind::<Integer, _>(args.amount_cents)
         .get_result::<NewOrder>(c)
         .await?;
-        if ctx.lease.attempt_no == 1 {
+        if ctx.lease.attempt_no == AttemptNo::FIRST {
             return Err(PlaceOrderError::Crash);
         }
         let command = OutboxCommand {
-            effect_name: "order-placed".into(),
-            command_key: serde_json::to_string(&(ctx.task_key.as_str(), "order-placed"))?,
-            topic: "orders".into(),
-            payload: serde_json::json!({"order_id": order.id, "amount_cents": args.amount_cents}),
+            effect_name: EffectName::try_from("order-placed")?,
+            command_key: CommandKey::try_from(serde_json::to_string(&(
+                ctx.task_key.as_str(),
+                "order-placed",
+            ))?)?,
+            topic: Topic::try_from("orders")?,
+            payload: serde_json::to_value(OrderPlaced {
+                order_id: order.id,
+                amount_cents: args.amount_cents,
+            })?,
         };
         store::complete_with_outbox(c, &ctx.lease, &command).await?;
         Ok(())
     })
     .await
-    // Map explicitly: `?` into `TaskError` would make the failure permanent.
+    // Every arm is classified by hand; `TaskError` has no `From` for `?` to use.
     .map_err(|e| match e {
         PlaceOrderError::Crash => {
             TaskError::retry("simulated crash after writing the order (demo: fails on purpose)")
         }
+        // A conflicting outbox key or a value that can never encode will fail
+        // the same way every attempt; retrying only burns attempts.
+        e @ (PlaceOrderError::Scheduler(SchedulerError::OutboxConflict { .. })
+        | PlaceOrderError::Identifier(_)
+        | PlaceOrderError::Json(_)) => TaskError::permanent(e.to_string()),
+        // Database and other scheduler errors are transient.
         other => TaskError::retry(other.to_string()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_placed_needs_an_order_id() {
+        assert!(
+            serde_json::from_value::<OrderPlaced>(serde_json::json!({"amount_cents": 5})).is_err()
+        );
+        let ok: OrderPlaced =
+            serde_json::from_value(serde_json::json!({"order_id": 7, "amount_cents": 5})).unwrap();
+        assert_eq!((ok.order_id, ok.amount_cents), (7, 5));
+    }
 }

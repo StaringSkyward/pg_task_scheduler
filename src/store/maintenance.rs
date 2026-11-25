@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use diesel::sql_types;
@@ -9,13 +9,26 @@ use crate::error::SchedulerError;
 use crate::models::CleanupSummary;
 use crate::models::ReapSummary;
 use crate::models::Retention;
+use crate::models::TaskStatus;
 use crate::models::pg_interval;
 
-// §12 reaper, plus closing each reaped task's open attempt. One statement, so both commit together.
-const REAP: &str = r#"
+// Reaper: expired leases go back to queued after the crash-retry delay, or to dead when no attempts
+// remain, and each reaped task's open attempt closes. One statement, so both commit together.
+// `expired` returns the locked, newest version of each row, so its lock_token is the lease being
+// reaped. The attempt is closed by upsert, not UPDATE: a reclaim that committed after this
+// statement's snapshot, but before the row lock, inserted an attempt the snapshot cannot see;
+// ON CONFLICT still finds it. A running task always has its attempt (the claim inserts both at
+// once), and a CHECK keeps `attempts >= 1` on every running row, so the `attempt_no =
+// attempts` insert is always valid. It only repairs an imported row missing its attempt row,
+// as `CANCEL` does.
+// `statement_timestamp()` is stable within the statement, so the cutoff is an index bound on
+// queue_tasks_expired_lease_idx, and it is never later than the `clock_timestamp()` an owner's
+// own expiry check reads. A lease that expires during the statement waits for the next pass.
+#[doc(hidden)]
+pub const REAP: &str = r#"
     WITH expired AS (
-        SELECT id FROM queue_tasks
-        WHERE status = 'running' AND locked_until <= clock_timestamp()
+        SELECT id, attempts, lock_token, locked_by FROM queue_tasks
+        WHERE status = 'running' AND locked_until <= statement_timestamp()
         ORDER BY locked_until ASC, id ASC
         LIMIT $1
         FOR UPDATE SKIP LOCKED
@@ -23,24 +36,28 @@ const REAP: &str = r#"
         UPDATE queue_tasks AS q
         SET status = CASE WHEN q.attempts >= q.max_attempts THEN 'dead' ELSE 'queued' END,
             due_at = CASE WHEN q.attempts >= q.max_attempts THEN q.due_at
-                          ELSE now() + $2::interval END,
+                          ELSE statement_timestamp() + $2::interval END,
             locked_by = NULL, locked_until = NULL,
             last_error = 'worker lease expired',
-            completed_at = CASE WHEN q.attempts >= q.max_attempts THEN now() ELSE NULL END,
-            updated_at = now()
+            completed_at = CASE WHEN q.attempts >= q.max_attempts THEN statement_timestamp() ELSE NULL END,
+            updated_at = statement_timestamp()
         FROM expired AS e WHERE q.id = e.id
-        RETURNING q.id, q.lock_token, q.status
+        RETURNING q.id, q.status
     ), closed AS (
-        UPDATE queue_task_attempts a
-        SET finished_at = now(), outcome = 'lease_expired', error = 'worker lease expired'
-        FROM reaped r
-        WHERE a.task_id = r.id AND a.lock_token = r.lock_token AND a.finished_at IS NULL
-        RETURNING a.task_id
+        INSERT INTO queue_task_attempts
+            (task_id, attempt_no, lock_token, worker_id, finished_at, outcome, error)
+        SELECT e.id, e.attempts, e.lock_token, e.locked_by, statement_timestamp(), 'lease_expired',
+               'worker lease expired'
+        FROM expired AS e JOIN reaped AS r ON r.id = e.id
+        ON CONFLICT (task_id, lock_token) DO UPDATE
+        SET finished_at = excluded.finished_at, outcome = excluded.outcome,
+            error = excluded.error
+        WHERE queue_task_attempts.finished_at IS NULL
     )
     SELECT status FROM reaped
 "#;
 
-// §20, one statement per terminal status: each is an ordered range scan of
+// Retention cleanup, one statement per terminal status: each is an ordered range scan of
 // queue_tasks_terminal_cleanup_idx with `completed_at < cutoff` as its index condition,
 // stopping at the LIMIT. One OR across both statuses cannot be one range: the planner
 // walks the whole index filtering every retained row, or bitmap-scans and sorts every
@@ -96,70 +113,72 @@ struct StatusRow {
     status: String,
 }
 
-fn limit(n: NonZeroUsize) -> i64 {
-    i64::try_from(n.get()).unwrap_or(i64::MAX)
-}
-
 /// Recover up to `batch` tasks whose lease expired: requeue after `crash_retry_delay`, or mark
 /// dead when attempts are exhausted. Safe to run from several processes (SKIP LOCKED).
 pub async fn reap_expired(
     conn: &mut AsyncPgConnection,
-    batch: NonZeroUsize,
+    batch: NonZeroU32,
     crash_retry_delay: Duration,
 ) -> Result<ReapSummary, SchedulerError> {
     let rows = diesel::sql_query(REAP)
-        .bind::<sql_types::BigInt, _>(limit(batch))
-        .bind::<sql_types::Interval, _>(pg_interval(crash_retry_delay))
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
+        .bind::<sql_types::Interval, _>(pg_interval(crash_retry_delay)?)
         .get_results::<StatusRow>(conn)
         .await?;
-    let dead = rows.iter().filter(|r| r.status == "dead").count();
-    Ok(ReapSummary {
-        requeued: rows.len() - dead,
-        dead,
-    })
+    let (mut requeued, mut dead) = (0, 0);
+    for row in &rows {
+        match row.status.parse::<TaskStatus>() {
+            Ok(TaskStatus::Queued) => requeued += 1,
+            Ok(TaskStatus::Dead) => dead += 1,
+            _ => {
+                return Err(SchedulerError::Invariant(
+                    "reap returned an unexpected status",
+                ));
+            }
+        }
+    }
+    Ok(ReapSummary { requeued, dead })
 }
 
-/// Delete one bounded batch of expired terminal tasks (`done` first, then `dead`, then `cancelled`, at most
-/// `retention.batch_size` in all) and one of published outbox rows. Call repeatedly until
-/// both counts are below `retention.batch_size`.
+/// Delete one bounded batch of expired terminal tasks per status (`done`, `dead` and `cancelled`:
+/// at most `retention.batch_size` each) and one of published outbox rows. Call repeatedly until
+/// every count is below `retention.batch_size`. Retention over 5 years is rejected with
+/// `Config` before any delete. The batches commit separately, so a database error mid-call
+/// leaves earlier batches committed.
 pub async fn cleanup(
     conn: &mut AsyncPgConnection,
     retention: &Retention,
 ) -> Result<CleanupSummary, SchedulerError> {
+    retention.check()?;
     let batch = retention.batch_size;
+    // Convert every interval first so invalid input is rejected before any delete.
+    let done_age = pg_interval(retention.done)?;
+    let dead_age = pg_interval(retention.dead)?;
+    let outbox_age = pg_interval(retention.outbox_published)?;
     let done = diesel::sql_query(CLEANUP_DONE)
-        .bind::<sql_types::Interval, _>(pg_interval(retention.done))
-        .bind::<sql_types::BigInt, _>(limit(batch))
+        .bind::<sql_types::Interval, _>(done_age)
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
         .execute(conn)
         .await?;
-    // Both statuses share one budget: a call deletes at most `batch_size` task rows.
-    let dead = match NonZeroUsize::new(batch.get().saturating_sub(done)) {
-        Some(left) => {
-            diesel::sql_query(CLEANUP_DEAD)
-                .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
-                .bind::<sql_types::BigInt, _>(limit(left))
-                .execute(conn)
-                .await?
-        }
-        None => 0,
-    };
-    let cancelled = match NonZeroUsize::new(batch.get().saturating_sub(done + dead)) {
-        Some(left) => {
-            diesel::sql_query(CLEANUP_CANCELLED)
-                .bind::<sql_types::Interval, _>(pg_interval(retention.dead))
-                .bind::<sql_types::BigInt, _>(limit(left))
-                .execute(conn)
-                .await?
-        }
-        None => 0,
-    };
+    let dead = diesel::sql_query(CLEANUP_DEAD)
+        .bind::<sql_types::Interval, _>(dead_age)
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
+        .execute(conn)
+        .await?;
+    let cancelled = diesel::sql_query(CLEANUP_CANCELLED)
+        .bind::<sql_types::Interval, _>(dead_age)
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
+        .execute(conn)
+        .await?;
     let outbox = diesel::sql_query(CLEANUP_OUTBOX)
-        .bind::<sql_types::Interval, _>(pg_interval(retention.outbox_published))
-        .bind::<sql_types::BigInt, _>(limit(batch))
+        .bind::<sql_types::Interval, _>(outbox_age)
+        .bind::<sql_types::BigInt, _>(i64::from(batch.get()))
         .execute(conn)
         .await?;
     Ok(CleanupSummary {
-        tasks: done + dead + cancelled,
+        done,
+        dead,
+        cancelled,
         outbox,
     })
 }

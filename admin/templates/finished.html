@@ -3,7 +3,7 @@
 {% block page %}p-{{ title|lower }}{% endblock %}
 {% block content %}
 <section class="panel">
-<h2>{{ title }}{% if !task_name.is_empty() %} <small>task <code>{{ task_name }}</code></small>{% endif %}{% if !error.is_empty() %} <small>error <code>{{ error }}</code></small>{% endif %}</h2>
+<h2>{{ title }}{% if !task_name.is_empty() %} <small>task <code>{{ task_name }}</code></small>{% endif %}{% if no_error %} <small>no error</small>{% endif %}{% if let Some(e) = error %} <small>error <code>{{ e }}</code></small>{% endif %}</h2>
 {% if rows.is_empty() %}
 <div class="body"><p>None.</p></div>
 {% else %}

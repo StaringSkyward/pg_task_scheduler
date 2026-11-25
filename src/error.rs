@@ -1,5 +1,6 @@
 //! Crate error types.
 
+use crate::ids::EffectName;
 use crate::ids::IdentifierError;
 #[cfg(feature = "cron")]
 use crate::ids::JobId;
@@ -8,6 +9,7 @@ use crate::ids::TaskKey;
 use crate::ids::TaskName;
 #[cfg(feature = "cron")]
 use crate::models::MaxAttemptsError;
+use crate::pool::PoolError;
 
 /// The error type of every fallible scheduler, store and enqueue operation.
 #[derive(Debug, thiserror::Error)]
@@ -17,16 +19,19 @@ pub enum SchedulerError {
     Database(#[from] diesel::result::Error),
     /// The connection pool could not hand out a connection.
     #[error("connection pool error: {0}")]
-    Pool(String),
+    Pool(#[source] PoolError),
     /// A cron expression did not parse.
     #[cfg(feature = "cron")]
     #[error("cron parse error: {0}")]
     Cron(String),
-    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting.
+    /// [`SchedulerBuilder::build`](crate::SchedulerBuilder::build) rejected a setting, or (with
+    /// `cron`) `store::materialize_due_jobs` was called inside a transaction that is not READ
+    /// COMMITTED.
     #[error("configuration error: {0}")]
     Config(String),
-    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName)
-    /// or [`WorkerId`](crate::WorkerId).
+    /// A string was not a valid [`TaskName`], [`TaskKey`], [`QueueName`](crate::QueueName),
+    /// [`WorkerId`](crate::WorkerId), [`EffectName`], [`Topic`](crate::Topic),
+    /// [`CommandKey`](crate::CommandKey) or (with `cron`) `ScheduleName`.
     #[error("invalid identifier: {0}")]
     Identifier(#[from] IdentifierError),
     /// A handler registration was rejected.
@@ -38,9 +43,31 @@ pub enum SchedulerError {
     /// A structural guarantee was violated (should be impossible); surfaced loudly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
-    /// The same `task_key` was enqueued with a different task name or payload.
+    /// Concurrent changes invalidated a bounded retry loop on every pass; retry the call.
+    #[error("concurrent changes kept invalidating the operation: {0}")]
+    Contention(&'static str),
+    /// A page cursor cannot advance (its position would overflow).
+    #[error("invalid cursor: {0}")]
+    InvalidCursor(&'static str),
+    /// A typed producer's arguments decode back as a different value than the caller's: JSON
+    /// cannot represent them (a non-finite `f64` is written as `null`), or PostgreSQL's JSONB
+    /// normalizes a number (`1e18` reads back as an integer). Nothing is written.
+    #[error("task arguments change meaning when stored as JSON")]
+    PayloadNotPreserved,
+    /// The same `task_key` was enqueued with a different task name or different arguments.
     #[error("idempotency conflict for task key {}", .0.as_str())]
     IdempotencyConflict(TaskKey),
+    /// The task key starts with the prefix reserved for schedule occurrences.
+    #[error("task key {} starts with the reserved prefix \"schedule:\"", .0.as_str())]
+    ReservedTaskKey(TaskKey),
+    /// The task already recorded this effect with a different command key, topic or payload.
+    #[error("outbox conflict: effect {} of task key {} already exists with different content", .effect_name.as_str(), .task_key.as_str())]
+    OutboxConflict {
+        /// The task's key.
+        task_key: TaskKey,
+        /// The effect whose stored content differs.
+        effect_name: EffectName,
+    },
     /// A worker-owned mutation matched no row: the lease was lost or expired.
     #[error("lost ownership of task {0:?}")]
     LostOwnership(TaskId),
@@ -90,14 +117,22 @@ pub enum RegisterError {
 
 /// The error a task handler returns. It says what happens to the task next:
 /// [`retry`](Self::retry), [`permanent`](Self::permanent) or
-/// [`interrupted`](Self::interrupted). Any `std::error::Error` converts into a
-/// permanent failure, so `?` marks the task `dead`.
+/// [`interrupted`](Self::interrupted). These are the only ways to make one: there is no
+/// `From` conversion, so `?` needs an explicit `.map_err(TaskError::retry)` or
+/// `.map_err(TaskError::permanent)`.
 ///
-/// Opaque handler error. Deliberately does NOT implement `std::error::Error`
-/// (same trick as `anyhow::Error`) so the blanket `From<E: Error>` below is
-/// coherent — if `TaskError` were itself an `Error`, that blanket would collide
-/// with the std reflexive `From<TaskError> for TaskError`. Its `Display` is what
-/// gets stored in `queue_tasks.last_error`.
+/// ```compile_fail
+/// use pg_task_scheduler::TaskError;
+/// async fn h() -> Result<(), TaskError> {
+///     serde_json::from_str::<i32>("x")?;
+///     Ok(())
+/// }
+/// ```
+///
+/// Its `Display` is the cause's and is what gets stored in `queue_tasks.last_error`;
+/// [`source`](std::error::Error::source) is the cause's own source, as `#[error(transparent)]`
+/// does, so an error chain does not repeat the message. [`cause`](Self::cause) returns the cause
+/// itself, to downcast.
 pub struct TaskError {
     source: Box<dyn std::error::Error + Send + Sync>,
     kind: Kind,
@@ -111,20 +146,20 @@ enum Kind {
 }
 
 impl TaskError {
-    /// Marks the task `dead` now, whatever attempts remain. `message` is stored in
-    /// `last_error`.
-    pub fn permanent(message: impl Into<String>) -> Self {
+    /// Marks the task `dead` now, whatever attempts remain. The cause (a `String`, a `&str` or
+    /// any error) is displayed in `last_error`.
+    pub fn permanent(cause: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
-            source: message.into().into(),
+            source: cause.into(),
             kind: Kind::Permanent,
         }
     }
 
     /// Requeues the task with exponential backoff and jitter, or marks it `dead` once
-    /// `max_attempts` is used up. `message` is stored in `last_error`.
-    pub fn retry(message: impl Into<String>) -> Self {
+    /// `max_attempts` is used up. The cause is displayed in `last_error`.
+    pub fn retry(cause: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
-            source: message.into().into(),
+            source: cause.into(),
             kind: Kind::Retry,
         }
     }
@@ -136,6 +171,11 @@ impl TaskError {
             source: "interrupted by worker shutdown".into(),
             kind: Kind::Interrupted,
         }
+    }
+
+    /// The cause this error was made from, for downcasting.
+    pub fn cause(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        &*self.source
     }
 
     /// Whether the task will be tried again: true for [`retry`](Self::retry) and
@@ -165,12 +205,9 @@ impl std::fmt::Display for TaskError {
     }
 }
 
-impl<E: std::error::Error + Send + Sync + 'static> From<E> for TaskError {
-    fn from(e: E) -> Self {
-        TaskError {
-            source: Box::new(e),
-            kind: Kind::Permanent,
-        }
+impl std::error::Error for TaskError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
     }
 }
 
@@ -179,11 +216,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_error_from_std_error() {
-        let serde_err = serde_json::from_str::<i32>("x").unwrap_err();
-        let task_err = TaskError::from(serde_err);
-        // Should produce a non-empty display string from the inner error.
-        assert!(!task_err.to_string().is_empty());
+    fn task_error_keeps_a_typed_cause() {
+        let e = TaskError::retry(std::io::Error::other("disk"));
+        assert!(e.is_retryable());
+        assert_eq!(e.to_string(), "disk");
+        assert!(std::error::Error::source(&e).is_none());
+        assert!(e.cause().downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(TaskError::permanent("x").to_string(), "x");
+    }
+
+    #[test]
+    fn pool_error_keeps_its_source() {
+        let e = SchedulerError::Pool(Box::new(std::io::Error::other("x")));
+        let source = std::error::Error::source(&e).unwrap();
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(e.to_string(), "connection pool error: x");
     }
 
     #[test]

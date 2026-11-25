@@ -1,5 +1,7 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
+use std::time::Duration;
+
 use axum::Extension;
 use axum::Router;
 use axum::body::Body;
@@ -94,7 +96,8 @@ async fn status_of(db: &TestDb, id: i64) -> String {
         .await
         .unwrap()
         .unwrap()
-        .status
+        .state
+        .status()
         .as_str()
         .to_owned()
 }
@@ -150,8 +153,9 @@ async fn cancel_and_replay_via_forms() {
 
     let n = db
         .scalar(&format!(
-            "SELECT count(*) AS n FROM queue_admin_actions WHERE task_id = {id} \
-             AND operator = 'ops' AND action IN ('cancel', 'replay')"
+            "SELECT count(*) AS n FROM queue_admin_actions a \
+             JOIN queue_admin_action_tasks m ON m.action_id = a.id \
+             WHERE m.task_id = {id} AND operator = 'ops' AND a.action IN ('cancel', 'replay')"
         ))
         .await;
     assert_eq!(n, 2);
@@ -274,7 +278,7 @@ async fn bulk_requires_typed_name() {
 }
 
 #[tokio::test]
-async fn bulk_cancel_runs_and_offers_continue() {
+async fn bulk_cancel_runs_and_offers_rerun() {
     let db = TestDb::new().await;
     for i in 0..3 {
         queued(&db, "a", "default", &format!("k{i}")).await;
@@ -297,7 +301,6 @@ async fn bulk_cancel_runs_and_offers_continue() {
             ("action", "cancel"),
             ("task_name", "a"),
             ("queue", ""),
-            ("error", ""),
             ("confirm_name", "a"),
             ("reason", "cleanup"),
         ],
@@ -309,7 +312,25 @@ async fn bulk_cancel_runs_and_offers_continue() {
         "{}",
         r.body
     );
-    assert!(!r.body.contains("class=\"continue\""));
+    // A short batch offers a re-run of the same filter.
+    assert!(r.body.contains("class=\"continue\""), "{}", r.body);
+    assert!(r.body.contains("Run again"), "{}", r.body);
+    assert!(
+        r.body
+            .contains("Finished, or some rows were locked by other work and skipped"),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"task_name\" value=\"a\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"reason\" value=\"cleanup\""),
+        "{}",
+        r.body
+    );
     let n = db
         .scalar(
             "SELECT count(*) AS n FROM queue_tasks WHERE status = 'cancelled' AND task_name = 'a'",
@@ -317,15 +338,19 @@ async fn bulk_cancel_runs_and_offers_continue() {
         .await;
     assert_eq!(n, 3);
     let n = db
-        .scalar("SELECT count(*) AS n FROM queue_admin_actions WHERE operator = 'ops' AND reason = 'cleanup' AND affected = 3")
+        .scalar(
+            "SELECT count(*) AS n FROM queue_admin_actions a \
+             JOIN queue_admin_action_tasks m ON m.action_id = a.id \
+             WHERE operator = 'ops' AND reason = 'cleanup'",
+        )
         .await;
-    assert_eq!(n, 1);
+    assert_eq!(n, 3);
 
     // Replay-all from the failure-group link's confirm page.
     sql(&db, "UPDATE queue_tasks SET status = 'dead', last_error = 'boom <b>', completed_at = now(), attempts = max_attempts WHERE task_name = 'other'").await;
     let c = get(
         app(&db),
-        "/bulk?action=replay&task_name=other&error=boom+%3Cb%3E",
+        "/bulk?action=replay&task_name=other&error_filter=exact&error=boom+%3Cb%3E",
     )
     .await;
     assert!(
@@ -339,6 +364,110 @@ async fn bulk_cancel_runs_and_offers_continue() {
         "{}",
         c.body
     );
+    assert!(
+        c.body.contains("name=\"error_filter\" value=\"exact\""),
+        "{}",
+        c.body
+    );
+    // The re-run form carries the queue and error filters too.
+    let r = post(
+        app(&db),
+        "/bulk",
+        &[
+            ("action", "replay"),
+            ("task_name", "other"),
+            ("queue", "default"),
+            ("error_filter", "exact"),
+            ("error", "boom <b>"),
+            ("confirm_name", "other"),
+            ("reason", "again"),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(
+        r.body.contains("name=\"queue\" value=\"default\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"error\" value=\"boom &lt;b&gt;\"")
+            || r.body.contains("name=\"error\" value=\"boom &#60;b&#62;\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"error_filter\" value=\"exact\""),
+        "{}",
+        r.body
+    );
+    assert_eq!(
+        db.scalar(
+            "SELECT count(*) AS n FROM queue_tasks WHERE task_name = 'other' AND status = 'queued'"
+        )
+        .await,
+        1
+    );
+    db.cleanup().await;
+}
+
+/// Continue posts only the action id: the batches belong to that action, its filter, operator
+/// and reason, and the audit keeps one row.
+#[tokio::test]
+async fn continue_resumes_the_same_action() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name) \
+         SELECT 'k' || g, 'a' FROM generate_series(1, 600) g",
+    )
+    .await;
+    let mut conn = db.pool.get().await.unwrap();
+    let filter = store::BulkFilter {
+        task_name: pg_task_scheduler::TaskName::try_from("a").unwrap(),
+        queue: None,
+    };
+    let first = store::cancel_matching(&mut conn, &filter, "first", "cleanup", Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.affected, first.stopped),
+        (500, store::BulkStop::BudgetSpent)
+    );
+    let id = first.action_id.to_string();
+    let r = post(app(&db), "/bulk", &[("action_id", id.as_str())]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(
+        r.body.contains("<p id=\"bulk-result\">100 cancelled</p>"),
+        "{}",
+        r.body
+    );
+    // That call came back short: Run again starts a new action with the same filters.
+    assert!(r.body.contains("Run again"), "{}", r.body);
+    assert!(
+        r.body.contains("name=\"task_name\" value=\"a\""),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains("name=\"reason\" value=\"cleanup\""),
+        "{}",
+        r.body
+    );
+    assert_eq!(
+        db.scalar("SELECT count(*) AS n FROM queue_admin_actions WHERE operator = 'first'")
+            .await,
+        1
+    );
+    assert_eq!(
+        db.scalar(&format!(
+            "SELECT count(*) AS n FROM queue_admin_action_tasks WHERE action_id = {id}"
+        ))
+        .await,
+        600
+    );
+    let r = post(app(&db), "/bulk", &[("action_id", "999999")]).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
     db.cleanup().await;
 }
 
@@ -422,11 +551,11 @@ async fn overview_offers_resume_and_replay_all() {
         page.body
     );
     assert!(
-        page.body
-            .contains("href=\"/bulk?action=replay&amp;task_name=send&amp;error=boom\"")
-            || page
-                .body
-                .contains("href=\"/bulk?action=replay&#38;task_name=send&#38;error=boom\""),
+        page.body.contains(
+            "href=\"/bulk?action=replay&amp;task_name=send&amp;error_filter=exact&amp;error=boom\""
+        ) || page.body.contains(
+            "href=\"/bulk?action=replay&#38;task_name=send&#38;error_filter=exact&#38;error=boom\""
+        ),
         "{}",
         page.body
     );

@@ -48,6 +48,22 @@ impl std::fmt::Debug for BasicUser {
 /// Why [`with_basic_auth`] rejected its users.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthConfigError {
+    /// No users: nobody could log in.
+    #[error("no users: nobody could log in")]
+    NoUsers,
+    /// Two users share a name; the later would silently replace the earlier.
+    #[error("duplicate user name {user:?}")]
+    DuplicateUser {
+        /// The repeated name.
+        user: String,
+    },
+    /// A user name is blank, so its audit rows could name no operator, or contains `:`, which a
+    /// Basic credential cannot carry (it splits at the first one).
+    #[error("user name {user:?} is blank or contains ':'")]
+    InvalidUser {
+        /// The offending name.
+        user: String,
+    },
     /// A user's `password_hash` is not an argon2id PHC string.
     #[error("user {user:?}: password_hash is not an argon2id PHC string")]
     InvalidHash {
@@ -74,13 +90,23 @@ struct Users {
 }
 
 /// Require HTTP basic auth against `users`; the user name becomes the [`Operator`].
-/// Fails if any hash is not an argon2id PHC string.
+/// Fails on an empty list, a blank name or one with `:`, a repeated name, or a hash that is not
+/// an argon2id PHC string.
 pub fn with_basic_auth(router: Router, users: Vec<BasicUser>) -> Result<Router, AuthConfigError> {
+    if users.is_empty() {
+        return Err(AuthConfigError::NoUsers);
+    }
     let mut hashes = HashMap::new();
     for u in users {
+        if u.name.trim().is_empty() || u.name.contains(':') {
+            return Err(AuthConfigError::InvalidUser { user: u.name });
+        }
         match PasswordHash::new(&u.password_hash) {
             Ok(h) if h.algorithm == ARGON2ID_IDENT => {}
             _ => return Err(AuthConfigError::InvalidHash { user: u.name }),
+        }
+        if hashes.contains_key(&u.name) {
+            return Err(AuthConfigError::DuplicateUser { user: u.name });
         }
         hashes.insert(u.name, u.password_hash);
     }
@@ -197,6 +223,39 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn user(name: &str) -> BasicUser {
+        BasicUser {
+            name: name.into(),
+            password_hash: hash_password("x"),
+        }
+    }
+
+    #[test]
+    fn with_basic_auth_rejects_no_users() {
+        let r = with_basic_auth(Router::new(), vec![]);
+        assert!(matches!(r, Err(AuthConfigError::NoUsers)));
+    }
+
+    #[test]
+    fn with_basic_auth_rejects_a_duplicate_name() {
+        let r = with_basic_auth(Router::new(), vec![user("a"), user("a")]);
+        assert!(matches!(r, Err(AuthConfigError::DuplicateUser { ref user }) if user == "a"));
+    }
+
+    #[test]
+    fn with_basic_auth_rejects_a_colon_in_a_name() {
+        let r = with_basic_auth(Router::new(), vec![user("a:b")]);
+        assert!(matches!(r, Err(AuthConfigError::InvalidUser { ref user }) if user == "a:b"));
+    }
+
+    #[test]
+    fn with_basic_auth_rejects_a_blank_name() {
+        for name in ["", "  "] {
+            let r = with_basic_auth(Router::new(), vec![user(name)]);
+            assert!(matches!(r, Err(AuthConfigError::InvalidUser { ref user }) if user == name));
+        }
+    }
 
     /// At most `N` verifies run at once, even when callers give up mid-verify.
     #[tokio::test(flavor = "multi_thread")]

@@ -125,7 +125,8 @@ from retries and double-clicks. Change Order to try another key.
 **Exactly-once database work.** Press "Place 5 orders". The order row, the
 outbox message and the task's completion share one transaction. The first
 attempt of each order crashes right after writing its row, which rolls the row
-back, and the task retries. In the admin UI each order shows 2 attempts. In
+back, and the task retries. ("Simulated crash" is only the demo's label: the
+probe returns a transaction error after the insert.) In the admin UI each order shows 2 attempts. In
 the "In the database" panel (press "reload"), the summary reads
 `demo_orders: 5 rows from 5 completed place-order tasks (10 attempts)`: one row
 per order. The table has no unique key on the task key, so only the transaction
@@ -134,10 +135,13 @@ use up identity values. That is visible proof of the rollback.
 
 **Transactional outbox.** Completing an order also writes an `order-placed`
 message to `queue_outbox` in the same transaction, so a message exists only if
-the order does. A relay in the `web` container delivers each one a few seconds
+the order does. A relay in the `web` container (it handles only the `orders`
+topic) delivers each one a few seconds
 later (it logs it) and marks it published. After placing orders, reload the
 page: messages show *pending* for 3 to 5 seconds and then *published*. The
-crashed first attempts left no messages. You can also look at the tables:
+crashed first attempts left no messages. A message that does not decode is
+recorded in `outbox_rejected` and shown as *rejected*. You can also look at the
+tables:
 
 ```sh
 docker compose exec db psql -U postgres demo -c \

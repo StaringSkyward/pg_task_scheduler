@@ -41,7 +41,9 @@ async fn serve(cfg: config::StandaloneConfig) -> Result<(), Box<dyn std::error::
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&cfg.database_url);
-    let pool = Pool::builder(manager).max_size(cfg.pool_size).build()?;
+    let pool = Pool::builder(manager)
+        .max_size(cfg.pool_size.get())
+        .build()?;
     let app = router(pool, cfg.admin_config());
     let app = match cfg.auth {
         Auth::Basic(users) => {
@@ -50,7 +52,7 @@ async fn serve(cfg: config::StandaloneConfig) -> Result<(), Box<dyn std::error::
             }
             with_basic_auth(app, users)?
         }
-        Auth::TrustedHeader(h) => with_trusted_header(app, h.parse()?),
+        Auth::TrustedHeader(h) => with_trusted_header(app, h),
     };
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!("listening on {}", cfg.bind);

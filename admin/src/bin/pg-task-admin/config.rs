@@ -1,8 +1,11 @@
 //! TOML config for the standalone server: parsing, validation, mapping to `AdminConfig`.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use axum::http::HeaderName;
 use pg_task_scheduler::store::OverviewParams;
 use pg_task_scheduler_admin::AdminConfig;
 use pg_task_scheduler_admin::QueueThresholds;
@@ -21,6 +24,14 @@ pub enum ConfigError {
     NoUsers,
     #[error("duplicate user name {0:?} in [[auth.users]]")]
     DuplicateUser(String),
+    #[error("user name {0:?} in [[auth.users]] is blank or contains ':'")]
+    InvalidUser(String),
+    #[error(
+        "invalid config: base_path {0:?} must be empty, or start with '/' and not end with '/'"
+    )]
+    BasePath(String),
+    #[error("invalid config: auth.header {0:?} is not a valid header name")]
+    Header(String),
 }
 
 #[derive(Deserialize)]
@@ -28,31 +39,34 @@ pub enum ConfigError {
 struct Raw {
     database_url: Option<String>,
     bind: SocketAddr,
-    pool_size: usize,
+    pool_size: NonZeroUsize,
     base_path: String,
     public_origin: Option<String>,
     refresh_seconds: u64,
     overview_cache_seconds: u64,
     statement_timeout_seconds: u64,
-    count_cap: i64,
+    count_cap: NonZeroU32,
     window_seconds: u64,
     thresholds: RawThresholds,
     #[serde(default = "missing_auth")]
     auth: RawAuth,
 }
 
+const DEFAULT_COUNT_CAP: NonZeroU32 = NonZeroU32::new(10_000).unwrap();
+const DEFAULT_POOL_SIZE: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 impl Default for Raw {
     fn default() -> Self {
         Self {
             database_url: None,
             bind: ([127, 0, 0, 1], 8080).into(),
-            pool_size: 4,
+            pool_size: DEFAULT_POOL_SIZE,
             base_path: String::new(),
             public_origin: None,
             refresh_seconds: 10,
             overview_cache_seconds: 5,
             statement_timeout_seconds: 5,
-            count_cap: 10_000,
+            count_cap: DEFAULT_COUNT_CAP,
             window_seconds: 3600,
             thresholds: RawThresholds::default(),
             auth: missing_auth(),
@@ -64,7 +78,7 @@ impl Default for Raw {
 fn missing_auth() -> RawAuth {
     RawAuth {
         mode: None,
-        header: default_header(),
+        header: None,
         users: vec![],
     }
 }
@@ -95,8 +109,7 @@ enum Mode {
 #[serde(deny_unknown_fields)]
 struct RawAuth {
     mode: Option<Mode>,
-    #[serde(default = "default_header")]
-    header: String,
+    header: Option<String>,
     #[serde(default)]
     users: Vec<RawUser>,
 }
@@ -114,20 +127,20 @@ struct RawUser {
 
 pub enum Auth {
     Basic(Vec<BasicUser>),
-    TrustedHeader(String),
+    TrustedHeader(HeaderName),
 }
 
 // No Debug: holds the database URL and password hashes.
 pub struct StandaloneConfig {
     pub database_url: String,
     pub bind: SocketAddr,
-    pub pool_size: usize,
+    pub pool_size: NonZeroUsize,
     pub base_path: String,
     pub public_origin: Option<String>,
     pub refresh_seconds: u64,
     pub overview_cache_seconds: u64,
     pub statement_timeout_seconds: u64,
-    pub count_cap: i64,
+    pub count_cap: NonZeroU32,
     pub window_seconds: u64,
     pub backlog_after_seconds: u64,
     pub stall_after_seconds: u64,
@@ -147,19 +160,42 @@ pub fn parse_with_env(text: &str, env: Option<String>) -> Result<StandaloneConfi
         message: e.message().to_string(),
     })?;
     let database_url = raw.database_url.or(env).ok_or(ConfigError::NoDatabaseUrl)?;
+    if !(raw.base_path.is_empty()
+        || raw.base_path.starts_with('/') && !raw.base_path.ends_with('/'))
+    {
+        return Err(ConfigError::BasePath(raw.base_path));
+    }
     let a = raw.auth;
     let mode = a.mode.ok_or(ConfigError::Toml {
         line: 0,
         message: "missing field `auth.mode`".into(),
     })?;
     let auth = match mode {
-        Mode::TrustedHeader => Auth::TrustedHeader(a.header),
+        Mode::TrustedHeader => {
+            if !a.users.is_empty() {
+                return Err(ConfigError::Toml {
+                    line: 0,
+                    message: "`auth.users` is only for `auth.mode = \"basic\"`".into(),
+                });
+            }
+            let h = a.header.unwrap_or_else(default_header);
+            Auth::TrustedHeader(h.parse().map_err(|_| ConfigError::Header(h))?)
+        }
         Mode::Basic => {
+            if a.header.is_some() {
+                return Err(ConfigError::Toml {
+                    line: 0,
+                    message: "`auth.header` is only for `auth.mode = \"trusted_header\"`".into(),
+                });
+            }
             if a.users.is_empty() {
                 return Err(ConfigError::NoUsers);
             }
             let mut seen = std::collections::HashSet::new();
             for u in &a.users {
+                if u.name.trim().is_empty() || u.name.contains(':') {
+                    return Err(ConfigError::InvalidUser(u.name.clone()));
+                }
                 if !seen.insert(&u.name) {
                     return Err(ConfigError::DuplicateUser(u.name.clone()));
                 }
@@ -275,7 +311,7 @@ password_hash = "$argon2id$x"
         let c = parse_with_env(FULL, None).ok().unwrap();
         assert_eq!(c.database_url, "postgres://u:p@h/db");
         assert_eq!(c.bind.port(), 9000);
-        assert_eq!(c.pool_size, 7);
+        assert_eq!(c.pool_size.get(), 7);
         let a = c.admin_config();
         assert_eq!(a.base_path, "/admin");
         assert_eq!(
@@ -285,7 +321,7 @@ password_hash = "$argon2id$x"
         assert_eq!(a.refresh_seconds, 20);
         assert_eq!(a.overview_cache, Duration::from_secs(6));
         assert_eq!(a.statement_timeout, Duration::from_secs(3));
-        assert_eq!(a.overview.count_cap, 500);
+        assert_eq!(a.overview.count_cap.get(), 500);
         assert_eq!(a.overview.window, Duration::from_secs(600));
         assert_eq!(a.thresholds.default.backlog_after, Duration::from_secs(120));
         assert_eq!(a.thresholds.default.stall_after, Duration::from_secs(240));
@@ -301,8 +337,8 @@ password_hash = "$argon2id$x"
             .ok()
             .unwrap();
         assert_eq!(c.bind, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(c.pool_size, 4);
-        assert!(matches!(c.auth, Auth::TrustedHeader(ref h) if h == "X-Forwarded-User"));
+        assert_eq!(c.pool_size.get(), 4);
+        assert!(matches!(c.auth, Auth::TrustedHeader(ref h) if h.as_str() == "x-forwarded-user"));
     }
 
     #[test]
@@ -322,6 +358,12 @@ password_hash = "$argon2id$x"
     }
 
     #[test]
+    fn rejects_zero_count_cap() {
+        let t = auth("count_cap = 0\n[auth]\nmode = \"trusted_header\"\n");
+        assert!(parse_with_env(&t, None).is_err());
+    }
+
+    #[test]
     fn rejects_unknown_key() {
         let t = auth("bogus = 1\n[auth]\nmode = \"trusted_header\"\n");
         assert!(parse_with_env(&t, None).is_err());
@@ -337,6 +379,37 @@ password_hash = "$argon2id$x"
     }
 
     #[test]
+    fn rejects_users_in_trusted_header_mode() {
+        let u = "[[auth.users]]\nname = \"a\"\npassword_hash = \"x\"\n";
+        let t = auth(&format!("[auth]\nmode = \"trusted_header\"\n{u}"));
+        assert!(matches!(
+            parse_with_env(&t, None),
+            Err(ConfigError::Toml { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_header_in_basic_mode() {
+        let u = "[[auth.users]]\nname = \"a\"\npassword_hash = \"x\"\n";
+        let t = auth(&format!(
+            "[auth]\nmode = \"basic\"\nheader = \"X-User\"\n{u}"
+        ));
+        assert!(matches!(
+            parse_with_env(&t, None),
+            Err(ConfigError::Toml { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_pool_size() {
+        let t = auth("pool_size = 0\n[auth]\nmode = \"trusted_header\"\n");
+        assert!(matches!(
+            parse_with_env(&t, None),
+            Err(ConfigError::Toml { .. })
+        ));
+    }
+
+    #[test]
     fn database_url_falls_back_to_env() {
         let t = "[auth]\nmode = \"trusted_header\"\n";
         let c = parse_with_env(t, Some("postgres://env".into()))
@@ -347,5 +420,62 @@ password_hash = "$argon2id$x"
             parse_with_env(t, None),
             Err(ConfigError::NoDatabaseUrl)
         ));
+    }
+
+    fn base(path: &str) -> Result<StandaloneConfig, ConfigError> {
+        parse_with_env(
+            &auth(&format!(
+                "base_path = \"{path}\"\n[auth]\nmode = \"trusted_header\"\n"
+            )),
+            None,
+        )
+    }
+
+    #[test]
+    fn rejects_a_relative_base_path() {
+        assert!(matches!(base("admin"), Err(ConfigError::BasePath(_))));
+    }
+
+    #[test]
+    fn rejects_a_trailing_slash_base_path() {
+        assert!(matches!(base("/admin/"), Err(ConfigError::BasePath(_))));
+        assert!(matches!(base("/"), Err(ConfigError::BasePath(_))));
+    }
+
+    #[test]
+    fn accepts_empty_and_absolute_base_paths() {
+        assert!(base("").is_ok());
+        assert!(base("/admin").is_ok());
+    }
+
+    #[test]
+    fn rejects_an_invalid_header_name() {
+        let t = auth("[auth]\nmode = \"trusted_header\"\nheader = \"bad header\"\n");
+        assert!(matches!(
+            parse_with_env(&t, None),
+            Err(ConfigError::Header(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_colon_in_a_user_name() {
+        let u = "[[auth.users]]\nname = \"a:b\"\npassword_hash = \"x\"\n";
+        let t = auth(&format!("[auth]\nmode = \"basic\"\n{u}"));
+        assert!(matches!(
+            parse_with_env(&t, None),
+            Err(ConfigError::InvalidUser(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_blank_user_name() {
+        for name in ["", "  "] {
+            let u = format!("[[auth.users]]\nname = \"{name}\"\npassword_hash = \"x\"\n");
+            let t = auth(&format!("[auth]\nmode = \"basic\"\n{u}"));
+            assert!(matches!(
+                parse_with_env(&t, None),
+                Err(ConfigError::InvalidUser(_))
+            ));
+        }
     }
 }

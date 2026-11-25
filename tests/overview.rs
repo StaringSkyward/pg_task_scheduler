@@ -1,5 +1,6 @@
 mod common;
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::TestDb;
@@ -53,8 +54,8 @@ async fn overview_counts_per_queue() {
            ('d3', 'a', 'default', now()), \
            ('f1', 'a', 'default', now() + interval '1 hour'), \
            ('b1', 'a', 'bulk', now()); \
-         INSERT INTO queue_tasks (task_key, task_name, queue, status, locked_by, locked_until) \
-           VALUES ('r1', 'a', 'default', 'running', 'w', now() + interval '1 minute'); \
+         INSERT INTO queue_tasks (task_key, task_name, queue, status, attempts, locked_by, locked_until) \
+           VALUES ('r1', 'a', 'default', 'running', 1, 'w', now() + interval '1 minute'); \
          INSERT INTO queue_tasks (task_key, task_name, queue, status, completed_at) VALUES \
            ('x1', 'a', 'default', 'done', now()), ('x2', 'a', 'default', 'done', now()), \
            ('y1', 'a', 'default', 'dead', now())",
@@ -94,7 +95,7 @@ async fn overview_caps_counts() {
     )
     .await;
     let p = OverviewParams {
-        count_cap: 5,
+        count_cap: NonZeroU32::new(5).unwrap(),
         ..Default::default()
     };
     let o = overview(&db, &p).await;
@@ -124,10 +125,46 @@ async fn overview_groups_failures() {
     assert_eq!(o.failure_groups.len(), 1);
     let g = &o.failure_groups[0];
     assert_eq!(
-        (g.task_name.as_str(), g.error.as_str()),
-        ("send", "smtp refused")
+        (g.task_name.as_str(), g.error.as_deref()),
+        ("send", Some("smtp refused"))
     );
     assert_eq!((g.dead, g.failed_attempts), (c(1, false), c(2, false)));
+    db.cleanup().await;
+}
+
+/// A NULL error and an empty one are different groups, for dead tasks and failed attempts.
+#[tokio::test]
+async fn null_and_empty_errors_are_separate_groups() {
+    let db = TestDb::new().await;
+    sql(
+        &db,
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at, last_error) \
+           VALUES ('empty', 'send', 'dead', now(), ''), ('null', 'send', 'dead', now(), NULL); \
+         INSERT INTO queue_task_attempts \
+           (task_id, attempt_no, lock_token, worker_id, finished_at, outcome, error) \
+           SELECT id, 1, 1, 'w', now(), 'retry', last_error FROM queue_tasks",
+    )
+    .await;
+    let o = overview(&db, &OverviewParams::default()).await;
+    let groups: Vec<_> = o
+        .failure_groups
+        .iter()
+        .map(|g| {
+            (
+                g.task_name.as_str(),
+                g.error.as_deref(),
+                g.dead,
+                g.failed_attempts,
+            )
+        })
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            ("send", None, c(1, false), c(1, false)),
+            ("send", Some(""), c(1, false), c(1, false)),
+        ]
+    );
     db.cleanup().await;
 }
 
@@ -151,7 +188,7 @@ async fn overview_caps_failed_attempts() {
     )
     .await;
     let p = OverviewParams {
-        count_cap: 5,
+        count_cap: NonZeroU32::new(5).unwrap(),
         ..Default::default()
     };
     let o = overview(&db, &p).await;
@@ -182,7 +219,10 @@ fn registration(queue: &str, names: &[&str]) -> WorkerRegistration {
             in_use: 0,
             finished_ago: None,
         }],
-        task_names: names.iter().map(|s| (*s).to_owned()).collect(),
+        task_names: names
+            .iter()
+            .map(|s| pg_task_scheduler::TaskName::try_from(*s).unwrap())
+            .collect(),
         lost_after: Duration::from_secs(60),
     }
 }
@@ -224,7 +264,9 @@ async fn overview_lists_paused_and_registered_queues_without_tasks() {
     drop(conn);
     sql(
         &db,
-        "INSERT INTO queue_pauses (queue, operator, reason) VALUES ('held', 'op', 'why')",
+        "WITH a AS (INSERT INTO queue_admin_actions (action, queue, operator, reason) \
+         VALUES ('pause', 'held', 'op', 'why') RETURNING id) \
+         INSERT INTO queue_pauses (queue, action_id) SELECT 'held', id FROM a",
     )
     .await;
     let o = overview(&db, &OverviewParams::default()).await;

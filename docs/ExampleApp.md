@@ -16,6 +16,10 @@ repository), the entry says so. Each entry has a source:
   implementation ledger (`.superpowers/sdd/2026-11-12-example-app/progress.md`).
 - **Ledger note**: behaviour the ledger flagged for documentation.
 
+Reviews 01 and 02 changed some of these entries after they shipped. A changed
+entry says **Changed by review 01** or **Changed by review 02** and links to the
+entry in [Review decisions](ReviewDecisions.md) that says what changed and why.
+
 **Contents**
 
 1. [Purpose and shape](#1-purpose-and-shape)
@@ -240,12 +244,21 @@ repository), the entry says so. Each entry has a source:
 ### 3.5 The digest uses cron, created idempotently
 
 - **Source:** spec "Tasks" (call).
-- **Decision:** The `web` role calls `jobs::ensure_job` for `digest` with
-  `*/5 * * * *` at startup.
-- **Why:** It shows the `cron` feature. `ensure_job` never duplicates the job on
-  a restart and never un-pauses a job an operator paused.
+- **Decision:** At startup the `web` role builds the schedule with
+  `CreateJob::for_task::<Digest>`, named `digest`, with `*/5 * * * *`, and
+  passes it to `jobs::ensure_job`.
+- **Why:** It shows the `cron` feature. `for_task` takes the task name, queue
+  and argument type from `Digest`, so the schedule cannot name the wrong
+  handler. `ensure_job` never duplicates the job on a restart and never
+  un-pauses a job an operator paused: a pause is a `scheduler_job_pauses` row,
+  which it does not touch.
 - **Expected behaviour:** A `digest` task reaches `done` within 5 minutes of
   startup, then every 5 minutes.
+- **Changed by review 01:** the schedule was built with `CreateJob::new`, and
+  its name doubled as the task name
+  ([Review decisions, entry 7](ReviewDecisions.md#7-a-schedule-has-its-own-name-and-a-typed-constructor));
+  the pause was an `is_paused` column
+  ([Review decisions, entry 5](ReviewDecisions.md#5-the-schema-puts-optional-and-multi-valued-facts-in-their-own-relations)).
 
 ### 3.6 Workers log their start and clean stop
 
@@ -351,7 +364,19 @@ repository), the entry says so. Each entry has a source:
   tasks with 10 attempts. A replayed order crashes once again, because a replay
   resets `attempt_no`. When the handler has already completed the task, the
   runtime's own completion finds it done and logs at debug, which is the
-  documented path.
+  documented path. The handler ignores the `OutboxWrite` that
+  `complete_with_outbox` returns: `Inserted` and `AlreadyPresent` both mean
+  the command is recorded. An `OutboxConflict` (the same effect with different
+  content) would roll the transaction back, and the handler fails the task
+  permanently, because every retry would conflict the same way. Identifier and
+  JSON errors are permanent for the same reason; database and other scheduler
+  errors are retried.
+- **Changed by review 01:** `complete_with_outbox` returned a `bool`, and the
+  outbox fields became the typed `EffectName`, `CommandKey` and `Topic`
+  ([Review decisions, entry 6](ReviewDecisions.md#6-a-conflicting-outbox-effect-is-an-error)).
+- **Changed by review 02:** an `OutboxConflict` was retried, like any other
+  error
+  ([Review decisions, entry 32](ReviewDecisions.md#32-ci-checks-the-minimum-rust-and-postgresql-18)).
 - **Ledger note (implementation fact):** `demo_orders` ids have gaps, because
   the rolled-back first-attempt inserts use up identity values. That is visible
   proof of the rollback.
@@ -364,7 +389,9 @@ repository), the entry says so. Each entry has a source:
   `queue_outbox` rows created at least 3 s ago (oldest first, up to 100) with
   `FOR UPDATE SKIP LOCKED`, "delivers" each by logging
   `delivered order-placed for order <id> (command_key …)`, then sets
-  `published_at` on those ids. The outbox command's `command_key` is the JSON of
+  `published_at` on those ids. A row that does not decode as `OrderPlaced` is
+  logged at `warn` and inserted into `outbox_rejected` (with the error text) in
+  the same transaction; later ticks skip it and the page shows *rejected*. The outbox command's `command_key` is the JSON of
   `(task_key, "order-placed")`.
 - **Why:** `web` runs as one instance, and the 3 s delay lets the page show
   *pending*. Delivering before marking, in the same transaction, is the
