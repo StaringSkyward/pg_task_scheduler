@@ -8,12 +8,12 @@ x-app: &app
 
 services:
   db:
-    image: postgres:13
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in example-app/.env (see README)}
       POSTGRES_DB: demo
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
       # When the crate adds a migration, mount it here in order, and keep
       # demo.sql last.
       - ../migrations/0001_create_queue_tables/up.sql:/docker-entrypoint-initdb.d/0001.sql:ro

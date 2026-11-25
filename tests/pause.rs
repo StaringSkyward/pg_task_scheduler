@@ -1,10 +1,11 @@
 mod common;
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::Instant;
 
 use common::TestDb;
+use diesel_async::AsyncConnection;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::QueueName;
 use pg_task_scheduler::Scheduler;
@@ -13,6 +14,8 @@ use pg_task_scheduler::TaskKey;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::store::AdminActionKind;
+use pg_task_scheduler::store::AdminActionTarget;
+use pg_task_scheduler::store::QueueAction;
 use pg_task_scheduler::store::{self};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -41,12 +44,13 @@ async fn claim(db: &TestDb, queue: &str) -> Vec<pg_task_scheduler::ClaimedTask> 
         &mut conn,
         &WorkerId::generate(),
         &q(queue),
-        &["job".to_owned()],
-        NonZeroUsize::new(5).unwrap(),
-        Duration::from_secs(60),
+        &[pg_task_scheduler::TaskName::try_from("job").unwrap()],
+        NonZeroU32::new(5).unwrap(),
+        common::lease(Duration::from_secs(60)),
     )
     .await
     .unwrap()
+    .ready
 }
 
 async fn pause(db: &TestDb, queue: &str) -> bool {
@@ -109,7 +113,7 @@ async fn next_due_in_ignores_paused_queues() {
     let db = TestDb::new().await;
     add(&db, "a", "bulk").await;
     let mut conn = db.pool.get().await.unwrap();
-    let names = ["job".to_owned()];
+    let names = [pg_task_scheduler::TaskName::try_from("job").unwrap()];
     assert!(
         store::next_due_in(&mut conn, &[q("bulk")], &names)
             .await
@@ -123,6 +127,21 @@ async fn next_due_in_ignores_paused_queues() {
             .unwrap()
             .is_none()
     );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_blank_reason_is_a_check_violation() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let e = store::pause_queue(&mut conn, &q("bulk"), "op", "  ")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:?}").contains("queue_admin_actions_text_present"),
+        "{e:?}"
+    );
+    drop(conn);
     db.cleanup().await;
 }
 
@@ -144,14 +163,69 @@ async fn pause_is_idempotent_and_audited() {
     assert!(!resume(&db, "bulk").await);
     let mut conn = db.pool.get().await.unwrap();
     assert!(store::paused_queues(&mut conn).await.unwrap().is_empty());
-    let actions = store::admin_actions(&mut conn, None, 10).await.unwrap();
-    let kinds: Vec<_> = actions.iter().map(|a| a.action).collect();
+    let ten = NonZeroU32::new(10).unwrap();
+    let actions = store::admin_actions(&mut conn, None, ten, ten)
+        .await
+        .unwrap();
+    let kinds: Vec<_> = actions.iter().map(|a| a.kind()).collect();
     assert_eq!(kinds, [AdminActionKind::Resume, AdminActionKind::Pause]);
-    assert!(
-        actions
-            .iter()
-            .all(|a| a.affected == 0 && a.queue == Some(q("bulk")))
-    );
+    assert!(matches!(
+        actions[1].target,
+        AdminActionTarget::Queue {
+            action: QueueAction::Pause,
+            ..
+        }
+    ));
+    assert!(actions.iter().all(|a| a.affected.value == 0
+        && matches!(&a.target, AdminActionTarget::Queue { queue, .. } if *queue == q("bulk"))));
+    db.cleanup().await;
+}
+
+async fn pause_actions(db: &TestDb, queue: &str) -> i64 {
+    db.scalar(&format!(
+        "SELECT count(*) AS n FROM queue_admin_actions WHERE action = 'pause' AND queue = '{queue}'"
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn pausing_a_paused_queue_writes_no_audit_row() {
+    let db = TestDb::new().await;
+    assert!(pause(&db, "bulk").await);
+    assert!(!pause(&db, "bulk").await);
+    assert_eq!(pause_actions(&db, "bulk").await, 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_concurrent_second_pause_writes_no_audit_row() {
+    let db = TestDb::new().await;
+    // A's pause stays uncommitted until `release` fires.
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut a = db.pool.get().await.unwrap();
+    let first = tokio::spawn(async move {
+        a.transaction::<_, diesel::result::Error, _>(async |c| {
+            let paused = store::pause_queue(c, &q("bulk"), "a", "first")
+                .await
+                .unwrap();
+            paused_tx.send(paused).unwrap();
+            release_rx.await.unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    });
+    assert!(paused_rx.await.unwrap());
+    let mut b = db.pool.get().await.unwrap();
+    let pid = common::backend_pid(&mut b).await;
+    let second =
+        tokio::spawn(async move { store::pause_queue(&mut b, &q("bulk"), "b", "second").await });
+    db.wait_until_lock_blocked(pid).await;
+    release_tx.send(()).unwrap();
+    first.await.unwrap();
+    assert!(!second.await.unwrap().unwrap());
+    assert_eq!(pause_actions(&db, "bulk").await, 1);
     db.cleanup().await;
 }
 
@@ -183,6 +257,18 @@ async fn worker_resumes_promptly() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     cancel.cancel();
-    run.await.unwrap().unwrap();
+    run.await.unwrap();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_failed_wakeup_leaves_the_queue_paused() {
+    let db = TestDb::new().await;
+    assert!(pause(&db, "default").await);
+    let mut conn = db.conn_with_failing_notify().await;
+    let r = store::resume_queue(&mut conn, &q("default"), "op", "done").await;
+    assert!(r.is_err(), "{r:?}");
+    let mut conn = db.pool.get().await.unwrap();
+    assert_eq!(store::paused_queues(&mut conn).await.unwrap().len(), 1);
     db.cleanup().await;
 }

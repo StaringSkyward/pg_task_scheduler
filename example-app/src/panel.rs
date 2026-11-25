@@ -4,6 +4,7 @@
 use diesel::QueryableByName;
 use diesel::sql_query;
 use diesel::sql_types::BigInt;
+use diesel::sql_types::Bool;
 use diesel::sql_types::Int4;
 use diesel::sql_types::Nullable;
 use diesel::sql_types::Text;
@@ -38,6 +39,8 @@ pub struct OutboxRow {
     pub order_id: Option<i64>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
     pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = Bool)]
+    pub rejected: bool,
 }
 
 #[derive(QueryableByName)]
@@ -67,7 +70,8 @@ pub async fn load(conn: &mut AsyncPgConnection) -> Result<Panel, diesel::result:
     .load::<OrderRow>(conn)
     .await?;
     let outbox = sql_query(
-        "SELECT topic, (payload->>'order_id')::bigint AS order_id, published_at
+        "SELECT topic, CASE WHEN payload->>'order_id' ~ '^[0-9]{1,18}$' THEN (payload->>'order_id')::bigint END AS order_id, published_at,
+                EXISTS (SELECT 1 FROM outbox_rejected r WHERE r.outbox_id = queue_outbox.id) AS rejected
          FROM queue_outbox ORDER BY id DESC LIMIT 10",
     )
     .load::<OutboxRow>(conn)

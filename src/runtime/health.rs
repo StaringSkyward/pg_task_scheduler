@@ -3,9 +3,9 @@
 pub enum HealthStatus {
     /// No claim cycle has finished yet.
     Starting,
-    /// The last claim cycle succeeded.
+    /// The last claim cycle succeeded, and (with `cron`) the materializer's last run succeeded.
     Healthy,
-    /// The last claim cycle (or, with `cron`, materialization) failed.
+    /// The last claim cycle failed, or the materializer's last run failed.
     Degraded,
     /// `run_until_shutdown` returned, or its future was dropped.
     Stopped,

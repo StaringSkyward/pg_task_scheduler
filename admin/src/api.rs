@@ -13,7 +13,10 @@ use axum::routing::post;
 use pg_task_scheduler::JobId;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::SchedulerPool;
+use pg_task_scheduler::StoredTaskKey;
 use pg_task_scheduler::TaskId;
+use pg_task_scheduler::TaskPayload;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskView;
 #[cfg(feature = "cron")]
 use pg_task_scheduler::jobs::Applied;
@@ -61,6 +64,7 @@ async fn acquire<P: SchedulerPool>(pool: &P) -> Result<P::Conn, ApiError> {
 struct JobView {
     id: JobId,
     name: String,
+    task_name: String,
     cron_expression: String,
     is_paused: bool,
 }
@@ -71,6 +75,7 @@ impl From<pg_task_scheduler::Job> for JobView {
         JobView {
             id: j.id,
             name: j.name.as_str().to_owned(),
+            task_name: j.task_name.as_str().to_owned(),
             cron_expression: j.cron.as_str().to_owned(),
             is_paused: matches!(j.lifecycle, pg_task_scheduler::JobLifecycle::Paused),
         }
@@ -92,7 +97,7 @@ async fn list_jobs<P: SchedulerPool>(
 #[cfg(feature = "cron")]
 fn applied(a: Applied, id: JobId) -> Result<StatusCode, ApiError> {
     match a {
-        Applied::Changed => Ok(StatusCode::NO_CONTENT),
+        Applied::Changed | Applied::Unchanged => Ok(StatusCode::NO_CONTENT),
         Applied::NotFound => Err((StatusCode::NOT_FOUND, format!("no job with id {}", id.0))),
     }
 }
@@ -127,32 +132,67 @@ async fn delete_job<P: SchedulerPool>(
 #[derive(serde::Serialize)]
 struct TaskJson {
     id: i64,
-    task_key: String,
+    task_key: TaskKeyJson,
     task_name: String,
     queue: String,
     status: &'static str,
-    attempts: i32,
-    max_attempts: i32,
+    payload: PayloadJson,
+    attempts: u32,
+    max_attempts: u32,
     due_at: chrono::DateTime<chrono::Utc>,
     locked_by: Option<String>,
     last_error: Option<String>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// `{"json": <value>}`, or `{"unreadable": {"text": ..., "error": ...}}` when the stored
+/// payload does not parse.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PayloadJson {
+    Json(serde_json::Value),
+    Unreadable { text: String, error: String },
+}
+
+/// `{"valid": "<key>"}`, or `{"invalid": {"text": ..., "error": ...}}` when the stored key
+/// fails the identifier policy.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskKeyJson {
+    Valid(String),
+    Invalid { text: String, error: String },
+}
+
 impl From<TaskView> for TaskJson {
     fn from(t: TaskView) -> Self {
+        let (locked_by, completed_at) = match &t.state {
+            TaskState::Queued => (None, None),
+            TaskState::Running { locked_by, .. } => (Some(locked_by.as_str().to_owned()), None),
+            TaskState::Finished { completed_at, .. } => (None, Some(*completed_at)),
+        };
+        let payload = match t.payload {
+            TaskPayload::Json(v) => PayloadJson::Json(v),
+            TaskPayload::Unreadable { text, error } => PayloadJson::Unreadable { text, error },
+        };
         TaskJson {
+            payload,
             id: t.id.0,
-            task_key: t.task_key.as_str().to_owned(),
+            task_key: match t.task_key {
+                StoredTaskKey::Valid(k) => TaskKeyJson::Valid(k.as_str().to_owned()),
+                StoredTaskKey::Invalid { text, error } => TaskKeyJson::Invalid {
+                    text,
+                    error: error.to_string(),
+                },
+            },
             task_name: t.task_name.as_str().to_owned(),
             queue: t.queue.as_str().to_owned(),
-            status: t.status.as_str(),
+            status: t.state.status().as_str(),
             attempts: t.attempts,
-            max_attempts: t.max_attempts,
+            max_attempts: t.max_attempts.get(),
             due_at: t.due_at,
-            locked_by: t.locked_by.map(|w| w.as_str().to_owned()),
+            locked_by,
             last_error: t.last_error,
-            completed_at: t.completed_at,
+            completed_at,
         }
     }
 }

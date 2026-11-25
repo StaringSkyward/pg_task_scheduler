@@ -8,6 +8,7 @@ use axum::Form;
 use axum::Router;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Html;
 use axum::response::IntoResponse;
 use axum::response::Redirect;
@@ -20,10 +21,10 @@ use pg_task_scheduler::CronExpression;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::SchedulerError;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskKey;
-use pg_task_scheduler::TaskName;
 use pg_task_scheduler::enqueue;
 use pg_task_scheduler::jobs;
 use pg_task_scheduler_admin::AdminConfig;
@@ -104,9 +105,9 @@ impl FlashKind {
     }
 }
 
-fn back(flash: Flash) -> Redirect {
-    let query = serde_urlencoded::to_string(&flash).unwrap_or_default();
-    Redirect::to(&format!("/?{query}"))
+fn back(flash: Flash) -> Result<Redirect, BoxError> {
+    let query = serde_urlencoded::to_string(&flash)?;
+    Ok(Redirect::to(&format!("/?{query}")))
 }
 
 #[derive(Template)]
@@ -141,8 +142,26 @@ async fn index(State(pool): State<Pool>, flash: Option<Query<Flash>>) -> Respons
 type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Turns a handler's result into the redirect: an error becomes the red banner.
-fn finish(result: Result<Flash, BoxError>) -> Redirect {
-    back(result.unwrap_or_else(|e| Flash::new(FlashKind::Error, e.to_string(), None)))
+/// A banner that cannot be encoded is a 500.
+fn finish(result: Result<Flash, BoxError>) -> Result<Redirect, AppError> {
+    Ok(back(result.unwrap_or_else(|e| {
+        Flash::new(FlashKind::Error, e.to_string(), None)
+    }))?)
+}
+
+/// A server error for the one failure `finish` cannot show as a banner.
+struct AppError(BoxError);
+
+impl From<BoxError> for AppError {
+    fn from(e: BoxError) -> Self {
+        AppError(e)
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
+    }
 }
 
 async fn enqueue_emails(pool: &Pool) -> Result<Flash, BoxError> {
@@ -224,6 +243,22 @@ pub fn parse_order_no(input: &str) -> Option<u32> {
     s.parse().ok().filter(|n| (1..=999_999).contains(n))
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ReceiptVariant {
+    Same,
+    Changed,
+}
+
+impl ReceiptVariant {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "same" => Some(Self::Same),
+            "changed" => Some(Self::Changed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ReceiptForm {
     // Missing fields default to "", so they take the red-banner path.
@@ -242,9 +277,16 @@ async fn enqueue_receipt(pool: &Pool, form: ReceiptForm) -> Result<Flash, BoxErr
             None,
         ));
     };
+    let Some(variant) = ReceiptVariant::parse(&form.variant) else {
+        return Ok(Flash::new(
+            FlashKind::Error,
+            "Variant must be same or changed.".into(),
+            None,
+        ));
+    };
     let key = format!("receipt:order-{n}");
     let mut subject = format!("Receipt for order {n}");
-    if form.variant == "changed" {
+    if variant == ReceiptVariant::Changed {
         subject.push_str(" (changed)");
     }
     let args = EmailArgs {
@@ -284,23 +326,26 @@ async fn enqueue_receipt(pool: &Pool, form: ReceiptForm) -> Result<Flash, BoxErr
     })
 }
 
-async fn orders(State(pool): State<Pool>) -> Redirect {
+async fn orders(State(pool): State<Pool>) -> Result<Redirect, AppError> {
     finish(enqueue_orders(&pool).await)
 }
 
-async fn receipt(State(pool): State<Pool>, Form(form): Form<ReceiptForm>) -> Redirect {
+async fn receipt(
+    State(pool): State<Pool>,
+    Form(form): Form<ReceiptForm>,
+) -> Result<Redirect, AppError> {
     finish(enqueue_receipt(&pool, form).await)
 }
 
-async fn emails(State(pool): State<Pool>) -> Redirect {
+async fn emails(State(pool): State<Pool>) -> Result<Redirect, AppError> {
     finish(enqueue_emails(&pool).await)
 }
 
-async fn bulk_import(State(pool): State<Pool>) -> Redirect {
+async fn bulk_import(State(pool): State<Pool>) -> Result<Redirect, AppError> {
     finish(enqueue_bulk_import(&pool).await)
 }
 
-async fn flaky(State(pool): State<Pool>) -> Redirect {
+async fn flaky(State(pool): State<Pool>) -> Result<Redirect, AppError> {
     finish(enqueue_flaky(&pool).await)
 }
 
@@ -312,8 +357,8 @@ pub async fn run(
 ) -> Result<(), Box<dyn Error>> {
     // The digest job is created at startup. `ensure_job` is safe on every
     // restart: it never resurrects a job an operator paused.
-    let job = CreateJob::new(
-        TaskName::try_from(Digest::NAME)?,
+    let job = CreateJob::for_task::<Digest>(
+        ScheduleName::try_from("digest")?,
         CronExpression::parse("*/5 * * * *")?,
         MaxAttempts::try_from(3u32)?,
         JobLifecycle::Active,
@@ -395,6 +440,17 @@ mod tests {
         ] {
             assert_eq!(parse_order_no(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn receipt_variant_accepts_only_same_and_changed() {
+        assert_eq!(ReceiptVariant::parse("same"), Some(ReceiptVariant::Same));
+        assert_eq!(
+            ReceiptVariant::parse("changed"),
+            Some(ReceiptVariant::Changed)
+        );
+        assert_eq!(ReceiptVariant::parse("typo"), None);
+        assert_eq!(ReceiptVariant::parse(""), None);
     }
 
     #[test]

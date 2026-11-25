@@ -1,3 +1,10 @@
+# The dev database allows PostgreSQL's default 100 connections. A test running a scheduler with
+# `cron` holds about six at its start: LISTEN, a claim, maintenance, the registry, the
+# materializer and the test's own reads. 16 tests at a time stay under the limit; the default of
+# one per CPU does not on a large host, and more threads gain no wall time.
+[profile.default]
+test-threads = 16
+
 # claim_loop counts its worker's claims; any other test's NOTIFY on the shared database wakes
 # that worker, so each of its tests must run with nothing else in flight.
 [[profile.default.overrides]]

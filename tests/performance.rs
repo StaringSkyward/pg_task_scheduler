@@ -162,15 +162,24 @@ async fn replay_matching_uses_failed_name_index() {
     use diesel::sql_types::Text;
     let db = TestDb::new().await;
     let mut conn = db.pool.get().await.unwrap();
-    conn.batch_execute("SET enable_seqscan = off")
-        .await
-        .unwrap();
+    // With real statistics, the selective task_name wins over the status-only index
+    // (an empty table leaves PostgreSQL 18 choosing the latter).
+    conn.batch_execute(
+        "INSERT INTO queue_tasks (task_key, task_name, status, completed_at) \
+         SELECT 'k' || g, CASE WHEN g % 50 = 0 THEN 'a' ELSE 'name' || (g % 50) END, \
+                'dead', now() - g * interval '1 second' \
+         FROM generate_series(1, 5000) g; ANALYZE queue_tasks; \
+         SET enable_seqscan = off",
+    )
+    .await
+    .unwrap();
     let plan = diesel::sql_query(format!(
         "EXPLAIN {}",
         pg_task_scheduler::store::REPLAY_BATCH
     ))
     .bind::<Text, _>("a")
     .bind::<Nullable<Text>, _>(None::<String>)
+    .bind::<Text, _>("any")
     .bind::<Nullable<Text>, _>(None::<String>)
     .bind::<BigInt, _>(1000_i64)
     .bind::<BigInt, _>(1_i64)
@@ -217,64 +226,73 @@ async fn seqscan_off_conn(
 #[tokio::test]
 async fn queued_page_uses_claim_and_due_indexes() {
     use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
     use diesel::sql_types::Text;
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let now = chrono::Utc::now();
-    let due = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_DUE))
-        .bind::<Text, _>("default")
-        .bind::<BigInt, _>(5_i64)
-        .bind::<Timestamptz, _>(now)
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(due, "queue_tasks_claim_idx");
-    let future = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_FUTURE))
-        .bind::<Text, _>("default")
-        .bind::<Timestamptz, _>(now)
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(future, "queue_tasks_due_idx");
+    // A first page (NULL) and a continuation.
+    for after in [None, Some(chrono::Utc::now())] {
+        let due = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_DUE))
+            .bind::<Text, _>("default")
+            .bind::<BigInt, _>(5_i64)
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(due, "queue_tasks_claim_idx");
+        let future = diesel::sql_query(format!("EXPLAIN {}", store::QUEUED_FUTURE))
+            .bind::<Text, _>("default")
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(future, "queue_tasks_due_idx");
+    }
     db.cleanup().await;
 }
 
 #[tokio::test]
 async fn running_page_uses_lease_index() {
     use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::RUNNING))
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_expired_lease_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::RUNNING))
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_expired_lease_idx");
+    }
     db.cleanup().await;
 }
 
 #[tokio::test]
 async fn done_page_uses_terminal_index() {
     use diesel::sql_types::BigInt;
+    use diesel::sql_types::Nullable;
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::DONE))
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_terminal_cleanup_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::DONE))
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_terminal_cleanup_idx");
+    }
     db.cleanup().await;
 }
 
@@ -286,16 +304,19 @@ async fn failed_page_uses_failed_index() {
     use diesel::sql_types::Timestamptz;
     let db = TestDb::new().await;
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED))
-        .bind::<Text, _>("dead")
-        .bind::<Nullable<Text>, _>(Some("boom"))
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_failed_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED))
+            .bind::<Text, _>("dead")
+            .bind::<Text, _>("exact")
+            .bind::<Nullable<Text>, _>(Some("boom"))
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_failed_idx");
+    }
     db.cleanup().await;
 }
 
@@ -318,17 +339,20 @@ async fn failed_page_by_name_uses_failed_name_index() {
         .unwrap();
     drop(setup);
     let mut conn = seqscan_off_conn(&db).await;
-    let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED_BY_NAME))
-        .bind::<Text, _>("dead")
-        .bind::<Nullable<Text>, _>(None::<&str>)
-        .bind::<Timestamptz, _>(chrono::Utc::now())
-        .bind::<BigInt, _>(7_i64)
-        .bind::<BigInt, _>(51_i64)
-        .bind::<Text, _>("email")
-        .get_results::<PlanLine>(&mut conn)
-        .await
-        .unwrap();
-    browse_plan(plan, "queue_tasks_failed_name_idx");
+    for after in [None, Some(chrono::Utc::now())] {
+        let plan = diesel::sql_query(format!("EXPLAIN {}", store::FAILED_BY_NAME))
+            .bind::<Text, _>("dead")
+            .bind::<Text, _>("any")
+            .bind::<Nullable<Text>, _>(None::<&str>)
+            .bind::<Nullable<Timestamptz>, _>(after)
+            .bind::<BigInt, _>(7_i64)
+            .bind::<BigInt, _>(51_i64)
+            .bind::<Text, _>("email")
+            .get_results::<PlanLine>(&mut conn)
+            .await
+            .unwrap();
+        browse_plan(plan, "queue_tasks_failed_name_idx");
+    }
     db.cleanup().await;
 }
 
@@ -479,8 +503,8 @@ async fn production_shaped_db() -> TestDb {
          FROM generate_series(1, 20000) g; \
          INSERT INTO queue_tasks (task_key, task_name, queue) \
          SELECT 'q' || g, 'name' || (g % 50), 'q' || (g % 5) FROM generate_series(1, 200) g; \
-         INSERT INTO queue_tasks (task_key, task_name, status, locked_by, locked_until) \
-         SELECT 'r' || g, 'name' || (g % 50), 'running', 'w', now() + interval '1 minute' \
+         INSERT INTO queue_tasks (task_key, task_name, status, attempts, locked_by, locked_until) \
+         SELECT 'r' || g, 'name' || (g % 50), 'running', 1, 'w', now() + interval '1 minute' \
          FROM generate_series(1, 20) g; \
          INSERT INTO queue_tasks (task_key, task_name, status, completed_at, last_error) \
          SELECT 'z' || g, 'name' || (g % 50), 'dead', now() - g * interval '1 second', 'boom' \
@@ -505,7 +529,13 @@ async fn custom_and_generic_plans(db: &TestDb, sql: &str, args: &str) -> [String
         conn.batch_execute(&format!("SET plan_cache_mode = {mode}"))
             .await
             .unwrap();
-        let rows = diesel::sql_query(format!("EXPLAIN EXECUTE probe({args})"))
+        // `EXECUTE probe()` is a syntax error: a statement without parameters takes no list.
+        let params = if args.is_empty() {
+            String::new()
+        } else {
+            format!("({args})")
+        };
+        let rows = diesel::sql_query(format!("EXPLAIN EXECUTE probe{params}"))
             .get_results::<PlanLine>(&mut conn)
             .await
             .unwrap();
@@ -553,6 +583,56 @@ async fn count_cancellable_reads_only_live_rows() {
     db.cleanup().await;
 }
 
+/// With only live leases, the reaper bounds its lease-index scan by `locked_until` instead of
+/// reading every running row and filtering it.
+#[tokio::test]
+async fn reaper_with_only_live_leases_bounds_the_lease_index() {
+    let db = production_shaped_db().await;
+    // $1 batch size, $2 crash-retry delay.
+    for plan in custom_and_generic_plans(&db, store::REAP, "100, interval '0'").await {
+        assert!(
+            plan.contains("queue_tasks_expired_lease_idx")
+                && plan
+                    .lines()
+                    .any(|l| l.contains("Index Cond:") && l.contains("locked_until")),
+            "unexpected query plan:\n{plan}"
+        );
+    }
+    db.cleanup().await;
+}
+
+/// The due-schedule scan reaches due cursors through an index condition on `next_run_at`, so
+/// schedules due later are never read.
+#[cfg(feature = "cron")]
+#[tokio::test]
+async fn due_schedule_scan_reads_the_cursor_index() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    // 2,000 schedules, 10 of them due; ANALYZEd, so the plan is the planner's real choice.
+    conn.batch_execute(
+        "WITH j AS (INSERT INTO scheduler_jobs (name, task_name, cron_expression) \
+                    SELECT 'j' || g, 't', '*/5 * * * *' FROM generate_series(1, 2000) g \
+                    RETURNING id, name) \
+         INSERT INTO scheduler_job_cursors (job_id, next_run_at) \
+         SELECT id, now() + (substr(name, 2)::int - 10) * interval '1 minute' FROM j; \
+         ANALYZE scheduler_jobs, scheduler_job_cursors",
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    for plan in custom_and_generic_plans(&db, store::SELECT_DUE, "").await {
+        assert!(
+            plan.contains("scheduler_job_cursors_due_idx")
+                && plan
+                    .lines()
+                    .any(|l| l.contains("Index Cond:") && l.contains("next_run_at"))
+                && !plan.contains("Seq Scan on scheduler_job"),
+            "unexpected query plan:\n{plan}"
+        );
+    }
+    db.cleanup().await;
+}
+
 fn assert_index_no_seq_scan(plans: [String; 2], index: &str) {
     for plan in plans {
         assert!(
@@ -565,9 +645,14 @@ fn assert_index_no_seq_scan(plans: [String; 2], index: &str) {
 #[tokio::test]
 async fn count_replayable_uses_failed_name_index() {
     let db = production_shaped_db().await;
-    let plans =
-        custom_and_generic_plans(&db, store::COUNT_REPLAYABLE, "'name1', NULL, NULL, 10000").await;
-    assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    // $1 task_name, $2 queue, $3 error mode, $4 error text, $5 cap.
+    for args in [
+        "'name1', NULL, 'any', NULL, 10000",
+        "'name1', NULL, 'exact', 'boom', 10000",
+    ] {
+        let plans = custom_and_generic_plans(&db, store::COUNT_REPLAYABLE, args).await;
+        assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    }
     db.cleanup().await;
 }
 
@@ -576,20 +661,29 @@ async fn count_replayable_uses_failed_name_index() {
 #[tokio::test]
 async fn failed_page_generic_plan_uses_failed_index() {
     let db = production_shaped_db().await;
-    // $1 status, $2 last_error, $3 completed_at, $4 id, $5 limit.
-    let args = "'dead', NULL, '9999-12-31', 0, 51";
-    let plans = custom_and_generic_plans(&db, store::FAILED, args).await;
-    assert_index_no_seq_scan(plans, "queue_tasks_failed_idx");
+    // $1 status, $2 error mode, $3 error text, $4 completed_at, $5 id, $6 limit: a first page,
+    // a continuation.
+    for args in [
+        "'dead', 'any', NULL, NULL, 0, 51",
+        "'dead', 'missing', NULL, now() - interval '500 seconds', 500, 51",
+    ] {
+        let plans = custom_and_generic_plans(&db, store::FAILED, args).await;
+        assert_index_no_seq_scan(plans, "queue_tasks_failed_idx");
+    }
     db.cleanup().await;
 }
 
 #[tokio::test]
 async fn failed_page_by_name_generic_plan_uses_failed_name_index() {
     let db = production_shaped_db().await;
-    // As FAILED, plus $6 task_name.
-    let args = "'dead', NULL, '9999-12-31', 0, 51, 'name1'";
-    let plans = custom_and_generic_plans(&db, store::FAILED_BY_NAME, args).await;
-    assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    // As FAILED, plus $7 task_name.
+    for args in [
+        "'dead', 'any', NULL, NULL, 0, 51, 'name1'",
+        "'dead', 'exact', 'boom', now() - interval '500 seconds', 500, 51, 'name1'",
+    ] {
+        let plans = custom_and_generic_plans(&db, store::FAILED_BY_NAME, args).await;
+        assert_index_no_seq_scan(plans, "queue_tasks_failed_name_idx");
+    }
     db.cleanup().await;
 }
 
@@ -601,7 +695,7 @@ struct IndexDef {
 
 /// Closing an attempt sets `finished_at`, `outcome` and `error`. An index whose key, INCLUDE
 /// list or predicate names one of them makes every close a non-HOT update that writes every
-/// attempts index, so completions would tax the hot path (spec §3).
+/// attempts index, so completions would tax the hot path (docs/AdminUI.md §3.12).
 #[tokio::test]
 async fn attempt_close_stays_hot_eligible() {
     let db = TestDb::new().await;

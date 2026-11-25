@@ -6,3 +6,11 @@ CREATE TABLE demo_orders (
     amount_cents INTEGER NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- The relay records a message it cannot decode here, and leaves published_at
+-- for delivered rows only.
+CREATE TABLE outbox_rejected (
+    outbox_id   BIGINT PRIMARY KEY REFERENCES queue_outbox (id) ON DELETE CASCADE,
+    error       TEXT NOT NULL,
+    rejected_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

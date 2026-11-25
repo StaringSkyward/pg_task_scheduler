@@ -1,5 +1,4 @@
-use std::num::NonZeroUsize;
-use std::ops::DerefMut;
+use std::num::NonZeroU32;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,10 +9,13 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use futures::FutureExt;
 use futures::StreamExt;
+use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinError;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio::time::MissedTickBehavior;
@@ -23,6 +25,8 @@ use tracing::Instrument;
 use crate::error::SchedulerError;
 use crate::error::TaskError;
 use crate::ids::QueueName;
+use crate::ids::TaskName;
+use crate::models::AttemptNo;
 use crate::models::ClaimedTask;
 use crate::models::RetryOutcome;
 use crate::models::TaskLease;
@@ -36,10 +40,15 @@ use crate::runtime::health::WorkerHealth;
 use crate::runtime::registry::Handler;
 use crate::runtime::registry::Registry;
 use crate::store;
+use crate::store::PoisonedClaim;
 
 /// Shortest idle wait before a task due soon (a due task the cycle could not claim waits
 /// `max_poll_interval` instead: another transaction holds it).
 const MIN_WAIT: Duration = Duration::from_millis(10);
+
+/// Pool connections dead-lettering may hold at once, per scheduler. Rows a claim poisons
+/// while all are in use stay `running`, and the reaper recovers them after the lease.
+const QUARANTINE_CONNECTIONS: usize = 1;
 
 /// How long shutdown waits, after `shutdown_timeout`, for dropped handlers' tasks to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,8 +79,16 @@ impl<P: SchedulerPool> Scheduler<P> {
     /// Claim and run tasks until `cancel` fires. Then stop claiming and maintenance, cancel
     /// every handler's `ctx.cancellation`, and drain for up to `shutdown_timeout`. Handlers
     /// still running then are dropped and their tasks released; after 5 s more, whatever is
-    /// left is aborted and the reaper recovers those tasks after the lease.
-    pub async fn run_until_shutdown(self, cancel: CancellationToken) -> Result<(), SchedulerError> {
+    /// left is aborted and the reaper recovers those tasks after the lease. A completion, retry,
+    /// failure or release already in flight is not aborted: it runs on its own task until its
+    /// transaction commits or rolls back. After it returns, each heartbeat or such transition
+    /// still in flight may hold one pool connection until its transaction ends; each of its
+    /// statements is bounded by the lease it had left. A heartbeat renews nothing then, unless
+    /// it passed its cancellation check before its dispatch ended.
+    ///
+    /// It has no error path. Startup and claim failures surface through
+    /// [`Scheduler::health`] (`Degraded`, with `last_error`) while the runtime keeps retrying.
+    pub async fn run_until_shutdown(self, cancel: CancellationToken) {
         let Scheduler {
             pool,
             registry,
@@ -80,7 +97,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         } = self;
         let health = StoppedOnDrop(health_tx);
         let config = Arc::new(config);
-        let names = registry.names();
+        let names = registry.task_names();
         let queues: Vec<_> = config
             .queues
             .iter()
@@ -91,54 +108,74 @@ impl<P: SchedulerPool> Scheduler<P> {
             })
             .collect();
         let mut in_flight = JoinSet::new();
+        let quarantine = Arc::new(Semaphore::new(QUARANTINE_CONNECTIONS));
         let shutdown = Shutdown {
             begun: cancel.clone(),
             expired: CancellationToken::new(),
         };
-        let runtime = tokio::runtime::Handle::current();
-        let mut listener = Listener::<P> {
-            conn: None,
-            runtime: runtime.clone(),
-        };
+        // The receiver task that owns the LISTEN session (none yet), and its wakeups.
+        let mut receiver: Option<JoinHandle<()>> = None;
+        let wake = Arc::new(Notify::new());
         let mut failures = 0u64;
+        // The last claim cycle's error, which a materializer run reports beside its own.
+        let mut claim_failed: Option<String> = None;
         // A child token: cancelled together with `cancel`, or by the guard if this future is
-        // dropped (aborted, or a failed `try_join!` sibling) so maintenance and the registry
-        // never outlive it.
+        // dropped (aborted, or a failed `try_join!` sibling) so maintenance, the materializer
+        // and the registry never outlive it.
         let background = cancel.child_token();
         let _stop_background = background.clone().drop_guard();
         let maintenance = tokio::spawn(maintain(pool.clone(), config.clone(), background.clone()));
+        // Each materializer run's error, `None` when it succeeded. Without `cron` nothing sends:
+        // the channel is closed, and the wait's `changed()` arm never fires.
+        let (runs, mut materialized) = watch::channel(None::<String>);
+        #[cfg(feature = "cron")]
+        let materializer = tokio::spawn(materialize_loop(
+            pool.clone(),
+            config.clone(),
+            runs,
+            background.clone(),
+        ));
+        #[cfg(not(feature = "cron"))]
+        drop(runs);
         let registration = tokio::spawn(keep_registered(
             pool.clone(),
             config.clone(),
             names.clone(),
             queues.clone(),
             health.0.subscribe(),
-            background,
+            background.clone(),
         ));
-        #[cfg(feature = "cron")]
-        let (mut materialized, mut next_materialize) = (Ok(()), Instant::now());
 
         while !cancel.is_cancelled() {
-            // The wait below collects at most one finished dispatch per wake, and a full batch
-            // skips it entirely; collect them all here so the set stays bounded by the permits.
+            // The wait below collects at most one finished task per wake, and a full batch
+            // skips it entirely; collect them all here. Dispatches are bounded by the permits.
+            // At most QUARANTINE_CONNECTIONS dead-letter tasks run at once; rows poisoned while
+            // they all run are left to the reaper. Poisoned rows never make a batch full, so
+            // they never skip the wait on their own.
             while let Some(joined) = in_flight.try_join_next() {
                 log_join(joined);
+            }
+            // A finished receiver never listened, or its connection failed: re-listen. On
+            // `background`, so an aborted run still stops it and it UNLISTENs.
+            let mut listening = None;
+            if receiver.as_ref().is_none_or(JoinHandle::is_finished) {
+                let (ready, subscribed) = oneshot::channel();
+                listening = Some(subscribed);
+                receiver = Some(tokio::spawn(listen(
+                    pool.clone(),
+                    wake.clone(),
+                    ready,
+                    background.clone(),
+                )));
             }
             // Every pool and query await races shutdown, so a stalled database cannot hold it
             // past its bound. A claim cut off after it committed leaves its tasks `running`
             // until the reaper recovers them, as when a claim's response is lost.
             let step = async {
-                // At most once per `max_poll_interval`; the wait below wakes for it, so a due
-                // schedule is materialized within `max_poll_interval`.
-                #[cfg(feature = "cron")]
-                let materialized_now = Instant::now() >= next_materialize;
-                #[cfg(feature = "cron")]
-                if materialized_now {
-                    next_materialize = Instant::now() + config.max_poll_interval;
-                    materialized = materialize(&pool).await;
-                }
-                if listener.conn.is_none() {
-                    listen(&pool, &mut listener).await;
+                // LISTEN before the claim, so a task enqueued after the claim's snapshot is
+                // notified. An error means the receiver ended without listening.
+                if let Some(subscribed) = listening {
+                    subscribed.await.ok();
                 }
                 if queues.iter().all(|q| q.permits.available_permits() == 0) {
                     return Some(config.max_poll_interval);
@@ -150,19 +187,23 @@ impl<P: SchedulerPool> Scheduler<P> {
                     &config,
                     &queues,
                     &mut in_flight,
+                    &quarantine,
                     &shutdown,
                 )
                 .await;
-                // The last materialization's failure keeps health degraded but never stops
+                claim_failed = cycle.as_ref().err().map(ToString::to_string);
+                // The materializer's last failure keeps health degraded but never stops
                 // claiming; it counts as one failure per failed run, not per claim cycle.
-                #[cfg(feature = "cron")]
-                let (failed, fresh) = (
-                    cycle.as_ref().err().or(materialized.as_ref().err()),
-                    cycle.is_err() || (materialized_now && materialized.is_err()),
+                let (run_failed, ran) = {
+                    let run = materialized.borrow_and_update();
+                    (run.clone(), run.has_changed())
+                };
+                report(
+                    &health.0,
+                    &mut failures,
+                    claim_failed.as_deref().or(run_failed.as_deref()),
+                    cycle.is_err() || (ran && run_failed.is_some()),
                 );
-                #[cfg(not(feature = "cron"))]
-                let (failed, fresh) = (cycle.as_ref().err(), true);
-                report(&health.0, &mut failures, failed, fresh);
                 cycle.unwrap_or_else(|error| {
                     tracing::error!(%error, "claim failed");
                     Some(config.max_poll_interval)
@@ -173,29 +214,43 @@ impl<P: SchedulerPool> Scheduler<P> {
                 Some(None) => continue, // full batch: more work is likely due
                 Some(Some(wait)) => wait,
             };
-            #[cfg(feature = "cron")]
-            let wait = wait.min(next_materialize.saturating_duration_since(Instant::now()));
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                Some(joined) = in_flight.join_next() => log_join(joined),
-                listening = notified(&mut listener.conn) => if !listening {
-                    tracing::warn!("LISTEN connection failed; re-listening");
-                    listener = Listener {
-                        conn: None,
-                        runtime: runtime.clone(),
-                    };
-                },
-                () = tokio::time::sleep(wait) => {}
+            let until = Instant::now() + wait;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    Some(joined) = in_flight.join_next() => log_join(joined),
+                    () = wake.notified() => {},
+                    // A materializer run reports now, beside the last claim cycle's result, even
+                    // while no claim cycle is due or no queue has a free permit. Then the wait
+                    // goes on: a run is no reason to claim, and one that inserts tasks notifies.
+                    Ok(()) = materialized.changed() => {
+                        let run_failed = materialized.borrow_and_update().clone();
+                        report(
+                            &health.0,
+                            &mut failures,
+                            claim_failed.as_deref().or(run_failed.as_deref()),
+                            run_failed.is_some(),
+                        );
+                        continue;
+                    },
+                    () = tokio::time::sleep_until(until) => {}
+                }
+                break;
             }
         }
 
         if let Err(error) = maintenance.await {
             tracing::error!(%error, "maintenance task panicked");
         }
-        // The guard runs UNLISTEN on a spawned task, so a stalled connection cannot delay the
-        // drain; the connection returns to the pool only once UNLISTEN completes.
-        drop(listener);
+        #[cfg(feature = "cron")]
+        if let Err(error) = materializer.await {
+            tracing::error!(%error, "materializer task panicked");
+        }
+        // Detached, not awaited: `cancel` stops the receiver, which UNLISTENs on its own task, so
+        // a stalled connection cannot delay the drain and returns to the pool only once UNLISTEN
+        // completes.
+        drop(receiver);
         // `true` once every dispatch has ended within `limit`.
         let mut drain = async |limit| {
             let all = async {
@@ -216,7 +271,7 @@ impl<P: SchedulerPool> Scheduler<P> {
         // It exits within REGISTRY_SHUTDOWN_TIMEOUT of `cancel`. That bounds shutdown, not the
         // server: a periodic upsert cut off by `cancel`, or a `stopping` write that timed out,
         // may still execute after the delete below and re-create the row, which then reads
-        // live until its `lost_after` (AdminUI §6.11).
+        // live until its `lost_after` (docs/AdminUI.md §6.11).
         if let Err(error) = registration.await {
             tracing::error!(%error, "registry task panicked");
         }
@@ -225,14 +280,12 @@ impl<P: SchedulerPool> Scheduler<P> {
             store::remove_worker(&mut conn, &config.worker_id).await
         })
         .await;
-        Ok(()) // `health` reports Stopped as it drops
+        // `health` reports Stopped as it drops
     }
 }
 
 async fn acquire<P: SchedulerPool>(pool: &P) -> Result<P::Conn, SchedulerError> {
-    pool.acquire()
-        .await
-        .map_err(|e| SchedulerError::Pool(e.to_string()))
+    pool.acquire().await.map_err(SchedulerError::Pool)
 }
 
 /// Await a store call, recording `pg_task_scheduler_db_query_seconds{operation}`.
@@ -244,6 +297,8 @@ async fn timed<T>(operation: &'static str, query: impl Future<Output = T>) -> T 
     out
 }
 
+/// A row count as `u64`, for metrics and for comparing with a `u32` batch size; no supported
+/// `usize` exceeds `u64`, so the saturation never applies.
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -259,41 +314,75 @@ async fn materialize<P: SchedulerPool>(pool: &P) -> Result<(), SchedulerError> {
     Ok(())
 }
 
-/// Fill `listener` with a pooled connection listening on `queue_available`. The guard holds
-/// the connection before `LISTEN` is sent, so a future dropped mid-`LISTEN` (shutdown, or
-/// the run future dropped) still UNLISTENs it. On failure the listener stays empty: the
-/// worker only polls, and retries on the next loop.
-async fn listen<P: SchedulerPool>(pool: &P, listener: &mut Listener<P>) {
-    let listening: Result<(), SchedulerError> = async {
-        let conn = listener.conn.insert(acquire(pool).await?);
-        diesel::sql_query("LISTEN queue_available")
-            .execute(&mut **conn)
-            .await?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = listening {
-        tracing::warn!(%error, "LISTEN failed; polling only");
-        listener.conn = None; // a failed LISTEN is not in effect: return the connection as is
-    }
-}
-
-/// The `LISTEN` connection, if any. Dropped while still holding one (the run future was
-/// dropped, the connection failed, or shutdown), it runs `UNLISTEN *` on a spawned task before the
-/// connection returns to the pool: a pooled connection left listening buffers every
-/// `queue_available` notification in the database, unbounded, for as long as it lives.
-/// The runtime handle is captured at start, so this also works when the run future is
-/// dropped from a thread outside the runtime.
-struct Listener<P: SchedulerPool> {
-    conn: Option<P::Conn>,
-    runtime: tokio::runtime::Handle,
-}
-
-impl<P: SchedulerPool> Drop for Listener<P> {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            self.runtime.spawn(unlisten(conn));
+/// Materialize at once and every `max_poll_interval`, on a connection of its own, so a stalled
+/// schedule table never holds up claims. Each run is one bounded pass, so a backlog of due
+/// schedules takes several. Publishes each run's error on `runs` (`None` on success); every
+/// await races `cancel`.
+#[cfg(feature = "cron")]
+async fn materialize_loop<P: SchedulerPool>(
+    pool: P,
+    config: Arc<Config>,
+    runs: watch::Sender<Option<String>>,
+    cancel: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(config.max_poll_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    while cancel.run_until_cancelled(tick.tick()).await.is_some() {
+        if let Some(run) = cancel.run_until_cancelled(materialize(&pool)).await {
+            runs.send_replace(run.err().map(|error| error.to_string()));
         }
+    }
+}
+
+/// The receiver: owns a pooled connection, runs `LISTEN queue_available`, reports on
+/// `ready`, then reads the notification stream until it fails or `cancel` fires. Each
+/// `queue_available` notification calls `wake.notify_one()`, which stores at most one permit,
+/// so a burst while the loop is busy is one wakeup. Other channels (a host's own `LISTEN` on
+/// the pooled session) are ignored. It then runs `UNLISTEN queue_available`, never `*`, and
+/// drops the connection. If it gets no connection or `LISTEN` fails, it ends at once: the
+/// worker only polls, and re-listens on the next loop.
+async fn listen<P: SchedulerPool>(
+    pool: P,
+    wake: Arc<Notify>,
+    ready: oneshot::Sender<()>,
+    cancel: CancellationToken,
+) {
+    let mut conn = match cancel.run_until_cancelled(acquire(&pool)).await {
+        Some(Ok(conn)) => conn,
+        Some(Err(error)) => {
+            tracing::warn!(%error, "LISTEN failed; polling only");
+            return;
+        }
+        None => return,
+    };
+    let subscribe = diesel::sql_query("LISTEN queue_available").execute(&mut *conn);
+    match cancel.run_until_cancelled(subscribe).await {
+        Some(Err(error)) => {
+            tracing::warn!(%error, "LISTEN failed; polling only");
+            return; // a failed LISTEN is not in effect: return the connection as is
+        }
+        None => {} // cut off mid-LISTEN, which may be in effect
+        Some(Ok(_)) => {
+            ready.send(()).ok();
+            let mut stream = std::pin::pin!(conn.notifications_stream());
+            loop {
+                match cancel.run_until_cancelled(stream.next()).await {
+                    Some(Some(Ok(n))) if n.channel == "queue_available" => wake.notify_one(),
+                    Some(Some(Ok(_))) => {}
+                    Some(_) => {
+                        tracing::warn!("LISTEN connection failed; re-listening");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    if let Err(error) = diesel::sql_query("UNLISTEN queue_available")
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!(%error, "UNLISTEN failed");
     }
 }
 
@@ -306,37 +395,22 @@ impl Drop for StoppedOnDrop {
     }
 }
 
-async fn unlisten<C: DerefMut<Target = AsyncPgConnection>>(mut conn: C) {
-    if let Err(error) = diesel::sql_query("UNLISTEN *").execute(&mut *conn).await {
-        tracing::warn!(%error, "UNLISTEN failed");
-    }
-}
-
-/// Wait for a notification (forever without a listener), then drain any already
-/// buffered. `false` when the listening connection has failed.
-async fn notified<C: DerefMut<Target = AsyncPgConnection>>(listener: &mut Option<C>) -> bool {
-    let Some(conn) = listener else {
-        return std::future::pending().await;
-    };
-    let mut stream = std::pin::pin!(conn.notifications_stream());
-    if !matches!(stream.next().await, Some(Ok(_))) {
-        return false;
-    }
-    while let Some(Some(Ok(_))) = stream.next().now_or_never() {}
-    true
-}
-
 /// For each queue with a free permit, in configuration order: claim up to
 /// `min(its free permits, claim_batch_size)` of its due tasks and spawn a dispatch for each.
 /// `None` when any batch was full, else how long to wait: until the next due task in a queue
 /// that still has a free permit, within `MIN_WAIT..=max_poll_interval`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run loop's state, borrowed for one cycle"
+)]
 async fn claim_cycle<P: SchedulerPool>(
     pool: &P,
     registry: &Registry,
-    names: &[String],
+    names: &[TaskName],
     config: &Arc<Config>,
     queues: &[WorkerQueue],
     in_flight: &mut JoinSet<()>,
+    quarantine: &Arc<Semaphore>,
     shutdown: &Shutdown,
 ) -> Result<Option<Duration>, SchedulerError> {
     let mut conn = acquire(pool).await?;
@@ -346,11 +420,14 @@ async fn claim_cycle<P: SchedulerPool>(
             return Ok(Some(config.max_poll_interval));
         }
         let free = queue.permits.available_permits();
-        let Some(want) = NonZeroUsize::new(free.min(config.claim_batch_size.get())) else {
+        // Exact: the `min` with the `u32` batch size bounds the result, so a `free` beyond
+        // `u32` only means the batch size wins.
+        let want = u32::try_from(free).unwrap_or(u32::MAX);
+        let Some(want) = NonZeroU32::new(want.min(config.claim_batch_size.get())) else {
             continue;
         };
         let sent = Instant::now();
-        let claimed = timed(
+        let batch = timed(
             "claim",
             store::claim(
                 &mut conn,
@@ -362,9 +439,11 @@ async fn claim_cycle<P: SchedulerPool>(
             ),
         )
         .await?;
-        let full_batch = claimed.len() == want.get();
-        claimed_any |= !claimed.is_empty();
-        for task in claimed {
+        // Ready rows only: a poisoned row takes no permit, so counting it would loop at once
+        // and spawn a dead-letter task per batch of a poisoned backlog.
+        let full_batch = count(batch.ready.len()) == u64::from(want.get());
+        claimed_any |= !batch.ready.is_empty();
+        for task in batch.ready {
             let name = task.task_name.as_str().to_owned();
             let queue_label = queue.name.as_str().to_owned();
             let latency = (task.claimed_at - task.due_at).to_std().unwrap_or_default();
@@ -379,7 +458,7 @@ async fn claim_cycle<P: SchedulerPool>(
             let handler = registry
                 .get(&task.task_name)
                 .ok_or(SchedulerError::Invariant("claimed a task with no handler"))?;
-            let deadline = sent + config.lease_duration;
+            let deadline = sent + config.lease_duration.get();
             let run = dispatch(
                 pool.clone(),
                 config.clone(),
@@ -395,6 +474,21 @@ async fn claim_cycle<P: SchedulerPool>(
                 *last_finished.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(Instant::now());
             });
+        }
+        // After the dispatches, and never awaited here: a slow dead-letter must not use up the
+        // healthy rows' leases. In `in_flight`, so shutdown drains it like a dispatch. Never
+        // waits for the permit either: that would hold these leases, unbounded.
+        if !batch.poisoned.is_empty() {
+            match quarantine.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    in_flight.spawn(dead_letter(pool.clone(), batch.poisoned, permit));
+                }
+                Err(_) => {
+                    for claim in &batch.poisoned {
+                        tracing::warn!(task_id = claim.task_id.0, reason = %claim.reason, "dead-lettering is busy; the reaper recovers the task after its lease");
+                    }
+                }
+            }
         }
         // A full batch only means "loop now" if this queue can still take more.
         full |= full_batch && queue.permits.available_permits() > 0;
@@ -421,12 +515,38 @@ async fn claim_cycle<P: SchedulerPool>(
     }))
 }
 
-/// Publish health. `fresh` is whether `error` happened in this cycle; a standing error
-/// carried over from an earlier cycle (a failed materialization) does not count again.
+/// Dead-letter rows the claim could not convert, on a connection of their own, holding
+/// `_permit` until done. A row this misses stays `running` until the reaper requeues it, and
+/// the next claim poisons it again.
+async fn dead_letter<P: SchedulerPool>(
+    pool: P,
+    poisoned: Vec<PoisonedClaim>,
+    _permit: OwnedSemaphorePermit,
+) {
+    for claim in &poisoned {
+        tracing::error!(task_id = claim.task_id.0, reason = %claim.reason, "claimed task is unusable; marking it dead");
+    }
+    let mut conn = match acquire(&pool).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::error!(%error, "could not dead-letter the tasks; skipping them");
+            return;
+        }
+    };
+    for claim in &poisoned {
+        if let Err(error) = timed("fail", store::dead_letter(&mut conn, claim)).await {
+            tracing::error!(task_id = claim.task_id.0, %error, "could not dead-letter the task; skipping it");
+        }
+    }
+}
+
+/// Publish health: `error` is the last claim cycle's, else the materializer's last run's.
+/// `fresh` is whether a failure happened since the last report; a standing error carried over
+/// (a failed materializer run, or a failed cycle beside a materializer run) does not count again.
 fn report(
     health: &watch::Sender<WorkerHealth>,
     failures: &mut u64,
-    error: Option<&SchedulerError>,
+    error: Option<&str>,
     fresh: bool,
 ) {
     *failures = match (error, fresh) {
@@ -440,7 +560,7 @@ fn report(
             None => HealthStatus::Healthy,
         },
         consecutive_failures: *failures,
-        last_error: error.map(ToString::to_string),
+        last_error: error.map(str::to_owned),
     };
     health.send_if_modified(|h| {
         let changed = *h != next;
@@ -473,13 +593,26 @@ fn dispatch<P: SchedulerPool>(
         task_key = task.task_key.as_str(),
         task_name = task.task_name.as_str(),
         queue = task.queue.as_str(),
-        attempt_no = task.lease.attempt_no,
+        attempt_no = task.lease.attempt_no.get(),
         worker_id = config.worker_id.as_str(),
         lock_token = task.lease.lock_token.0,
     );
     async move {
         let _permit = permit;
         let name = task.task_name.as_str().to_owned();
+        // A slow claim response can arrive after the lease it claimed; never start external
+        // work on it. The reaper recovers the task.
+        if Instant::now() >= deadline {
+            metrics::counter!("pg_task_scheduler_leases_lost_total", "task_name" => name)
+                .increment(1);
+            tracing::warn!("claim arrived after its lease; handler not started");
+            return;
+        }
+        // Cancelled when the lease keeper gives up, and by the guard however dispatch ends
+        // (finished, released, or dropped with the scheduler), so a heartbeat still in flight
+        // renews nothing. Not a child of `shutdown.begun`: draining handlers keep their leases.
+        let lease_stop = CancellationToken::new();
+        let _stop_heartbeats = lease_stop.clone().drop_guard();
         // Cancelled when shutdown begins, and by the guard however dispatch ends: lease lost,
         // finished, released, or aborted.
         let cancellation = shutdown.begun.child_token();
@@ -495,23 +628,13 @@ fn dispatch<P: SchedulerPool>(
         let started = Instant::now();
         // The lease keeper is its own future, not a select! arm body: a DB-contained
         // handler holding the row lock must keep being polled while a heartbeat waits.
+        // It is polled before the handler (and so is forced-shutdown expiry): a handler
+        // suspended past the local deadline must be dropped, not resumed for one more segment.
         let result = tokio::select! {
             biased;
-            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
-                Ok(result) => result,
-                // Not finalized: the attempt stays open and the reaper recovers the task.
-                Err(panic) => {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("non-string panic payload");
-                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
-                    return;
-                }
-            },
-            () = keep_lease(&pool, &task.lease, &config, &name, deadline) => {
+            () = keep_lease(&pool, &task.lease, &config, &name, deadline, &lease_stop) => {
                 drop(cancel_on_drop); // cancel now, not after the check below
+                lease_stop.cancel(); // and end any heartbeat still in flight
                 // A DB-contained handler may have committed its own completion while a
                 // heartbeat waited on the row lock, or an operator cancelled the task; the
                 // heartbeat then matches no row. Bounded, so a database outage cannot hold
@@ -533,6 +656,19 @@ fn dispatch<P: SchedulerPool>(
                 release(&pool, &task.lease, name).await;
                 return;
             }
+            result = AssertUnwindSafe(handler(ctx, task.payload)).catch_unwind() => match result {
+                Ok(result) => result,
+                // Not finalized: the attempt stays open and the reaper recovers the task.
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    tracing::error!(panic = message, "handler panicked; the reaper recovers its task after the lease");
+                    return;
+                }
+            },
         };
         metrics::histogram!("pg_task_scheduler_task_duration_seconds", "task_name" => name.clone())
             .record(started.elapsed());
@@ -545,36 +681,53 @@ fn dispatch<P: SchedulerPool>(
 /// Heartbeat every `heartbeat_interval`; returns only once ownership is lost: a heartbeat
 /// matched no row, or the local deadline (claim send + lease, advanced by each successful
 /// heartbeat) passed. The deadline only gives up early; PostgreSQL decides validity.
+/// `stop` is the dispatch's: a heartbeat spawned before the dispatch ended renews nothing.
 async fn keep_lease<P: SchedulerPool>(
     pool: &P,
     lease: &TaskLease,
     config: &Config,
     name: &str,
     mut deadline: Instant,
+    stop: &CancellationToken,
 ) {
     loop {
         tokio::time::sleep_until((Instant::now() + config.heartbeat_interval).min(deadline)).await;
         let sent = Instant::now();
+        // A beat started now could not be awaited, and could renew after this keeper is gone.
+        if sent >= deadline {
+            return;
+        }
         let beat = tokio::time::timeout_at(deadline, async {
             let mut conn = acquire(pool).await?;
-            timed(
-                "heartbeat",
-                store::heartbeat(&mut conn, lease, config.lease_duration),
-            )
+            // The pool wait may have used up the lease; never spawn a beat with no time left.
+            let Some(lock_wait) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                return Ok(None);
+            };
+            // Only the transaction is spawned, so a dropped keep_lease (handler finished,
+            // deadline, scheduler dropped) cannot abandon it mid-flight holding the row lock:
+            // dropping a JoinHandle does not cancel the task. Each of its statements runs for
+            // at most `lock_wait`, and it renews nothing once `stop` fires.
+            let (lease, duration, stop) = (lease.clone(), config.lease_duration, stop.clone());
+            tokio::spawn(async move {
+                let query = store::heartbeat_bounded(&mut conn, &lease, duration, lock_wait, &stop);
+                timed("heartbeat", query).await
+            })
             .await
+            .map_err(|_| SchedulerError::Invariant("heartbeat task panicked"))?
+            .map(Some)
         })
         .await;
         match beat {
-            Ok(Ok(_)) => deadline = sent + config.lease_duration,
-            Ok(Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
+            Ok(Ok(Some(_))) => deadline = sent + config.lease_duration.get(),
+            Ok(Ok(None) | Err(SchedulerError::LostOwnership(_))) | Err(_) => return,
             Ok(Err(error)) => {
                 metrics::counter!("pg_task_scheduler_heartbeat_failures_total", "task_name" => name.to_owned())
                     .increment(1);
                 tracing::warn!(%error, "heartbeat failed");
             }
-        }
-        if Instant::now() >= deadline {
-            return;
         }
     }
 }
@@ -599,9 +752,18 @@ async fn finish<P: SchedulerPool>(
             return;
         }
     };
+    let owned = lease.clone();
     let error = match result {
         Ok(()) => {
-            match timed("complete", store::complete(&mut conn, lease)).await {
+            let Some((mut conn, completed)) = spawned(async move {
+                let completed = timed("complete", store::complete(&mut conn, &owned)).await;
+                (conn, completed)
+            })
+            .await
+            else {
+                return;
+            };
+            match completed {
                 Ok(()) => {
                     metrics::counter!("pg_task_scheduler_tasks_done_total", "task_name" => name)
                         .increment(1);
@@ -618,20 +780,34 @@ async fn finish<P: SchedulerPool>(
         Err(error) => error,
     };
     let message = error.to_string();
-    let (classification, outcome) = if error.is_retryable() {
+    let delay = error.is_retryable().then(|| {
         let random = uuid::Uuid::new_v4().as_u64_pair().0;
-        let delay = retry_delay(
+        retry_delay(
             lease.attempt_no,
             config.base_retry_delay,
             config.max_retry_delay,
             config.retry_jitter,
             random,
-        );
-        let outcome = timed("retry", store::retry(&mut conn, lease, &message, delay)).await;
-        ("retryable", outcome)
+        )
+    });
+    let classification = if delay.is_some() {
+        "retryable"
     } else {
-        let outcome = timed("fail", store::fail_permanently(&mut conn, lease, &message)).await;
-        ("permanent", outcome.map(|()| RetryOutcome::Dead))
+        "permanent"
+    };
+    let text = message.clone();
+    let Some((mut conn, outcome)) = spawned(async move {
+        let outcome = match delay {
+            Some(delay) => timed("retry", store::retry(&mut conn, &owned, &text, delay)).await,
+            None => timed("fail", store::fail_permanently(&mut conn, &owned, &text))
+                .await
+                .map(|()| RetryOutcome::Dead),
+        };
+        (conn, outcome)
+    })
+    .await
+    else {
+        return;
     };
     match outcome {
         Ok(RetryOutcome::Queued { due_at }) => {
@@ -657,15 +833,26 @@ async fn finish<P: SchedulerPool>(
 /// `running` until the reaper recovers it after the lease, and that attempt counts.
 async fn release<P: SchedulerPool>(pool: &P, lease: &TaskLease, name: String) {
     let released = match acquire(pool).await {
-        Ok(mut conn) => match timed("release", store::release(&mut conn, lease)).await {
-            Err(SchedulerError::LostOwnership(_)) => {
-                if !ended_elsewhere(&mut conn, lease, &name).await {
-                    tracing::warn!("lost ownership before release");
-                }
+        Ok(mut conn) => {
+            let owned = lease.clone();
+            let Some((mut conn, released)) = spawned(async move {
+                let released = timed("release", store::release(&mut conn, &owned)).await;
+                (conn, released)
+            })
+            .await
+            else {
                 return;
+            };
+            match released {
+                Err(SchedulerError::LostOwnership(_)) => {
+                    if !ended_elsewhere(&mut conn, lease, &name).await {
+                        tracing::warn!("lost ownership before release");
+                    }
+                    return;
+                }
+                released => released,
             }
-            released => released,
-        },
+        }
         Err(error) => Err(error),
     };
     match released {
@@ -678,6 +865,21 @@ async fn release<P: SchedulerPool>(pool: &P, lease: &TaskLease, name: String) {
             tracing::error!(%error, "release failed; the reaper recovers the task after the lease");
         }
     }
+}
+
+/// Run a finalizing transition on its own task, which owns the connection and hands it back with
+/// the result. As with `keep_lease`'s heartbeats, dropping this future (shutdown's abort) does
+/// not cancel that task, so the transaction always commits or rolls back; `BOUND` limits each
+/// of its statements by the lease left. `None` if the task panicked.
+async fn spawned<C, T>(transition: impl Future<Output = (C, T)> + Send + 'static) -> Option<(C, T)>
+where
+    C: Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(transition)
+        .await
+        .inspect_err(|error| tracing::error!(%error, "finalizing transition task panicked"))
+        .ok()
 }
 
 /// After a heartbeat or transition matched no row: if the task under this lease was completed
@@ -727,10 +929,6 @@ async fn maintenance_pass<P: SchedulerPool>(
     config: &Config,
 ) -> Result<(), SchedulerError> {
     let mut conn = acquire(pool).await?;
-    if let Err(error) = store::prune_workers(&mut conn).await {
-        registry_failed(&error);
-    }
-    let batch = config.retention.batch_size.get();
     let mut cleaning = true;
     loop {
         let reaped = timed(
@@ -747,25 +945,26 @@ async fn maintenance_pass<P: SchedulerPool>(
         if cleaning {
             let deleted = timed("cleanup", store::cleanup(&mut conn, &config.retention)).await?;
             metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "task")
-                .increment(count(deleted.tasks));
+                .increment(count(deleted.tasks()));
             metrics::counter!("pg_task_scheduler_cleanup_deleted_total", "kind" => "outbox")
                 .increment(count(deleted.outbox));
-            cleaning = deleted.tasks >= batch || deleted.outbox >= batch;
+            cleaning = deleted.any_full(config.retention.batch_size);
         }
-        if n < config.reaper_batch_size.get() && !cleaning {
+        if count(n) < u64::from(config.reaper_batch_size.get()) && !cleaning {
             return Ok(());
         }
     }
 }
 
-/// Keep this worker's display-only registry row (§5.2): upsert at once and every
-/// `registry_interval`. When `cancel` fires, write `stopping` once, within
-/// `REGISTRY_SHUTDOWN_TIMEOUT`, and return. Every other await races `cancel`, so a stalled
-/// pool never holds shutdown.
+/// Keep this worker's display-only registry row (docs/AdminUI.md §6.7): upsert at once and every
+/// `registry_interval`, each time then pruning rows not written for 24 h. Here, not in
+/// maintenance, so a lock on the registry never delays a reap. When `cancel` fires, write
+/// `stopping` once, within `REGISTRY_SHUTDOWN_TIMEOUT`, and return. Every other await races
+/// `cancel`, so a stalled pool never holds shutdown.
 async fn keep_registered<P: SchedulerPool>(
     pool: P,
     config: Arc<Config>,
-    task_names: Vec<String>,
+    task_names: Vec<TaskName>,
     queues: Vec<WorkerQueue>,
     health: watch::Receiver<WorkerHealth>,
     cancel: CancellationToken,
@@ -807,13 +1006,15 @@ async fn keep_registered<P: SchedulerPool>(
         let mut conn = acquire(&pool).await?;
         store::upsert_worker(&mut conn, &reg).await
     };
+    let refresh = async || {
+        let mut conn = acquire(&pool).await?;
+        store::upsert_worker(&mut conn, &registration(false)).await?;
+        store::prune_workers(&mut conn).await.map(drop)
+    };
     let mut tick = tokio::time::interval(config.registry_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     while cancel.run_until_cancelled(tick.tick()).await.is_some() {
-        if let Some(Err(error)) = cancel
-            .run_until_cancelled(upsert(registration(false)))
-            .await
-        {
+        if let Some(Err(error)) = cancel.run_until_cancelled(refresh()).await {
             registry_failed(&error);
         }
     }
@@ -835,22 +1036,24 @@ fn registry_failed(error: &dyn std::fmt::Display) {
     tracing::warn!(%error, "worker registry write failed");
 }
 
-/// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)` (§11.2). Saturates
-/// rather than overflowing for any `attempt_no`.
+/// `min(base · 2^(attempt_no − 1), max) + random % (jitter + 1 ns)`, computed exactly for
+/// any `attempt_no`.
 pub(crate) fn retry_delay(
-    attempt_no: i32,
+    attempt_no: AttemptNo,
     base: Duration,
     max: Duration,
     jitter: Duration,
     random: u64,
 ) -> Duration {
-    let doublings = attempt_no.saturating_sub(1).clamp(0, 31).unsigned_abs();
+    // 2^127 ns exceeds the 5-year duration cap, so clamping the count never changes the
+    // capped result; saturation is likewise absorbed by the `max` cap.
+    let doublings = (attempt_no.get() - 1).min(127);
+    let nanos = base.as_nanos().saturating_mul(1u128 << doublings);
+    let nanos = nanos.min(max.as_nanos());
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
-    base.saturating_mul(1 << doublings)
-        .min(max)
-        .saturating_add(Duration::from_nanos(
-            random % jitter_nanos.saturating_add(1),
-        ))
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).saturating_add(
+        Duration::from_nanos(random % jitter_nanos.saturating_add(1)),
+    )
 }
 
 #[cfg(test)]
@@ -858,27 +1061,56 @@ mod tests {
     use std::time::Duration;
 
     use super::retry_delay;
+    use crate::AttemptNo;
+
+    fn n(v: u32) -> AttemptNo {
+        AttemptNo::try_from(v).unwrap()
+    }
 
     const BASE: Duration = Duration::from_secs(1);
     const MAX: Duration = Duration::from_secs(300);
 
     #[test]
     fn retry_delay_doubles_from_base() {
-        assert_eq!(retry_delay(1, BASE, MAX, Duration::ZERO, 0), BASE);
-        assert_eq!(retry_delay(3, BASE, MAX, Duration::ZERO, 0), 4 * BASE);
+        assert_eq!(retry_delay(n(1), BASE, MAX, Duration::ZERO, 0), BASE);
+        assert_eq!(retry_delay(n(3), BASE, MAX, Duration::ZERO, 0), 4 * BASE);
+    }
+
+    #[test]
+    fn retry_delay_first_attempt_is_base() {
+        assert_eq!(
+            retry_delay(AttemptNo::FIRST, BASE, MAX, Duration::ZERO, 0),
+            BASE
+        );
     }
 
     #[test]
     fn retry_delay_saturates_at_max() {
-        assert_eq!(retry_delay(i32::MAX, BASE, MAX, Duration::ZERO, 0), MAX);
-        assert_eq!(retry_delay(0, BASE, MAX, Duration::ZERO, 0), BASE);
+        assert_eq!(
+            retry_delay(n(i32::MAX.unsigned_abs()), BASE, MAX, Duration::ZERO, 0),
+            MAX
+        );
+    }
+
+    #[test]
+    fn retry_delay_keeps_doubling_past_attempt_32() {
+        let ns = Duration::from_nanos(1);
+        assert_eq!(
+            retry_delay(n(34), ns, MAX, Duration::ZERO, 0),
+            Duration::from_nanos(1 << 33)
+        );
+        assert_eq!(retry_delay(n(40), ns, MAX, Duration::ZERO, 0), MAX);
+        assert_eq!(
+            retry_delay(n(i32::MAX.unsigned_abs()), ns, MAX, Duration::ZERO, 0),
+            MAX
+        );
     }
 
     #[test]
     fn retry_delay_jitter_is_bounded() {
         let jitter = Duration::from_millis(500);
-        let d = retry_delay(1, BASE, MAX, jitter, u64::MAX);
+        let d = retry_delay(n(1), BASE, MAX, jitter, u64::MAX);
         assert!((BASE..=BASE + jitter).contains(&d), "{d:?}");
-        assert_eq!(retry_delay(1, BASE, MAX, jitter, 0), BASE);
+        assert_eq!(retry_delay(n(1), BASE, MAX, jitter, 0), BASE);
     }
 }

@@ -5,16 +5,23 @@
 <h2>Bulk result</h2>
 <div class="body">
 <p id="bulk-result">{{ affected }} {{ verb }}</p>
-{% if more %}
-<p>More tasks match.</p>
+{% if budget_spent %}
+<p>More tasks may match.</p>
+<form class="continue" method="post" action="{{ base }}/bulk">
+  <input type="hidden" name="action_id" value="{{ action_id }}">
+  <button type="submit">Continue</button>
+</form>
+{% else %}
+<p>Finished, or some rows were locked by other work and skipped; run again to catch them.</p>
 <form class="continue" method="post" action="{{ base }}/bulk">
   <input type="hidden" name="action" value="{{ p.action }}">
   <input type="hidden" name="task_name" value="{{ p.task_name }}">
   <input type="hidden" name="queue" value="{{ p.queue }}">
-  <input type="hidden" name="error" value="{{ p.error }}">
+  {% if let Some(f) = p.error_filter %}<input type="hidden" name="error_filter" value="{{ f }}">{% endif %}
+  {% if let Some(e) = p.error %}<input type="hidden" name="error" value="{{ e }}">{% endif %}
   <input type="hidden" name="confirm_name" value="{{ p.confirm_name }}">
   <input type="hidden" name="reason" value="{{ p.reason }}">
-  <button type="submit">Continue</button>
+  <button type="submit">Run again</button>
 </form>
 {% endif %}
 <p><a href="{{ base }}/overview">Back to overview</a></p>

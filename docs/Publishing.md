@@ -131,8 +131,14 @@ it was a judgement call made during the work, open to change.
   dependencies need at most 1.86 (Diesel). The workspace was checked with 1.88,
   and failed to build with 1.87.
 - **Expected behaviour:** Cargo reports a clear error on an older toolchain.
-  CI builds only on nightly, so a newer language feature could raise the real
-  minimum without anyone noticing.
+  CI's `msrv` job runs `cargo +1.88 check --workspace --all-features --locked`,
+  so a newer language feature in either crate, or a locked dependency that
+  needs a newer Rust, fails CI. That job only checks: it runs no tests or
+  clippy on 1.88, and does not cover the example app. CI's other cargo builds,
+  clippy runs and tests use the toolchain pinned in `rust-toolchain.toml`
+  (1.100.0), against PostgreSQL 13 and 18; only the format check uses nightly.
+- **Changed by review 02:** no CI job ran on 1.88
+  ([Review decisions, entry 32](ReviewDecisions.md#32-ci-checks-the-minimum-rust-and-postgresql-18)).
 
 ### 11. First release is plain `0.1.0`
 
@@ -147,22 +153,96 @@ it was a judgement call made during the work, open to change.
 - **Source:** call.
 - **Decision:** These notes came out of the READMEs, because no published
   version has ever lacked `0003`:
-  - "Upgrading to `0003`";
+  - how to upgrade to `0003`;
   - behaviour of workers from before `0003`;
-  - `queue_task_replays`;
+  - the replay audit table that `0003` used to replace;
   - the core crate's former `axum` feature.
-- **Expected behaviour:** The upgrade notes stay in git history and in
-  [Admin UI decisions](AdminUI.md).
+
+  Later, review 01 edited `0001`–`0003` in place, so the first release has no
+  schema history at all
+  ([Review decisions, entry 17](ReviewDecisions.md#17-the-migrations-were-edited-in-place)).
+- **Expected behaviour:** The old upgrade notes survive only as history, in git
+  and in section 9 of [Admin UI decisions](AdminUI.md#9-upgrade), which is
+  marked superseded. A database built by an unreleased version must be dropped
+  and recreated; there is no upgrade path from it.
 
 ## Release steps
 
 1. Check that the core crate packages and builds from its packaged sources:
    `cargo publish --dry-run -p pg_task_scheduler`.
-2. Publish it: `cargo publish -p pg_task_scheduler`.
+2. Check a fresh consumer against the packaged crate:
+   1. unpack the `.crate` that `cargo package -p pg_task_scheduler` writes into
+      a scratch directory;
+   2. create a consumer crate (edition 2024) that depends on it by path, with
+      exactly the README's Install dependencies (the harness needs no more) and
+      a freshly resolved lockfile
+      (`cargo +1.88 generate-lockfile`);
+   3. put the samples in `src/enqueue.rs` (the Enqueue sample's code block) and
+      `src/worker.rs` (the Worker sample's), each with the leading `# ` stripped
+      from the hidden lines and nothing else changed, and the harness below in
+      `src/main.rs`. Build on Rust 1.88;
+   4. against PostgreSQL 13, create a scratch schema and apply the packaged
+      migrations to it (`0001` and `0003`, plus `0002` with `cron`), then run
+      `DATABASE_URL=postgres://... SCHEMA=<scratch> cargo +1.88 run`. It
+      enqueues one task, runs the Worker sample's scheduler until the task is
+      `done` (30 s at most), prints the status and exits non-zero if it is not
+      `done`. Drop the schema afterwards.
+
+   ```rust,ignore
+   use diesel::{QueryableByName, sql_query, sql_types::Text};
+   use diesel_async::pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool};
+   use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+   use std::time::Duration;
+
+   mod enqueue;
+   mod worker;
+
+   #[derive(QueryableByName)]
+   struct Row {
+       #[diesel(sql_type = Text)]
+       status: String,
+   }
+
+   #[tokio::main]
+   async fn main() -> Result<(), Box<dyn std::error::Error>> {
+       let url = std::env::var("DATABASE_URL")?;
+       let schema = std::env::var("SCHEMA")?;
+       let url = format!("{url}?options=-c%20search_path%3D{schema}");
+       let mut conn = AsyncPgConnection::establish(&url).await?;
+       enqueue::example(&mut conn, uuid::Uuid::new_v4()).await?;
+       let pool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(url))
+           .max_size(24)
+           .build()?;
+       let status = async {
+           loop {
+               let rows: Vec<Row> = sql_query("SELECT status FROM queue_tasks")
+                   .load(&mut conn)
+                   .await?;
+               let status = rows.into_iter().next().map(|r| r.status).unwrap_or_default();
+               if status == "done" {
+                   return Ok::<_, Box<dyn std::error::Error>>(status);
+               }
+               tokio::time::sleep(Duration::from_millis(100)).await;
+           }
+       };
+       // Dropping the worker's future when the select ends cancels it.
+       let status = tokio::select! {
+           r = worker::example(pool) => { r?; String::from("worker stopped early") }
+           s = status => s?,
+           () = tokio::time::sleep(Duration::from_secs(30)) => String::from("timeout"),
+       };
+       println!("task status: {status}");
+       if status != "done" {
+           std::process::exit(1);
+       }
+       Ok(())
+   }
+   ```
 3. Tag the release and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
    The README's migrations link and both READMEs' git instructions for the
-   admin crate point at it.
-4. For the next release, bump:
+   admin crate point at it, so they work on release day.
+4. Publish it: `cargo publish -p pg_task_scheduler`.
+5. For the next release, bump:
    - both crates' `version`;
    - the admin crate's `pg_task_scheduler` dependency version;
    - every `v0.1.0` in `README.md` and `admin/README.md`.

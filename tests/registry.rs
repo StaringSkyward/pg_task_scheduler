@@ -1,5 +1,6 @@
 mod common;
 
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use chrono::Utc;
 use common::TestDb;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::HealthStatus;
@@ -19,6 +21,7 @@ use pg_task_scheduler::SchedulerBuilder;
 use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskName;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::WorkerId;
 use pg_task_scheduler::enqueue;
@@ -124,13 +127,13 @@ async fn done(db: &TestDb, id: TaskId) {
     loop {
         let mut conn = db.pool.get().await.unwrap();
         let task = store::task(&mut conn, id).await.unwrap().unwrap();
-        if task.status == TaskStatus::Done {
+        if task.state.status() == TaskStatus::Done {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "task {id:?} not done: {:?}",
-            task.status
+            task.state
         );
         tokio::time::sleep(ms(20)).await;
     }
@@ -178,14 +181,14 @@ async fn worker_registers_queues_and_task_names() {
         "{:?}",
         w.status
     );
-    assert_eq!(w.queues, vec![queue("default", 2), queue("bulk", 1)]);
-    let mut names = w.task_names.clone();
-    names.sort();
+    assert_eq!(w.queues, vec![queue("bulk", 1), queue("default", 2)]);
+    let mut names: Vec<&str> = w.task_names.iter().map(TaskName::as_str).collect();
+    names.sort_unstable();
     assert_eq!(names, ["job", "report"]);
     assert!(!w.lost);
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     db.cleanup().await;
 }
 
@@ -208,20 +211,20 @@ async fn registry_reports_last_finished_and_paused() {
 
     let rows = eventually(&db, Duration::from_secs(1), |rows| {
         rows.first()
-            .is_some_and(|w| w.queues[0].last_finished_at.is_some() && w.queues[1].paused)
+            .is_some_and(|w| w.queues[1].last_finished_at.is_some() && w.queues[0].paused)
     })
     .await;
-    let finished = rows[0].queues[0].last_finished_at.unwrap();
+    let finished = rows[0].queues[1].last_finished_at.unwrap();
     let skew = (db_now(&db).await - finished).abs();
     assert!(
         skew < chrono::Duration::seconds(5),
         "{finished} is {skew} from now()"
     );
-    assert!(!rows[0].queues[0].paused);
-    assert_eq!(rows[0].queues[1].last_finished_at, None);
+    assert!(!rows[0].queues[1].paused);
+    assert_eq!(rows[0].queues[0].last_finished_at, None);
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     db.cleanup().await;
 }
 
@@ -252,10 +255,10 @@ async fn worker_row_stopping_during_drain_then_removed() {
             .is_some_and(|w| w.status == WorkerStatus::Stopping)
     })
     .await;
-    assert_eq!(rows[0].queues[0].in_use, 1, "drain still running");
+    assert_eq!(rows[0].queues[1].in_use, 1, "drain still running");
 
     release.notify_one();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     assert!(workers(&db).await.is_empty());
     db.cleanup().await;
 }
@@ -275,17 +278,17 @@ async fn lost_and_pruned_workers() {
             in_use: 1,
             finished_ago: Some(Duration::from_secs(3)),
         }],
-        task_names: vec!["job".into()],
+        task_names: vec![TaskName::try_from("job").unwrap()],
         lost_after: Duration::from_secs(45),
     };
     store::upsert_worker(&mut conn, &live).await.unwrap();
     diesel::sql_query(
         "INSERT INTO queue_workers \
-             (worker_id, label, last_seen_at, lost_after, status, queues, task_names) \
+             (worker_id, label, last_seen_at, lost_after, status) \
          VALUES ('quiet', 'a', now() - interval '1 minute', now() - interval '1 second', \
-                 'healthy', '[]', '{}'), \
+                 'healthy'), \
                 ('gone', 'b', now() - interval '25 hours', now() - interval '24 hours', \
-                 'stopping', '[]', '{}')",
+                 'stopping')",
     )
     .execute(&mut conn)
     .await
@@ -338,7 +341,7 @@ async fn registry_failure_does_not_stop_claiming() {
     eventually(&db, Duration::from_secs(1), |rows| !rows.is_empty()).await;
 
     let mut conn = db.pool.get().await.unwrap();
-    diesel::sql_query("DROP TABLE queue_workers")
+    diesel::sql_query("DROP TABLE queue_workers CASCADE")
         .execute(&mut conn)
         .await
         .unwrap();
@@ -350,6 +353,143 @@ async fn registry_failure_does_not_stop_claiming() {
     assert_eq!(health.borrow().status, HealthStatus::Healthy);
 
     cancel.cancel();
-    handle.await.unwrap().unwrap(); // the failed remove is logged, not returned
+    handle.await.unwrap(); // the failed remove is logged, not returned
+    db.cleanup().await;
+}
+
+fn registration(queues: &[&str], task_names: &[&str]) -> WorkerRegistration {
+    WorkerRegistration {
+        worker_id: WorkerId::generate(),
+        label: None,
+        status: WorkerStatus::Healthy,
+        last_error: None,
+        queues: queues
+            .iter()
+            .map(|n| QueueSlots {
+                name: q(n),
+                limit: 4,
+                in_use: 0,
+                finished_ago: None,
+            })
+            .collect(),
+        task_names: task_names
+            .iter()
+            .map(|n| TaskName::try_from(*n).unwrap())
+            .collect(),
+        lost_after: Duration::from_secs(30),
+    }
+}
+
+#[tokio::test]
+async fn reregistering_with_fewer_queues_drops_the_old_ones() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let mut reg = registration(&["a", "b"], &["job"]);
+    store::upsert_worker(&mut conn, &reg).await.unwrap();
+    reg.queues.truncate(1);
+    store::upsert_worker(&mut conn, &reg).await.unwrap();
+    let w = &store::workers(&mut conn).await.unwrap()[0];
+    let names: Vec<&str> = w.queues.iter().map(|q| q.name.as_str()).collect();
+    assert_eq!(names, ["a"]);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn paused_is_read_when_listed() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    store::upsert_worker(&mut conn, &registration(&["a"], &["job"]))
+        .await
+        .unwrap();
+    assert!(
+        store::pause_queue(&mut conn, &q("a"), "op", "r")
+            .await
+            .unwrap()
+    );
+    assert!(store::workers(&mut conn).await.unwrap()[0].queues[0].paused);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn removing_a_worker_removes_its_queues_and_names() {
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    let reg = registration(&["a"], &["job"]);
+    store::upsert_worker(&mut conn, &reg).await.unwrap();
+    store::remove_worker(&mut conn, &reg.worker_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.scalar(
+            "SELECT (SELECT count(*) FROM queue_worker_queues) \
+                  + (SELECT count(*) FROM queue_worker_task_names) AS n"
+        )
+        .await,
+        0
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn workers_reads_consistently_inside_a_read_committed_transaction() {
+    use diesel_async::AsyncConnection;
+    let db = TestDb::new().await;
+    let mut conn = db.pool.get().await.unwrap();
+    store::upsert_worker(&mut conn, &registration(&["b", "a"], &["job"]))
+        .await
+        .unwrap();
+    let ws = conn
+        .transaction::<_, pg_task_scheduler::SchedulerError, _>(async |c| store::workers(c).await)
+        .await
+        .unwrap();
+    let names: Vec<&str> = ws[0].queues.iter().map(|q| q.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    let tasks: Vec<&str> = ws[0].task_names.iter().map(TaskName::as_str).collect();
+    assert_eq!(tasks, ["job"]);
+    db.cleanup().await;
+}
+
+/// A held lock on the registry stalls only the registry task: the reaper never waits on it.
+#[tokio::test]
+async fn a_locked_registry_does_not_delay_reaping() {
+    let db = TestDb::new().await;
+    let id = add(&db, "k").await;
+    let mut conn = db.pool.get().await.unwrap();
+    let claimed = store::claim(
+        &mut conn,
+        &WorkerId::generate(),
+        &q("default"),
+        &[TaskName::try_from("job").unwrap()],
+        NonZeroU32::MIN,
+        common::lease(Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.ready.len(), 1);
+    drop(conn);
+    db.expire_lease(id).await;
+    let mut lock = db.lock_table("queue_workers").await;
+    let scheduler = worker(&db, || async {})
+        .reaper_interval(ms(100))
+        .crash_retry_delay(Duration::from_secs(3600)) // keep the reaped task queued
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut conn = db.pool.get().await.unwrap();
+        let task = store::task(&mut conn, id).await.unwrap().unwrap();
+        if task.state.status() == TaskStatus::Queued {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not reaped: {:?}", task.state);
+        tokio::time::sleep(ms(20)).await;
+    }
+
+    lock.batch_execute("COMMIT").await.unwrap();
+    cancel.cancel();
+    handle.await.unwrap();
     db.cleanup().await;
 }

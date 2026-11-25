@@ -66,6 +66,7 @@
   .db .empty { padding: 12px 16px; margin: 0; }
   .pending { color: var(--pending); }
   .published { color: var(--ok); }
+  .rejected { color: var(--error); }
   footer { color: var(--muted); font-size: 13px; margin-top: 16px; }
 </style>
 </head>
@@ -166,8 +167,8 @@
       <table>
         <tr><th>topic</th><th>for</th><th>state</th></tr>
         {% for m in panel.outbox %}
-        <tr><td>{{ m.topic }}</td><td>{% if let Some(id) = m.order_id %}order #{{ id }}{% endif %}</td>
-        {% if let Some(t) = m.published_at %}<td class="published">published {{ t.format("%H:%M:%S") }} UTC</td>{% else %}<td class="pending">pending</td>{% endif %}</tr>
+        <tr><td>{{ m.topic }}</td><td>{% if let Some(id) = m.order_id %}order #{{ id }}{% else %}—{% endif %}</td>
+        {% if let Some(t) = m.published_at %}<td class="published">published {{ t.format("%H:%M:%S") }} UTC</td>{% else if m.rejected %}<td class="rejected">rejected</td>{% else %}<td class="pending">pending</td>{% endif %}</tr>
         {% endfor %}
       </table>
     </div>

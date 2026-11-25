@@ -11,6 +11,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 use pg_task_scheduler::AttemptOutcome;
+use pg_task_scheduler::AttemptState;
 use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::Scheduler;
 use pg_task_scheduler::SchedulerError;
@@ -18,6 +19,7 @@ use pg_task_scheduler::Task;
 use pg_task_scheduler::TaskError;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
+use pg_task_scheduler::TaskState;
 use pg_task_scheduler::TaskStatus;
 use pg_task_scheduler::TaskView;
 use pg_task_scheduler::enqueue;
@@ -66,7 +68,7 @@ async fn outcomes(db: &TestDb, id: TaskId) -> Vec<Option<AttemptOutcome>> {
         .await
         .unwrap()
         .into_iter()
-        .map(|a| a.outcome)
+        .map(|a| common::outcome(&a))
         .collect()
 }
 
@@ -74,7 +76,7 @@ async fn outcomes(db: &TestDb, id: TaskId) -> Vec<Option<AttemptOutcome>> {
 async fn run_until_started(
     scheduler: Scheduler<Pool<AsyncPgConnection>>,
     started: &Notify,
-) -> (CancellationToken, JoinHandle<Result<(), SchedulerError>>) {
+) -> (CancellationToken, JoinHandle<()>) {
     let cancel = CancellationToken::new();
     let handle = tokio::spawn(scheduler.run_until_shutdown(cancel.clone()));
     tokio::time::timeout(Duration::from_secs(10), started.notified())
@@ -130,7 +132,7 @@ async fn shutdown_cancels_in_flight_handler_no_detach() {
         .expect("handler should start within 10s");
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
 
     // Wait past the handler's full sleep. A detached handler would have set AFTER
     // by now; a cancelled one never will.
@@ -184,13 +186,17 @@ async fn panicking_handler_is_not_finalized_and_is_recoverable() {
     let mut conn = db.pool.get().await.unwrap();
     let task = store::task(&mut conn, id).await.unwrap().unwrap();
     assert_eq!(
-        task.status,
+        task.state.status(),
         TaskStatus::Running,
         "panicked task must stay running"
     );
     let attempts = store::attempts(&mut conn, id).await.unwrap();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].outcome, None, "attempt must stay open");
+    assert_eq!(
+        attempts[0].state,
+        AttemptState::Open,
+        "attempt must stay open"
+    );
     drop(conn);
 
     // The reaper recovers it after the lease.
@@ -198,7 +204,7 @@ async fn panicking_handler_is_not_finalized_and_is_recoverable() {
     let task = loop {
         let mut conn = db.pool.get().await.unwrap();
         let task = store::task(&mut conn, id).await.unwrap().unwrap();
-        if task.status == TaskStatus::Queued {
+        if task.state.status() == TaskStatus::Queued {
             break task;
         }
         assert!(
@@ -211,11 +217,14 @@ async fn panicking_handler_is_not_finalized_and_is_recoverable() {
     assert_eq!(task.last_error.as_deref(), Some("worker lease expired"));
     let mut conn = db.pool.get().await.unwrap();
     let attempts = store::attempts(&mut conn, id).await.unwrap();
-    assert_eq!(attempts[0].outcome, Some(AttemptOutcome::LeaseExpired));
+    assert_eq!(
+        common::outcome(&attempts[0]),
+        Some(AttemptOutcome::LeaseExpired)
+    );
     drop(conn);
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     db.cleanup().await;
 }
 
@@ -249,13 +258,11 @@ async fn shutdown_cancels_handlers_and_interrupted_task_is_released() {
         .expect(
             "shutdown waited for shutdown_timeout: ctx.cancellation did not fire at drain start",
         )
-        .unwrap()
         .unwrap();
 
     let task = task_of(&db, id).await;
-    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.state, TaskState::Queued);
     assert_eq!(task.attempts, 0, "the interrupted attempt must not count");
-    assert_eq!(task.locked_by, None);
     assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Released)]);
     db.cleanup().await;
 }
@@ -285,11 +292,11 @@ async fn handler_still_running_at_shutdown_timeout_is_released() {
 
     let stopping = Instant::now();
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     assert!(stopping.elapsed() < ms(200) + Duration::from_secs(5));
 
     let task = task_of(&db, id).await;
-    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.state.status(), TaskStatus::Queued);
     assert_eq!(task.attempts, 0, "the dropped attempt must not count");
     assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Released)]);
     db.cleanup().await;
@@ -320,9 +327,9 @@ async fn handler_finishing_during_drain_is_completed() {
     let (cancel, handle) = run_until_started(scheduler, &started).await;
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
 
-    assert_eq!(task_of(&db, id).await.status, TaskStatus::Done);
+    assert_eq!(task_of(&db, id).await.state.status(), TaskStatus::Done);
     assert_eq!(outcomes(&db, id).await, [Some(AttemptOutcome::Done)]);
     db.cleanup().await;
 }
@@ -369,10 +376,9 @@ async fn shutdown_with_row_lock_held_returns_in_bounded_time() {
     )
     .await
     .expect("shutdown hung behind the row lock")
-    .unwrap()
     .unwrap();
 
-    let status = task_of(&db, id).await.status;
+    let status = task_of(&db, id).await.state.status();
     assert!(
         matches!(status, TaskStatus::Queued | TaskStatus::Running),
         "{status:?}"
@@ -410,6 +416,5 @@ async fn shutdown_returns_when_the_pool_stalls() {
     tokio::time::timeout(Duration::from_secs(2), handle)
         .await
         .expect("shutdown hung behind a stalled pool")
-        .unwrap()
         .unwrap();
 }

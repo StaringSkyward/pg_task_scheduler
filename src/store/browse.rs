@@ -1,8 +1,9 @@
 //! Bounded, keyset-paged task lists and task detail for the admin pages. Every list reads at
 //! most `limit + 1` rows through an index, however large `queue_tasks` grows.
 
+use std::num::NonZeroU32;
+
 use chrono::DateTime;
-use chrono::TimeZone;
 use chrono::Utc;
 use diesel::sql_types;
 use diesel_async::AsyncPgConnection;
@@ -11,6 +12,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::AdminAction;
+use super::ErrorFilter;
 use super::attempts;
 use super::task;
 use super::task_actions;
@@ -20,6 +22,10 @@ use crate::ids::TaskId;
 use crate::ids::TaskName;
 use crate::ids::WorkerId;
 use crate::models::Attempt;
+use crate::models::AttemptRun;
+use crate::models::AttemptState;
+use crate::models::MaxAttempts;
+use crate::models::TaskState;
 use crate::models::TaskStatus;
 use crate::models::TaskView;
 
@@ -32,30 +38,23 @@ pub struct TaskRow {
     pub task_name: TaskName,
     /// The queue it runs in.
     pub queue: QueueName,
-    /// Lifecycle state.
-    pub status: TaskStatus,
+    /// Lifecycle state, with the lease while running and the completion time once finished.
+    pub state: TaskState,
     /// Higher is claimed first, within its queue.
     pub priority: i32,
     /// Earliest time a worker may claim it.
     pub due_at: DateTime<Utc>,
     /// Attempts counted so far.
-    pub attempts: i32,
+    pub attempts: u32,
     /// Attempts allowed in total.
-    pub max_attempts: i32,
+    pub max_attempts: MaxAttempts,
     /// Message of the latest failure.
     pub last_error: Option<String>,
     /// When it was enqueued.
     pub created_at: DateTime<Utc>,
-    /// When it became `done`, `dead` or `cancelled`.
-    pub completed_at: Option<DateTime<Utc>>,
-    /// The worker holding the lease, while `running`.
-    pub locked_by: Option<WorkerId>,
-    /// Lease expiry, while `running`.
-    pub locked_until: Option<DateTime<Utc>>,
-    /// When the current attempt (the one whose `lock_token` is the task's) started.
-    pub attempt_started_at: Option<DateTime<Utc>>,
-    /// When the current attempt ended; `None` while it runs.
-    pub attempt_finished_at: Option<DateTime<Utc>>,
+    /// The current attempt; `None` if no attempt carries the task's current `lock_token` (never
+    /// claimed, or replayed since).
+    pub attempt: Option<AttemptRun>,
 }
 
 /// One page and, if more rows follow, the cursor for the next.
@@ -132,6 +131,10 @@ struct Row {
     attempt_started_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = sql_types::Nullable<sql_types::Timestamptz>)]
     attempt_finished_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    attempt_outcome: Option<String>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
+    attempt_error: Option<String>,
 }
 
 impl TryFrom<Row> for TaskRow {
@@ -141,21 +144,27 @@ impl TryFrom<Row> for TaskRow {
             id: r.id,
             task_name: r.task_name,
             queue: r.queue,
-            status: r
-                .status
-                .parse()
-                .map_err(|_| SchedulerError::Invariant("unknown task status"))?,
+            state: TaskState::from_columns(&r.status, r.locked_by, r.locked_until, r.completed_at)?,
             priority: r.priority,
             due_at: r.due_at,
-            attempts: r.attempts,
-            max_attempts: r.max_attempts,
+            attempts: u32::try_from(r.attempts)
+                .map_err(|_| SchedulerError::Invariant("stored attempts is negative"))?,
+            max_attempts: MaxAttempts::from_db_i32(r.max_attempts)
+                .map_err(|_| SchedulerError::Invariant("stored max_attempts is not positive"))?,
             last_error: r.last_error,
             created_at: r.created_at,
-            completed_at: r.completed_at,
-            locked_by: r.locked_by,
-            locked_until: r.locked_until,
-            attempt_started_at: r.attempt_started_at,
-            attempt_finished_at: r.attempt_finished_at,
+            // A join miss nulls all three; `started_at` is NOT NULL, so it alone decides.
+            attempt: match r.attempt_started_at {
+                Some(started_at) => Some(AttemptRun {
+                    started_at,
+                    state: AttemptState::from_columns(
+                        r.attempt_finished_at,
+                        r.attempt_outcome.as_deref(),
+                        r.attempt_error,
+                    )?,
+                }),
+                None => None,
+            },
         })
     }
 }
@@ -167,7 +176,7 @@ macro_rules! select {
             "SELECT t.id, t.task_name, t.queue, t.status, t.priority, t.due_at, t.attempts, \
              t.max_attempts, t.last_error, t.created_at, t.completed_at, t.locked_by, \
              t.locked_until, a.started_at AS attempt_started_at, \
-             a.finished_at AS attempt_finished_at FROM ",
+             a.finished_at AS attempt_finished_at, a.outcome AS attempt_outcome, a.error AS attempt_error FROM ",
             $from,
             " AS t LEFT JOIN queue_task_attempts a \
              ON a.task_id = t.id AND a.lock_token = t.lock_token ORDER BY ",
@@ -178,11 +187,12 @@ macro_rules! select {
 
 // Due segment, exactly the claim order. A mixed-direction keyset needs the expanded predicate;
 // each branch is its own ordered index scan (equal priority, then lower priority), so neither
-// reads past `limit` rows. Binds: $1 queue, $2 priority, $3 due_at, $4 id, $5 limit.
+// reads past `limit` rows. Binds: $1 queue, $2 priority, $3 due_at (NULL = first page),
+// $4 id, $5 limit.
 #[doc(hidden)]
 pub const QUEUED_DUE: &str = select!(
     "((SELECT * FROM queue_tasks WHERE status = 'queued' AND queue = $1 AND due_at <= now() \
-        AND priority = $2 AND (due_at, id) > ($3, $4) \
+        AND priority = $2 AND (due_at, id) > (COALESCE($3, '-infinity'::timestamptz), $4) \
         ORDER BY priority DESC, due_at, id LIMIT $5) \
       UNION ALL \
       (SELECT * FROM queue_tasks WHERE status = 'queued' AND queue = $1 AND due_at <= now() \
@@ -191,56 +201,66 @@ pub const QUEUED_DUE: &str = select!(
     "t.priority DESC, t.due_at, t.id"
 );
 
-// Not-yet-due segment. Binds: $1 queue, $2 due_at, $3 id, $4 limit.
+// Not-yet-due segment. Binds: $1 queue, $2 due_at (NULL = first page), $3 id, $4 limit.
 #[doc(hidden)]
 pub const QUEUED_FUTURE: &str = select!(
     "(SELECT * FROM queue_tasks WHERE status = 'queued' AND queue = $1 AND due_at > now() \
-      AND (due_at, id) > ($2, $3) ORDER BY due_at, id LIMIT $4)",
+      AND (due_at, id) > (COALESCE($2, '-infinity'::timestamptz), $3) \
+      ORDER BY due_at, id LIMIT $4)",
     "t.due_at, t.id"
 );
 
-// Binds: $1 locked_until, $2 id, $3 limit.
+// Binds: $1 locked_until (NULL = first page), $2 id, $3 limit.
 #[doc(hidden)]
 pub const RUNNING: &str = select!(
-    "(SELECT * FROM queue_tasks WHERE status = 'running' AND (locked_until, id) > ($1, $2) \
+    "(SELECT * FROM queue_tasks WHERE status = 'running' \
+      AND (locked_until, id) > (COALESCE($1, '-infinity'::timestamptz), $2) \
       ORDER BY locked_until, id LIMIT $3)",
     "t.locked_until, t.id"
 );
 
-// Binds: $1 completed_at, $2 id, $3 limit.
+// Binds: $1 completed_at (NULL = first page), $2 id, $3 limit.
 #[doc(hidden)]
 pub const DONE: &str = select!(
-    "(SELECT * FROM queue_tasks WHERE status = 'done' AND (completed_at, id) < ($1, $2) \
+    "(SELECT * FROM queue_tasks WHERE status = 'done' \
+      AND (completed_at, id) < (COALESCE($1, 'infinity'::timestamptz), $2) \
       ORDER BY completed_at DESC, id DESC LIMIT $3)",
     "t.completed_at DESC, t.id DESC"
 );
 
-// Binds: $1 status, $2 last_error (NULL = any), $3 completed_at, $4 id, $5 limit. The literal
-// `status IN (...)` lets a generic plan (where `$1` is unknown) still prove the partial index's
-// predicate; without it, a repeated prepared statement can fall back to a seq scan.
+// Binds: $1 status, $2 error mode and $3 its text (`ErrorFilter::binds`), $4 completed_at
+// (NULL = first page), $5 id, $6 limit. The literal `status IN (...)` lets a generic plan (where `$1` is unknown) still
+// prove the partial index's predicate; without it, a repeated prepared statement can fall back
+// to a seq scan.
 #[doc(hidden)]
 pub const FAILED: &str = select!(
     "(SELECT * FROM queue_tasks WHERE status = $1 AND status IN ('dead', 'cancelled') \
-      AND ($2::text IS NULL OR last_error = $2) \
-      AND (completed_at, id) < ($3, $4) ORDER BY completed_at DESC, id DESC LIMIT $5)",
+      AND ($2::text = 'any' OR ($2 = 'missing' AND last_error IS NULL) \
+           OR ($2 = 'exact' AND last_error = $3)) \
+      AND (completed_at, id) < (COALESCE($4, 'infinity'::timestamptz), $5) \
+      ORDER BY completed_at DESC, id DESC LIMIT $6)",
     "t.completed_at DESC, t.id DESC"
 );
 
-// As FAILED plus $6 task_name; the name leads `queue_tasks_failed_name_idx`.
+// As FAILED plus $7 task_name; the name leads `queue_tasks_failed_name_idx`.
 #[doc(hidden)]
 pub const FAILED_BY_NAME: &str = select!(
-    "(SELECT * FROM queue_tasks WHERE task_name = $6 AND status = $1 \
-      AND status IN ('dead', 'cancelled') AND ($2::text IS NULL OR last_error = $2) \
-      AND (completed_at, id) < ($3, $4) ORDER BY completed_at DESC, id DESC LIMIT $5)",
+    "(SELECT * FROM queue_tasks WHERE task_name = $7 AND status = $1 \
+      AND status IN ('dead', 'cancelled') \
+      AND ($2::text = 'any' OR ($2 = 'missing' AND last_error IS NULL) \
+           OR ($2 = 'exact' AND last_error = $3)) \
+      AND (completed_at, id) < (COALESCE($4, 'infinity'::timestamptz), $5) \
+      ORDER BY completed_at DESC, id DESC LIMIT $6)",
     "t.completed_at DESC, t.id DESC"
 );
 
-/// Stand-ins for "no cursor" that keep every keyset predicate a plain index bound.
-fn earliest() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).unwrap()
+/// The `limit + 1` rows fetched so the page can tell whether more follow. Cannot overflow.
+fn lookahead(limit: NonZeroU32) -> i64 {
+    i64::from(limit.get()) + 1
 }
-fn latest() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0).unwrap()
+
+fn rows_len(items: &[TaskRow]) -> Result<i64, SchedulerError> {
+    i64::try_from(items.len()).map_err(|_| SchedulerError::Invariant("row count exceeds i64"))
 }
 
 fn rows(raw: Vec<Row>) -> Result<Vec<TaskRow>, SchedulerError> {
@@ -250,15 +270,18 @@ fn rows(raw: Vec<Row>) -> Result<Vec<TaskRow>, SchedulerError> {
 /// Keep `limit` of the `limit + 1` fetched rows; `next` is set iff one was left over.
 fn page<C>(
     mut items: Vec<TaskRow>,
-    limit: i64,
-    cursor: impl Fn(&TaskRow, usize) -> C,
-) -> Page<TaskRow, C> {
-    let more = items.len() as i64 > limit;
-    items.truncate(limit.max(0) as usize);
-    let next = more
-        .then(|| items.last().map(|r| cursor(r, items.len() - 1)))
-        .flatten();
-    Page { items, next }
+    limit: NonZeroU32,
+    cursor: impl Fn(&TaskRow, usize) -> Result<C, SchedulerError>,
+) -> Result<Page<TaskRow, C>, SchedulerError> {
+    let limit = usize::try_from(limit.get())
+        .map_err(|_| SchedulerError::Invariant("page limit does not fit in usize"))?;
+    let more = items.len() > limit;
+    items.truncate(limit);
+    let next = match items.last() {
+        Some(r) if more => Some(cursor(r, items.len() - 1)?),
+        _ => None,
+    };
+    Ok(Page { items, next })
 }
 
 /// Queued tasks of one queue in dequeue order: due tasks by `(priority DESC, due_at, id)` (the
@@ -267,21 +290,25 @@ pub async fn queued_page(
     conn: &mut AsyncPgConnection,
     queue: &QueueName,
     after: Option<&QueuedCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, QueuedCursor>, SchedulerError> {
-    let want = limit + 1;
+    let want = lookahead(limit);
     let mut items = Vec::new();
     let mut due_len = 0;
     if after.is_none_or(|c| c.due) {
         // No cursor: priority "above everything" makes the second branch the whole segment.
-        let (p, d, i) = after.map_or((i64::from(i32::MAX) + 1, earliest(), 0), |c| {
-            (i64::from(c.priority), c.due_at, c.id)
+        // A page binds NULL for its timestamp, which the SQL reads as `-infinity` or `infinity`,
+        // the type's own bounds. The id and priority stand-ins are in-domain bounds: `i64::MAX`
+        // for `bigint`, `i32::MAX + 1` above every `integer` and `0` below every identity id
+        // (they start at 1). Every keyset predicate stays a plain index bound.
+        let (p, d, i) = after.map_or((i64::from(i32::MAX) + 1, None, 0), |c| {
+            (i64::from(c.priority), Some(c.due_at), c.id)
         });
         items = rows(
             diesel::sql_query(QUEUED_DUE)
                 .bind::<sql_types::Text, _>(queue)
                 .bind::<sql_types::BigInt, _>(p)
-                .bind::<sql_types::Timestamptz, _>(d)
+                .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(d)
                 .bind::<sql_types::BigInt, _>(i)
                 .bind::<sql_types::BigInt, _>(want)
                 .get_results::<Row>(conn)
@@ -289,55 +316,76 @@ pub async fn queued_page(
         )?;
         due_len = items.len();
     }
-    if (items.len() as i64) < want {
+    if rows_len(&items)? < want {
         let (d, i) = after
             .filter(|c| !c.due)
-            .map_or((earliest(), 0), |c| (c.due_at, c.id));
+            .map_or((None, 0), |c| (Some(c.due_at), c.id));
         items.extend(rows(
             diesel::sql_query(QUEUED_FUTURE)
                 .bind::<sql_types::Text, _>(queue)
-                .bind::<sql_types::Timestamptz, _>(d)
+                .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(d)
                 .bind::<sql_types::BigInt, _>(i)
-                .bind::<sql_types::BigInt, _>(want - items.len() as i64)
+                .bind::<sql_types::BigInt, _>(want - rows_len(&items)?)
                 .get_results::<Row>(conn)
                 .await?,
         )?);
     }
     let base = after.map_or(0, |c| c.position);
-    Ok(page(items, limit, |r, idx| QueuedCursor {
-        due: idx < due_len,
-        priority: r.priority,
-        due_at: r.due_at,
-        id: r.id.0,
-        position: base + idx as i64 + 1,
-    }))
+    page(items, limit, |r, idx| {
+        Ok(QueuedCursor {
+            due: idx < due_len,
+            priority: r.priority,
+            due_at: r.due_at,
+            id: r.id.0,
+            position: i64::try_from(idx)
+                .ok()
+                .and_then(|i| base.checked_add(i)?.checked_add(1))
+                .ok_or(SchedulerError::InvalidCursor(
+                    "queued cursor position overflow",
+                ))?,
+        })
+    })
 }
 
 /// Running tasks by lease expiry, soonest first.
 pub async fn running_page(
     conn: &mut AsyncPgConnection,
     after: Option<&RunningCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, RunningCursor>, SchedulerError> {
-    let (u, i) = after.map_or((earliest(), 0), |c| (c.locked_until, c.id));
+    let (u, i) = after.map_or((None, 0), |c| (Some(c.locked_until), c.id));
     let items = rows(
         diesel::sql_query(RUNNING)
-            .bind::<sql_types::Timestamptz, _>(u)
+            .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(u)
             .bind::<sql_types::BigInt, _>(i)
-            .bind::<sql_types::BigInt, _>(limit + 1)
+            .bind::<sql_types::BigInt, _>(lookahead(limit))
             .get_results::<Row>(conn)
             .await?,
     )?;
-    Ok(page(items, limit, |r, _| RunningCursor {
-        locked_until: r.locked_until.unwrap_or_else(earliest),
-        id: r.id.0,
-    }))
+    page(items, limit, running)
 }
 
-fn finished(r: &TaskRow, _: usize) -> FinishedCursor {
-    FinishedCursor {
-        completed_at: r.completed_at.unwrap_or_else(latest),
-        id: r.id.0,
+fn running(r: &TaskRow, _: usize) -> Result<RunningCursor, SchedulerError> {
+    match r.state {
+        TaskState::Running { locked_until, .. } => Ok(RunningCursor {
+            locked_until,
+            id: r.id.0,
+        }),
+        _ => Err(SchedulerError::Invariant(
+            "running page returned a task in the wrong state",
+        )),
+    }
+}
+
+fn finished(r: &TaskRow, _: usize) -> Result<FinishedCursor, SchedulerError> {
+    match r.state {
+        TaskState::Finished { completed_at, .. } => Ok(FinishedCursor {
+            completed_at,
+            id: r.id.0,
+        }),
+        _ => Err(SchedulerError::Invariant(
+            "finished page returned a task in the wrong state",
+        )),
     }
 }
 
@@ -345,18 +393,18 @@ fn finished(r: &TaskRow, _: usize) -> FinishedCursor {
 pub async fn done_page(
     conn: &mut AsyncPgConnection,
     after: Option<&FinishedCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, FinishedCursor>, SchedulerError> {
-    let (c, i) = after.map_or((latest(), i64::MAX), |c| (c.completed_at, c.id));
+    let (c, i) = after.map_or((None, i64::MAX), |c| (Some(c.completed_at), c.id));
     let items = rows(
         diesel::sql_query(DONE)
-            .bind::<sql_types::Timestamptz, _>(c)
+            .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(c)
             .bind::<sql_types::BigInt, _>(i)
-            .bind::<sql_types::BigInt, _>(limit + 1)
+            .bind::<sql_types::BigInt, _>(lookahead(limit))
             .get_results::<Row>(conn)
             .await?,
     )?;
-    Ok(page(items, limit, finished))
+    page(items, limit, finished)
 }
 
 /// Which terminal failure [`failed_page`] lists.
@@ -373,8 +421,8 @@ pub enum FailedStatus {
 pub struct FailedFilter {
     /// Only tasks with this name.
     pub task_name: Option<TaskName>,
-    /// Exact match, as bulk replay's filter.
-    pub last_error: Option<String>,
+    /// Which `last_error` values match, as bulk replay's filter.
+    pub error: ErrorFilter,
 }
 
 /// Dead or cancelled tasks, newest completion first.
@@ -383,23 +431,25 @@ pub async fn failed_page(
     status: FailedStatus,
     filter: &FailedFilter,
     after: Option<&FinishedCursor>,
-    limit: i64,
+    limit: NonZeroU32,
 ) -> Result<Page<TaskRow, FinishedCursor>, SchedulerError> {
-    let (c, i) = after.map_or((latest(), i64::MAX), |c| (c.completed_at, c.id));
+    let (c, i) = after.map_or((None, i64::MAX), |c| (Some(c.completed_at), c.id));
     let status = match status {
         FailedStatus::Dead => TaskStatus::Dead,
         FailedStatus::Cancelled => TaskStatus::Cancelled,
     };
+    let (mode, text) = filter.error.binds();
     let q = diesel::sql_query(if filter.task_name.is_some() {
         FAILED_BY_NAME
     } else {
         FAILED
     })
     .bind::<sql_types::Text, _>(status.as_str())
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(filter.last_error.as_deref())
-    .bind::<sql_types::Timestamptz, _>(c)
+    .bind::<sql_types::Text, _>(mode)
+    .bind::<sql_types::Nullable<sql_types::Text>, _>(text)
+    .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(c)
     .bind::<sql_types::BigInt, _>(i)
-    .bind::<sql_types::BigInt, _>(limit + 1);
+    .bind::<sql_types::BigInt, _>(lookahead(limit));
     let items = match &filter.task_name {
         Some(n) => rows(
             q.bind::<sql_types::Text, _>(n)
@@ -408,33 +458,63 @@ pub async fn failed_page(
         )?,
         None => rows(q.get_results::<Row>(conn).await?)?,
     };
-    Ok(page(items, limit, finished))
+    page(items, limit, finished)
 }
 
-/// A task with its attempt history and the admin actions that touched it.
+/// A task with its attempt history and the admin actions that changed it.
 #[derive(Debug, Clone)]
 pub struct TaskDetail {
     /// The task.
     pub task: TaskView,
     /// Its attempts, in order.
     pub attempts: Vec<Attempt>,
-    /// Admin actions that touched it.
+    /// Admin actions that changed it, newest first.
     pub actions: Vec<AdminAction>,
 }
 
-/// The task with this id and its history, if it exists.
+/// The task with this id and its history, if it exists. Each action's `affected` counts at most
+/// `count_cap` tasks.
 pub async fn task_detail(
     conn: &mut AsyncPgConnection,
     id: TaskId,
+    count_cap: NonZeroU32,
 ) -> Result<Option<TaskDetail>, SchedulerError> {
     let Some(task) = task(conn, id).await? else {
         return Ok(None);
     };
     let attempts = attempts(conn, id).await?;
-    let actions = task_actions(conn, &task).await?;
+    let actions = task_actions(conn, id, count_cap).await?;
     Ok(Some(TaskDetail {
         task,
         attempts,
         actions,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queued_row() -> TaskRow {
+        TaskRow {
+            id: TaskId(1),
+            task_name: TaskName::try_from("job").unwrap(),
+            queue: QueueName::default(),
+            state: TaskState::Queued,
+            priority: 0,
+            due_at: Utc::now(),
+            attempts: 0,
+            max_attempts: MaxAttempts::default_value(),
+            last_error: None,
+            created_at: Utc::now(),
+            attempt: None,
+        }
+    }
+
+    #[test]
+    fn cursor_builders_reject_a_row_in_the_wrong_state() {
+        let r = queued_row();
+        assert!(matches!(finished(&r, 0), Err(SchedulerError::Invariant(_))));
+        assert!(matches!(running(&r, 0), Err(SchedulerError::Invariant(_))));
+    }
 }

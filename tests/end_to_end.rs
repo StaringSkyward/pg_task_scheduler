@@ -1,6 +1,6 @@
 #![cfg(feature = "cron")]
 mod common;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -12,6 +12,7 @@ use pg_task_scheduler::EnqueueOptions;
 use pg_task_scheduler::HealthStatus;
 use pg_task_scheduler::JobLifecycle;
 use pg_task_scheduler::MaxAttempts;
+use pg_task_scheduler::ScheduleName;
 use pg_task_scheduler::Scheduler;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskKey;
@@ -35,6 +36,7 @@ async fn runs_due_job_end_to_end() {
     let job = jobs::create(
         &mut conn,
         CreateJob::new(
+            ScheduleName::try_from("counter").unwrap(),
             TaskName::try_from("counter").unwrap(),
             CronExpression::parse("*/1 * * * *").unwrap(),
             MaxAttempts::try_from(3u32).unwrap(),
@@ -49,7 +51,8 @@ async fn runs_due_job_end_to_end() {
     {
         use diesel_async::RunQueryDsl;
         diesel::sql_query(
-            "UPDATE scheduler_jobs SET next_run_at = now() - interval '1 minute' WHERE id = $1",
+            "UPDATE scheduler_job_cursors SET next_run_at = now() - interval '1 minute' \
+             WHERE job_id = $1",
         )
         .bind::<diesel::sql_types::Uuid, _>(job.id)
         .execute(&mut conn)
@@ -85,7 +88,7 @@ async fn runs_due_job_end_to_end() {
     assert_eq!(COUNT.load(Ordering::SeqCst), 1);
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     db.cleanup().await;
 }
 
@@ -97,7 +100,7 @@ async fn wait_done(
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if let Some(t) = store::task(conn, id).await.unwrap()
-            && t.status == TaskStatus::Done
+            && t.state.status() == TaskStatus::Done
         {
             return true;
         }
@@ -120,7 +123,7 @@ async fn materialize_failure_degrades_health_without_slowing_claims() {
     let mut conn = db.pool.get().await.unwrap();
     {
         use diesel_async::RunQueryDsl;
-        diesel::sql_query("DROP TABLE scheduler_jobs")
+        diesel::sql_query("DROP TABLE scheduler_jobs CASCADE")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -140,7 +143,7 @@ async fn materialize_failure_degrades_health_without_slowing_claims() {
     let started = Arc::new(AtomicU32::new(0));
     let counter = started.clone();
     let scheduler = Scheduler::builder(db.pool.clone())
-        .claim_batch_size(NonZeroUsize::MIN) // every claim of one task is a full batch
+        .claim_batch_size(NonZeroU32::MIN) // every claim of one task is a full batch
         .max_poll_interval(Duration::from_secs(10))
         .shutdown_timeout(Duration::from_millis(100))
         .register_task::<Hold, _, _>(move |_ctx, _args| {
@@ -178,6 +181,6 @@ async fn materialize_failure_degrades_health_without_slowing_claims() {
     );
 
     cancel.cancel();
-    handle.await.unwrap().unwrap();
+    handle.await.unwrap();
     db.cleanup().await;
 }

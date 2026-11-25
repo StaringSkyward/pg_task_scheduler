@@ -20,15 +20,22 @@ use pg_task_scheduler::SchedulerPool;
 use pg_task_scheduler::TaskId;
 use pg_task_scheduler::TaskName;
 use pg_task_scheduler::replay;
+use pg_task_scheduler::store::AdminAction;
+use pg_task_scheduler::store::AdminActionTarget;
 use pg_task_scheduler::store::BULK_BUDGET;
+use pg_task_scheduler::store::BulkAction;
 use pg_task_scheduler::store::BulkFilter;
+use pg_task_scheduler::store::BulkOutcome;
+use pg_task_scheduler::store::BulkStop;
 use pg_task_scheduler::store::CancelOutcome;
+use pg_task_scheduler::store::ErrorFilter;
 use pg_task_scheduler::store::{self};
 use serde::Deserialize;
 
 use crate::AppState;
 use crate::Operator;
 use crate::pages::ErrorPage;
+use crate::pages::error_filter;
 use crate::pages::render;
 
 pub(crate) fn routes<P: SchedulerPool>() -> Router<AppState<P>> {
@@ -95,7 +102,7 @@ async fn cancel<P: SchedulerPool>(
     };
     let mut conn = match state.pool.acquire().await {
         Ok(c) => c,
-        Err(e) => return db_fail(&state, SchedulerError::Pool(e.to_string())),
+        Err(e) => return db_fail(&state, SchedulerError::Pool(e)),
     };
     match store::cancel(&mut conn, TaskId(id), &op, &reason).await {
         Ok(CancelOutcome::Cancelled) => to_task(&state, id),
@@ -121,7 +128,7 @@ async fn replay_task<P: SchedulerPool>(
     };
     let mut conn = match state.pool.acquire().await {
         Ok(c) => c,
-        Err(e) => return db_fail(&state, SchedulerError::Pool(e.to_string())),
+        Err(e) => return db_fail(&state, SchedulerError::Pool(e)),
     };
     match replay(&mut conn, TaskId(id), &op, &reason).await {
         Ok(true) => to_task(&state, id),
@@ -161,7 +168,7 @@ async fn queue<P: SchedulerPool>(
     };
     let mut conn = match state.pool.acquire().await {
         Ok(c) => c,
-        Err(e) => return db_fail(&state, SchedulerError::Pool(e.to_string())),
+        Err(e) => return db_fail(&state, SchedulerError::Pool(e)),
     };
     let r = if pause {
         store::pause_queue(&mut conn, &queue, &op, &reason).await
@@ -174,9 +181,13 @@ async fn queue<P: SchedulerPool>(
     }
 }
 
-/// Query (GET) and form (POST) fields of the bulk page; empty `queue`/`error` mean "any".
+/// Query (GET) and form (POST) fields of the bulk page; an empty `queue` means "any", and
+/// `error_filter` and `error` read as `pages::error_filter`. A POST with an `action_id`
+/// (Continue) resumes that action, and the other fields are ignored.
 #[derive(Deserialize, Default)]
 struct BulkParams {
+    #[serde(default)]
+    action_id: String,
     #[serde(default)]
     action: String,
     #[serde(default)]
@@ -184,7 +195,9 @@ struct BulkParams {
     #[serde(default)]
     queue: String,
     #[serde(default)]
-    error: String,
+    error_filter: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
     #[serde(default)]
     confirm_name: String,
     #[serde(default)]
@@ -192,30 +205,35 @@ struct BulkParams {
 }
 
 struct Bulk {
-    replay: bool,
+    action: BulkAction,
     filter: BulkFilter,
-    error: Option<String>,
 }
 
-fn parse<P: SchedulerPool>(state: &AppState<P>, p: &BulkParams) -> Result<Bulk, Response> {
-    let bad = |m| fail(state, StatusCode::BAD_REQUEST, m);
-    let replay = match p.action.as_str() {
-        "cancel" => false,
-        "replay" => true,
-        _ => return Err(bad("Unknown action.")),
+/// The form as the action it asks for, or the 400 message.
+fn parse(p: &BulkParams) -> Result<Bulk, &'static str> {
+    let error = error_filter(p.error_filter.as_deref(), p.error.as_deref())?;
+    let action = match (p.action.as_str(), error) {
+        ("cancel", ErrorFilter::Any) => BulkAction::Cancel,
+        ("cancel", _) => return Err("Cancel takes no error filter."),
+        ("replay", error) => BulkAction::Replay { error },
+        _ => return Err("Unknown action."),
     };
-    let task_name =
-        TaskName::try_from(p.task_name.as_str()).map_err(|_| bad("Invalid task name."))?;
+    let task_name = TaskName::try_from(p.task_name.as_str()).map_err(|_| "Invalid task name.")?;
     let queue = match p.queue.as_str() {
         "" => None,
-        q => Some(QueueName::try_from(q).map_err(|_| bad("Invalid queue name."))?),
+        q => Some(QueueName::try_from(q).map_err(|_| "Invalid queue name.")?),
     };
-    let error = Some(p.error.clone()).filter(|e| !e.is_empty());
     Ok(Bulk {
-        replay,
+        action,
         filter: BulkFilter { task_name, queue },
-        error,
     })
+}
+
+fn verb(action: &BulkAction) -> &'static str {
+    match action {
+        BulkAction::Replay { .. } => "replay",
+        BulkAction::Cancel => "cancel",
+    }
 }
 
 #[derive(Template)]
@@ -225,6 +243,10 @@ struct ConfirmPage<'a> {
     refresh: u64,
     p: &'a BulkParams,
     verb: &'a str,
+    /// The replay matches only tasks with no error.
+    no_error: bool,
+    /// The replay matches only this exact error.
+    error: Option<&'a str>,
     count: String,
 }
 
@@ -235,27 +257,38 @@ struct ResultPage<'a> {
     refresh: u64,
     p: &'a BulkParams,
     verb: &'a str,
+    action_id: i64,
     affected: i64,
-    more: bool,
+    budget_spent: bool,
 }
 
 async fn confirm<P: SchedulerPool>(
     State(state): State<AppState<P>>,
     Query(p): Query<BulkParams>,
 ) -> Response {
-    let b = match parse(&state, &p) {
+    let b = match parse(&p) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err(m) => return fail(&state, StatusCode::BAD_REQUEST, m),
     };
     let cap = state.config.overview.count_cap;
     let mut conn = match state.pool.acquire().await {
         Ok(c) => c,
-        Err(e) => return db_fail(&state, SchedulerError::Pool(e.to_string())),
+        Err(e) => return db_fail(&state, SchedulerError::Pool(e)),
     };
-    let n = if b.replay {
-        store::count_replayable(&mut conn, &b.filter, b.error.as_deref(), cap).await
-    } else {
-        store::count_cancellable(&mut conn, &b.filter, cap).await
+    let n = match &b.action {
+        BulkAction::Replay { error } => {
+            store::count_replayable(&mut conn, &b.filter, error, cap).await
+        }
+        BulkAction::Cancel => store::count_cancellable(&mut conn, &b.filter, cap).await,
+    };
+    let (no_error, error) = match &b.action {
+        BulkAction::Replay {
+            error: ErrorFilter::Missing,
+        } => (true, None),
+        BulkAction::Replay {
+            error: ErrorFilter::Exact(e),
+        } => (false, Some(e.as_str())),
+        _ => (false, None),
     };
     match n {
         Ok(n) => render(
@@ -263,8 +296,10 @@ async fn confirm<P: SchedulerPool>(
                 base: &state.config.base_path,
                 refresh: state.config.refresh_seconds,
                 p: &p,
-                verb: if b.replay { "replay" } else { "cancel" },
-                count: if n >= cap {
+                verb: verb(&b.action),
+                no_error,
+                error,
+                count: if n >= i64::from(cap.get()) {
                     format!("{n}+")
                 } else {
                     n.to_string()
@@ -281,9 +316,12 @@ async fn bulk<P: SchedulerPool>(
     Operator(op): Operator,
     Form(p): Form<BulkParams>,
 ) -> Response {
-    let b = match parse(&state, &p) {
+    if !p.action_id.is_empty() {
+        return resume(&state, &p.action_id).await;
+    }
+    let b = match parse(&p) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err(m) => return fail(&state, StatusCode::BAD_REQUEST, m),
     };
     if p.confirm_name != p.task_name {
         return fail(
@@ -298,33 +336,177 @@ async fn bulk<P: SchedulerPool>(
     };
     let mut conn = match state.pool.acquire().await {
         Ok(c) => c,
-        Err(e) => return db_fail(&state, SchedulerError::Pool(e.to_string())),
+        Err(e) => return db_fail(&state, SchedulerError::Pool(e)),
     };
-    let out = if b.replay {
-        store::replay_matching(
-            &mut conn,
-            &b.filter,
-            b.error.as_deref(),
-            &op,
-            &reason,
-            BULK_BUDGET,
-        )
-        .await
-    } else {
-        store::cancel_matching(&mut conn, &b.filter, &op, &reason, BULK_BUDGET).await
+    let out = match &b.action {
+        BulkAction::Replay { error } => {
+            store::replay_matching(&mut conn, &b.filter, error, &op, &reason, BULK_BUDGET).await
+        }
+        BulkAction::Cancel => {
+            store::cancel_matching(&mut conn, &b.filter, &op, &reason, BULK_BUDGET).await
+        }
     };
     match out {
-        Ok(o) => render(
-            ResultPage {
-                base: &state.config.base_path,
-                refresh: state.config.refresh_seconds,
-                p: &p,
-                verb: if b.replay { "replayed" } else { "cancelled" },
-                affected: o.affected,
-                more: o.more_remain,
-            },
-            StatusCode::OK,
-        ),
+        Ok(o) => result(&state, &p, &b.action, o),
         Err(e) => db_fail(&state, e),
+    }
+}
+
+/// Continue: more batches of the bulk action `id`, under its own filter, operator and reason.
+async fn resume<P: SchedulerPool>(state: &AppState<P>, id: &str) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return fail(state, StatusCode::BAD_REQUEST, "Invalid action id.");
+    };
+    let not_found = || fail(state, StatusCode::NOT_FOUND, "No bulk action has that id.");
+    let mut conn = match state.pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => return db_fail(state, SchedulerError::Pool(e)),
+    };
+    let found = match store::admin_action(&mut conn, id, state.config.overview.count_cap).await {
+        Ok(a) => a,
+        Err(e) => return db_fail(state, e),
+    };
+    let Some(AdminAction {
+        target:
+            AdminActionTarget::Bulk {
+                action,
+                task_name,
+                queue,
+                ..
+            },
+        reason,
+        ..
+    }) = found
+    else {
+        return not_found();
+    };
+    // The action's own fields, for the Run again form a short batch offers (no mode is `any`).
+    let (error_filter, error) = match &action {
+        BulkAction::Replay {
+            error: ErrorFilter::Missing,
+        } => (Some("missing"), None),
+        BulkAction::Replay {
+            error: ErrorFilter::Exact(e),
+        } => (Some("exact"), Some(e.clone())),
+        _ => (None, None),
+    };
+    let p = BulkParams {
+        action: verb(&action).into(),
+        task_name: task_name.as_str().into(),
+        queue: queue.map(|q| q.as_str().into()).unwrap_or_default(),
+        error_filter: error_filter.map(str::to_owned),
+        error,
+        confirm_name: task_name.as_str().into(),
+        reason,
+        ..Default::default()
+    };
+    match store::resume_bulk(&mut conn, id, BULK_BUDGET).await {
+        Ok(Some(o)) => result(state, &p, &action, o),
+        Ok(None) => not_found(),
+        Err(e) => db_fail(state, e),
+    }
+}
+
+fn result(
+    state: &AppState<impl SchedulerPool>,
+    p: &BulkParams,
+    action: &BulkAction,
+    o: BulkOutcome,
+) -> Response {
+    render(
+        ResultPage {
+            base: &state.config.base_path,
+            refresh: state.config.refresh_seconds,
+            p,
+            verb: match action {
+                BulkAction::Replay { .. } => "replayed",
+                BulkAction::Cancel => "cancelled",
+            },
+            action_id: o.action_id,
+            affected: o.affected,
+            budget_spent: o.stopped == BulkStop::BudgetSpent,
+        },
+        StatusCode::OK,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(query: &str) -> Result<BulkAction, &'static str> {
+        parse(&serde_urlencoded::from_str::<BulkParams>(query).unwrap()).map(|b| b.action)
+    }
+
+    #[test]
+    fn parse_reads_the_error_filter_into_its_meaning() {
+        let replay = |error| Ok(BulkAction::Replay { error });
+        assert_eq!(
+            parsed("action=replay&task_name=a&error_filter=exact&error="),
+            replay(ErrorFilter::Exact(String::new()))
+        );
+        assert_eq!(
+            parsed("action=replay&task_name=a&error_filter=missing"),
+            replay(ErrorFilter::Missing)
+        );
+        assert_eq!(
+            parsed("action=replay&task_name=a"),
+            replay(ErrorFilter::Any)
+        );
+        assert_eq!(parsed("action=cancel&task_name=a"), Ok(BulkAction::Cancel));
+    }
+
+    #[test]
+    fn parse_rejects_a_cancel_with_an_error_filter() {
+        assert_eq!(
+            parsed("action=cancel&task_name=a&error_filter=exact&error=x"),
+            Err("Cancel takes no error filter.")
+        );
+        assert_eq!(
+            parsed("action=replay&task_name=a&error_filter=exact"),
+            Err("An exact error filter needs an error.")
+        );
+        assert_eq!(
+            parsed("action=replay&task_name=a&error_filter=some"),
+            Err("Unknown error filter.")
+        );
+        // An `error` without `exact` (an old link's shape) never widens to `any`.
+        for q in [
+            "action=replay&task_name=a&error=x",
+            "action=replay&task_name=a&error_filter=missing&error=x",
+            "action=cancel&task_name=a&error=",
+        ] {
+            assert_eq!(
+                parsed(q),
+                Err("error is only for error_filter=exact."),
+                "{q}"
+            );
+        }
+    }
+
+    // The budget-spent branch needs 500+ rows and the fixed 10 s budget to reach end to end.
+    #[test]
+    fn budget_spent_result_offers_continue() {
+        let p = BulkParams {
+            action: "cancel".into(),
+            task_name: "a".into(),
+            ..Default::default()
+        };
+        let html = ResultPage {
+            base: "",
+            refresh: 0,
+            p: &p,
+            verb: "cancelled",
+            action_id: 7,
+            affected: 500,
+            budget_spent: true,
+        }
+        .render()
+        .unwrap();
+        assert!(html.contains("Continue"), "{html}");
+        assert!(!html.contains("Run again"), "{html}");
+        // Continue posts only the action id, so it resumes that action.
+        assert!(html.contains("name=\"action_id\" value=\"7\""), "{html}");
+        assert!(!html.contains("name=\"task_name\""), "{html}");
     }
 }

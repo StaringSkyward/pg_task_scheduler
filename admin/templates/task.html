@@ -5,21 +5,20 @@
 <h2>Task {{ t.task.id.0 }}</h2>
 <div class="scroll">
 <table class="details">
-<tr><th>Key</th><td>{{ t.task.task_key.as_str() }}</td></tr>
+<tr><th>Key</th><td>{{ key }}{% if let Some(e) = key_error %} <small class="invalid">invalid: {{ e }}</small>{% endif %}</td></tr>
 <tr><th>Name</th><td>{{ t.task.task_name.as_str() }}</td></tr>
 <tr><th>Queue</th><td>{{ t.task.queue.as_str() }}</td></tr>
 <tr><th>Status</th><td>{{ status }}</td></tr>
 <tr><th>Priority</th><td>{{ t.task.priority }}</td></tr>
-<tr><th>Attempts</th><td>{{ t.task.attempts }} / {{ t.task.max_attempts }}</td></tr>
+<tr><th>Attempts</th><td>{{ t.task.attempts }} / {{ t.task.max_attempts.get() }}</td></tr>
 <tr><th>Created</th><td>{{ created }}</td></tr>
 <tr><th>Updated</th><td>{{ updated }}</td></tr>
 <tr><th>Due</th><td>{{ due }}</td></tr>
 <tr><th>Completed</th><td>{{ completed }}</td></tr>
-<tr><th>Locked by</th><td>{% if let Some(w) = t.task.locked_by %}{{ w.as_str() }}{% else %}—{% endif %}</td></tr>
+<tr><th>Locked by</th><td>{{ locked_by }}</td></tr>
 <tr><th>Lock token</th><td>{{ t.task.lock_token.0 }}</td></tr>
 <tr><th>Lease expires</th><td>{{ locked_until }}</td></tr>
 <tr><th>Last error</th><td>{% if let Some(e) = t.task.last_error %}{{ e }}{% else %}—{% endif %}</td></tr>
-<tr><th>Admin action</th><td>{% if let Some(a) = t.task.admin_action_id %}{{ a }}{% else %}—{% endif %}</td></tr>
 </table>
 </div>
 {% if status == "queued" || status == "running" %}

@@ -23,9 +23,15 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::ManagerConfig;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::pooled_connection::deadpool::PoolBuilder;
 use uuid::Uuid;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A checked lease for store calls; panics on an out-of-range test value.
+pub fn lease(d: std::time::Duration) -> pg_task_scheduler::LeaseDuration {
+    pg_task_scheduler::LeaseDuration::try_from(d).unwrap()
+}
 
 pub fn database_url() -> String {
     // Load `.env` exactly once. `std::sync::Once` gives a happens-before edge so
@@ -43,6 +49,35 @@ pub fn database_url() -> String {
 fn unique_schema() -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("pgts_test_{}_{n}", std::process::id())
+}
+
+/// A pool builder whose every connection pins `search_path` to `schema`, then runs the SQL
+/// `setup` (may be empty).
+///
+/// diesel-async `SetupCallback<C>`:
+///   Box<dyn Fn(&str) -> future::BoxFuture<diesel::ConnectionResult<C>> + Send + Sync>
+/// i.e. an `Fn` (callable repeatedly, once per established connection),
+/// `Send + Sync`, taking the URL by `&str` and returning a `Send` boxed
+/// future of `Result<AsyncPgConnection, diesel::result::ConnectionError>`.
+fn schema_pool(url: &str, schema: &str, setup: &str) -> PoolBuilder<AsyncPgConnection> {
+    let session_setup = format!("SET search_path TO \"{schema}\"; {setup}");
+    let mut config = ManagerConfig::default();
+    config.custom_setup = Box::new(move |url| {
+        let setup = session_setup.clone();
+        Box::pin(async move {
+            use diesel::ConnectionError;
+            let mut conn = AsyncPgConnection::establish(url).await?;
+            conn.batch_execute(&setup)
+                .await
+                // Map a setup failure into the connection error type
+                // (a `diesel::result::Error` -> `ConnectionError`), so a
+                // broken setup surfaces as a pool/connection error rather
+                // than being silently swallowed.
+                .map_err(ConnectionError::CouldntSetupConfiguration)?;
+            Ok(conn)
+        })
+    });
+    Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config))
 }
 
 pub struct TestDb {
@@ -79,36 +114,72 @@ impl TestDb {
             .await
             .expect("create schema");
 
-        // Build a pool whose every connection pins `search_path` to this schema.
-        //
-        // diesel-async 0.5.2 `SetupCallback<C>`:
-        //   Box<dyn Fn(&str) -> future::BoxFuture<diesel::ConnectionResult<C>> + Send + Sync>
-        // i.e. an `Fn` (callable repeatedly, once per established connection),
-        // `Send + Sync`, taking the URL by `&str` and returning a `Send` boxed
-        // future of `Result<AsyncPgConnection, diesel::result::ConnectionError>`.
-        let setup_schema = schema.clone();
-        let mut config = ManagerConfig::default();
-        config.custom_setup = Box::new(move |url| {
-            let schema = setup_schema.clone();
-            Box::pin(async move {
-                use diesel::ConnectionError;
-                let mut conn = AsyncPgConnection::establish(url).await?;
-                diesel::sql_query(format!("SET search_path TO \"{schema}\""))
-                    .execute(&mut conn)
-                    .await
-                    // Map the search_path failure into the connection error type
-                    // (a `diesel::result::Error` -> `ConnectionError`), so a
-                    // broken setup surfaces as a pool/connection error rather
-                    // than being silently swallowed.
-                    .map_err(ConnectionError::CouldntSetupConfiguration)?;
-                Ok(conn)
-            })
-        });
-        let manager =
-            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
-        let pool = Pool::builder(manager).build().expect("pool");
-
+        let pool = schema_pool(&url, &schema, "").build().expect("pool");
         TestDb { pool, schema }
+    }
+
+    /// Another pool on this schema, of at most `max_size` connections. `self.pool.resize`
+    /// cannot do this: deadpool 0.13's `resize` forgets permits only for connections that exist when it is called, never later.
+    pub fn sized_pool(&self, max_size: usize) -> Pool<AsyncPgConnection> {
+        schema_pool(&database_url(), &self.schema, "")
+            .max_size(max_size)
+            .build()
+            .expect("pool")
+    }
+
+    /// Like [`TestDb::sized_pool`], but every session starts with the libpq `options` string,
+    /// for example `"-c statement_timeout=200"`: a host's own session settings.
+    pub fn pool_with_options(&self, max_size: usize, options: &str) -> Pool<AsyncPgConnection> {
+        let url = database_url();
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let url = format!("{url}{sep}options={}", options.replace(' ', "%20"));
+        schema_pool(&url, &self.schema, "")
+            .max_size(max_size)
+            .build()
+            .expect("pool")
+    }
+
+    /// Like [`TestDb::sized_pool`], but every session runs `LISTEN <channel>` in its setup: a
+    /// host that listens on its pooled sessions.
+    pub fn pool_listening_on(&self, channel: &str, max_size: usize) -> Pool<AsyncPgConnection> {
+        schema_pool(&database_url(), &self.schema, &format!("LISTEN {channel}"))
+            .max_size(max_size)
+            .build()
+            .expect("pool")
+    }
+
+    /// A session outside the pool holding `ACCESS EXCLUSIVE` on this schema's `table` in an
+    /// open transaction; `COMMIT` on it (or drop it) to release the lock.
+    pub async fn lock_table(&self, table: &str) -> AsyncPgConnection {
+        let mut conn = AsyncPgConnection::establish(&database_url())
+            .await
+            .expect("connect");
+        conn.batch_execute(&format!(
+            "BEGIN; LOCK TABLE \"{}\".{table} IN ACCESS EXCLUSIVE MODE",
+            self.schema
+        ))
+        .await
+        .expect("lock table");
+        conn
+    }
+
+    /// A connection whose unqualified `pg_notify` raises `notify refused`: the schema holds its
+    /// own `pg_notify(text, text)`, and `search_path` lists the schema before `pg_catalog`
+    /// (otherwise PostgreSQL searches `pg_catalog` first). The function lives in the test
+    /// schema only, because the database is shared by parallel tests.
+    pub async fn conn_with_failing_notify(&self) -> AsyncPgConnection {
+        let schema = &self.schema;
+        let mut conn = AsyncPgConnection::establish(&database_url())
+            .await
+            .expect("connect");
+        conn.batch_execute(&format!(
+            "CREATE FUNCTION \"{schema}\".pg_notify(text, text) RETURNS void \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'notify refused'; END $$; \
+             SET search_path TO \"{schema}\", pg_catalog"
+        ))
+        .await
+        .expect("failing notify");
+        conn
     }
 
     /// Run one migration's SQL in the test schema.
@@ -129,6 +200,16 @@ impl TestDb {
         }
     }
 
+    /// Drop one of the migrations' named constraints, so a test can store a value the
+    /// identifier CHECKs reject: a database whose CHECK was dropped by hand.
+    pub async fn drop_constraint(&self, table: &str, constraint: &str) {
+        let mut conn = self.pool.get().await.unwrap();
+        diesel::sql_query(format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
     /// Run a `SELECT ... AS n` count query and return `n`.
     pub async fn scalar(&self, sql: &str) -> i64 {
         let mut conn = self.pool.get().await.unwrap();
@@ -139,39 +220,64 @@ impl TestDb {
             .n
     }
 
-    /// Insert a job; returns its id. Cron validated by the DB only — pass valid cron.
+    /// Insert a job whose task name is its schedule name; returns its id. Cron validated
+    /// by the DB only — pass valid cron.
     pub async fn insert_job(&self, name: &str, cron: &str, next_run_at: DateTime<Utc>) -> Uuid {
-        self.insert_job_full(name, cron, next_run_at, 3, false)
+        self.insert_job_full(name, name, cron, next_run_at, 3, false)
             .await
     }
 
+    /// Insert a job and its cursor, plus a pause row when `is_paused`; returns its id.
     pub async fn insert_job_full(
         &self,
         name: &str,
+        task_name: &str,
         cron: &str,
         next_run_at: DateTime<Utc>,
         max_attempts: i32,
         is_paused: bool,
     ) -> Uuid {
         let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query(
-            "INSERT INTO scheduler_jobs (name, cron_expression, next_run_at, max_attempts, is_paused) \
-             VALUES ($1,$2,$3,$4,$5) RETURNING id",
+        let id = diesel::sql_query(
+            "WITH j AS (INSERT INTO scheduler_jobs (name, task_name, cron_expression, max_attempts) \
+                        VALUES ($1,$2,$3,$5) RETURNING id) \
+             INSERT INTO scheduler_job_cursors (job_id, next_run_at) SELECT id, $4 FROM j \
+             RETURNING job_id AS id",
         )
         .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(task_name)
         .bind::<diesel::sql_types::Text, _>(cron)
         .bind::<diesel::sql_types::Timestamptz, _>(next_run_at)
         .bind::<diesel::sql_types::Integer, _>(max_attempts)
-        .bind::<diesel::sql_types::Bool, _>(is_paused)
         .get_result::<IdRow>(&mut conn)
         .await
         .unwrap()
-        .id
+        .id;
+        if is_paused {
+            diesel::sql_query("INSERT INTO scheduler_job_pauses (job_id) VALUES ($1)")
+                .bind::<diesel::sql_types::Uuid, _>(id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        id
+    }
+
+    /// Overwrite a job's `job_args` with JSONB text serde cannot read (`{"x":1e500}`).
+    pub async fn make_job_args_unreadable(&self, job_id: Uuid) {
+        let mut conn = self.pool.get().await.unwrap();
+        diesel::sql_query(
+            "UPDATE scheduler_jobs SET job_args = '{\"x\":1e500}'::jsonb WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job_id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
     }
 
     pub async fn job_next_run_at(&self, job_id: Uuid) -> DateTime<Utc> {
         let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query("SELECT next_run_at FROM scheduler_jobs WHERE id = $1")
+        diesel::sql_query("SELECT next_run_at FROM scheduler_job_cursors WHERE job_id = $1")
             .bind::<diesel::sql_types::Uuid, _>(job_id)
             .get_result::<TsRow>(&mut conn)
             .await
@@ -181,12 +287,14 @@ impl TestDb {
 
     pub async fn is_paused(&self, job_id: Uuid) -> bool {
         let mut conn = self.pool.get().await.unwrap();
-        diesel::sql_query("SELECT is_paused AS flag FROM scheduler_jobs WHERE id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(job_id)
-            .get_result::<BoolRow>(&mut conn)
-            .await
-            .unwrap()
-            .flag
+        diesel::sql_query(
+            "SELECT EXISTS (SELECT 1 FROM scheduler_job_pauses WHERE job_id = $1) AS flag",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(job_id)
+        .get_result::<BoolRow>(&mut conn)
+        .await
+        .unwrap()
+        .flag
     }
 
     /// Ids of the `queue_tasks` materialized for a job, oldest occurrence first.
@@ -292,5 +400,21 @@ impl TestDb {
         .execute(&mut conn)
         .await
         .unwrap();
+    }
+}
+
+/// How the attempt closed; `None` while it is open.
+pub fn outcome(a: &pg_task_scheduler::Attempt) -> Option<pg_task_scheduler::AttemptOutcome> {
+    match &a.state {
+        pg_task_scheduler::AttemptState::Open => None,
+        pg_task_scheduler::AttemptState::Closed { outcome, .. } => Some(*outcome),
+    }
+}
+
+/// The recorded failure message; `None` while open or when the close carried none.
+pub fn error_of(a: &pg_task_scheduler::Attempt) -> Option<&str> {
+    match &a.state {
+        pg_task_scheduler::AttemptState::Open => None,
+        pg_task_scheduler::AttemptState::Closed { error, .. } => error.as_deref(),
     }
 }

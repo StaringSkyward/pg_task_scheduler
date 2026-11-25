@@ -142,7 +142,14 @@ async fn responses_forbid_framing() {
     assert_eq!(page.status(), StatusCode::OK);
     let no_operator = send(&bare(), Method::GET, "/", &[]).await;
     let basic = send(
-        &with_basic_auth(bare(), Vec::new()).unwrap(),
+        &with_basic_auth(
+            bare(),
+            vec![BasicUser {
+                name: "alice".into(),
+                password_hash: hash_password("s3cret"),
+            }],
+        )
+        .unwrap(),
         Method::GET,
         "/",
         &[],
@@ -253,8 +260,9 @@ async fn trusted_header_sets_operator() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let n = db
         .scalar(&format!(
-            "SELECT count(*) AS n FROM queue_admin_actions \
-             WHERE action = 'replay' AND task_id = {id} AND operator = 'carol'"
+            "SELECT count(*) AS n FROM queue_admin_actions a \
+             JOIN queue_admin_action_tasks m ON m.action_id = a.id \
+             WHERE a.action = 'replay' AND m.task_id = {id} AND operator = 'carol'"
         ))
         .await;
     assert_eq!(n, 1);

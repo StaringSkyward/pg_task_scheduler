@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match std::env::args().nth(1).as_deref() {
         Some("worker") => {
-            let scheduler = tasks::scheduler(pool(&required_env("DATABASE_URL"), 12))?;
+            // 5 handler slots (default 4, bulk 1) + 6 for the scheduler with `cron` (LISTEN,
+            // claims, maintenance, registry, dead-lettering, materializer) + 4 for `place_order`
+            // handlers, which take their own connection.
+            let scheduler = tasks::scheduler(pool(&required_env("DATABASE_URL"), 15))?;
             let token = CancellationToken::new();
             tokio::spawn({
                 let token = token.clone();
@@ -59,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
             tracing::info!("worker started: queues default(4), bulk(1)");
-            scheduler.run_until_shutdown(token).await?;
+            scheduler.run_until_shutdown(token).await;
             tracing::info!("worker stopped cleanly");
             Ok(())
         }

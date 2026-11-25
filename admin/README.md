@@ -69,7 +69,7 @@ axum::serve(listener, app).await?;
 ```
 
 - `base_path` must equal the prefix the router is nested under, or `""` when it
-  is not nested. Every link, asset, form action and redirect is built from it.
+  is not nested; a non-empty one starts with `/` and does not end with `/`. Every link, asset, form action and redirect is built from it.
 - Under `.nest("/admin", ..)` the overview is served at `/admin` and
   `/admin/overview`, but `/admin/` is a 404 (axum 0.7 maps the inner `/` to the
   bare prefix). Add a redirect in the host if you want `/admin/` to work.
@@ -134,7 +134,8 @@ credentials against a list of users with argon2id PHC hashes, made by
 - At most one verify runs per CPU; further requests queue for a slot. Each
   verify costs about 19 MiB and tens of milliseconds of CPU.
 - A hash that is not argon2id is a configuration error. The standalone config
-  also rejects duplicate user names.
+  also rejects duplicate user names. A user name must not be blank or contain
+  `:` (`with_basic_auth` rejects both too).
 - Browsers send the password with every request, so use TLS (below). The
   standalone server logs a warning when basic auth is bound to a non-loopback
   address.
@@ -233,22 +234,30 @@ over plain HTTP sends the password in the clear on every request.
 ## Database role
 
 Give the UI its own role, so its grants and connection count are visible and
-bounded. The pages read five tables; the actions update tasks, close attempts,
-write audit rows, and add or remove pauses:
+bounded. The pages read eight tables; the actions update tasks, close attempts,
+write audit rows and the tasks each action changed, and add or remove pauses:
 
 ```sql
 CREATE ROLE pg_task_admin LOGIN PASSWORD '...';
 GRANT USAGE ON SCHEMA public TO pg_task_admin;   -- the schema holding the queue tables
+-- every write's identifier CHECKs call this; PUBLIC has it by default
+GRANT EXECUTE ON FUNCTION queue_is_identifier(text) TO pg_task_admin;
 -- pages
 GRANT SELECT ON queue_tasks, queue_task_attempts, queue_admin_actions,
-                queue_workers, queue_pauses TO pg_task_admin;
--- actions: cancel and replay; cancel closes the attempt; audit rows (bulk updates
--- their count); pause and resume
+                queue_admin_action_tasks, queue_workers, queue_worker_queues,
+                queue_worker_task_names, queue_pauses TO pg_task_admin;
+-- actions: cancel and replay; cancel closes the attempt (an upsert); audit rows and
+-- the tasks each action changed; pause and resume
 GRANT UPDATE ON queue_tasks TO pg_task_admin;
-GRANT INSERT, UPDATE ON queue_task_attempts, queue_admin_actions TO pg_task_admin;
+GRANT INSERT, UPDATE ON queue_task_attempts TO pg_task_admin;
+GRANT INSERT ON queue_admin_actions, queue_admin_action_tasks TO pg_task_admin;
 GRANT INSERT, DELETE ON queue_pauses TO pg_task_admin;
--- only with the `cron` feature (/api/jobs)
+-- only with the `cron` feature (/api/jobs): list and delete (the delete's cascade
+-- removes the cursor); pause and resume lock the job row (FOR KEY SHARE needs
+-- UPDATE) and add or remove its pause
 GRANT SELECT, UPDATE, DELETE ON scheduler_jobs TO pg_task_admin;
+GRANT SELECT ON scheduler_job_cursors TO pg_task_admin;
+GRANT SELECT, INSERT, DELETE ON scheduler_job_pauses TO pg_task_admin;
 ```
 
 These grants were checked by running every page query and action as such a role.
@@ -276,10 +285,10 @@ keys, which map onto it. Unknown TOML keys are an error.
 | `public_origin` | `public_origin` | none | Browser-facing origin accepted by the CSRF check when a proxy rewrites `Host`. Must match exactly. |
 | `refresh_seconds` | `refresh_seconds` | 10 | Page auto-refresh; 0 turns it off. |
 | `overview_cache` | `overview_cache_seconds` | 5 s | The overview is computed at most once per this, shared by every viewer. |
-| `page_size` | (none) | 50 | Rows per list page. |
-| `statement_timeout` | `statement_timeout_seconds` | 5 s | Limit on each page-read statement, and on idle time inside a page read's transaction. |
+| `page_size` | (none) | 50 | Rows per list page; positive. |
+| `statement_timeout` | `statement_timeout_seconds` | 5 s | Limit on each page-read statement, and on idle time inside a page read's transaction. 0 means no timeout; a positive value rounds up to whole milliseconds. |
 | `overview.window` | `window_seconds` | 1 h | How far back the Done and Dead columns and the failure groups look. |
-| `overview.count_cap` | `count_cap` | 10,000 | Most rows any count reads; larger counts show as `10,000+`. Also caps the bulk confirm count. |
+| `overview.count_cap` | `count_cap` | 10,000 | Most rows any count reads (positive); larger counts show as `10,000+`. Also caps the bulk confirm count. |
 | `overview.no_handler_probe` | (none) | 100 | Oldest due tasks per queue checked for task names no live worker handles. |
 | `overview.failure_groups` | (none) | 20 | Failure groups shown. |
 | `overview.recent_actions` | (none) | 10 | Recent admin actions shown. |
@@ -293,10 +302,10 @@ Standalone-only keys:
 | --- | --- | --- |
 | `database_url` | `DATABASE_URL` from the environment | Required one way or the other; the file wins. |
 | `bind` | `127.0.0.1:8080` | Socket address, IP and port (no host names). |
-| `pool_size` | 4 | Connections in the server's pool. |
+| `pool_size` | 4 | Connections in the server's pool; at least 1. |
 | `[auth] mode` | required | `"basic"` or `"trusted_header"`. |
-| `[auth] header` | `X-Forwarded-User` | The trusted header (`trusted_header` only). |
-| `[[auth.users]] name`, `password_hash` | at least one | Basic-auth users (`basic` only); names must be unique. |
+| `[auth] header` | `X-Forwarded-User` | The trusted header (`trusted_header` only; an error under `basic`). |
+| `[[auth.users]] name`, `password_hash` | at least one | Basic-auth users (`basic` only; an error under `trusted_header`); names must be unique, not blank, and contain no `:`. |
 
 A full file:
 
@@ -335,12 +344,12 @@ strings, so any name works, `/`, `&` and `#` included.
 | `GET /workers` | Every registered worker, live first; lost workers greyed. |
 | `GET /queued?queue=…` | One queue in dequeue order. Without `queue`, a list of known queues. |
 | `GET /running` | Running tasks, soonest lease expiry first. |
-| `GET /completed`, `/failed`, `/cancelled` | Done, dead and cancelled tasks, newest first. `/failed` and `/cancelled` take `task_name` and `error` filters. |
-| `GET /tasks/:id` | A task, its payload, every attempt, and its admin actions. |
+| `GET /completed`, `/failed`, `/cancelled` | Done, dead and cancelled tasks, newest first. `/failed` and `/cancelled` take `task_name` and an error filter, `[&error_filter=any\|missing\|exact[&error=…]]`: `error` is only for `exact` (where an empty one matches only an empty error) and is 400 with any other mode, and an absent `error_filter` is `any`. |
+| `GET /tasks/:id` | A task, its payload, every attempt, and its admin actions. An invalid key is shown as stored, with why it is invalid. |
 | `POST /tasks/:id/cancel`, `/tasks/:id/replay` | Form posts with a `reason`; redirect back to the task. |
 | `POST /queues/pause`, `/queues/resume` | Form posts with `queue` and `reason`; redirect to the overview. |
-| `GET /bulk?action=cancel\|replay&task_name=…[&queue=…][&error=…]`, `POST /bulk` | Confirm page with the capped match count, then one budgeted run with a Continue button if more remain. |
-| `GET /api/tasks/:id` | The task as JSON. |
+| `GET /bulk?action=cancel\|replay&task_name=…[&queue=…][&error_filter=any\|missing\|exact[&error=…]]`, `POST /bulk` | Confirm page with the capped match count, then one budgeted run. The error filter is for `replay` only, and `error` is only for `exact` (400 otherwise); a cancel with a `missing` or `exact` filter is 400. When the budget ran out, Continue posts only the `action_id` and runs more batches of the same action; otherwise Run again starts a new action with the same filters (rows locked by other work are skipped). |
+| `GET /api/tasks/:id` | The task as JSON. `task_key` is `{"valid": "<key>"}`, or `{"invalid": {"text": "...", "error": "..."}}` when the stored key breaks the identifier rule (possible only in a database whose identifier CHECK was dropped by hand): its text, and why it is invalid. `payload` is `{"json": <arguments>}`, or `{"unreadable": {"text": "...", "error": "..."}}` when the stored payload does not parse: its text as PostgreSQL prints it, and why it does not parse. |
 | `POST /api/tasks/:id/replay` | JSON body `{"reason": "…"}`; 204, 400 if the reason is blank, or 409 if the task is not dead or cancelled. |
 | `GET /api/jobs`, `POST /api/jobs/:id/pause`, `POST /api/jobs/:id/resume`, `DELETE /api/jobs/:id` | Cron schedules (`cron` feature only). |
 
